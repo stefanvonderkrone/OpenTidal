@@ -30,6 +30,6 @@ The journeys:
 | `playlist-delete` | Delete returns to Playlists and leaves no dangling route. |
 | `collection` | A collection holds a playlist and removes it. |
 
-Rename (playlist and profile) uses a text field, which the headless driver
-does not type into; the operations are proven by the unit and invariant tests
-instead (`library::tests`, `state::tests`).
+Rename (playlist, collection, and profile) uses a text field, which the
+headless driver does not type into; the operations are proven by the unit and
+invariant tests instead (`library::tests`, `state::tests`).

@@ -23,7 +23,9 @@ const PREV: Icon = Icon { name: "prev", view: 24.0, body: "<path d=\"M6 5h2v14H6
 const NEXT: Icon = Icon { name: "next", view: 24.0, body: "<path d=\"M4 5l9 7-9 7zM16 5h2v14h-2z\"/>" };
 const HEART: Icon = Icon { name: "heart", view: 24.0, body: "<path d=\"M12 21s-6.7-4.35-9.33-8.11C.6 9.9 2.08 5.9 5.5 5.9c2.07 0 3.44 1.17 4.5 2.56 1.06-1.39 2.43-2.56 4.5-2.56 3.42 0 4.9 4 2.83 6.99C18.7 16.65 12 21 12 21z\"/>" };
 
-const SCENES: [(&str, fn(&mut App)); 4] = [
+type Scene = (&'static str, fn(&mut App));
+
+const SCENES: [Scene; 4] = [
     ("default", |_| {}),
     ("accent-blue", |a| a.core.accent = 0),
     ("accent-pink", |a| a.core.accent = 2),
@@ -202,7 +204,7 @@ fn screen_body(app: &App, t: tok::Theme, accent: Color) -> El {
         Route::Albums => screens::albums(&app.core, t),
         Route::Artists => screens::artists(&app.core, t),
         Route::Playlists => screens::playlists(&app.core, t),
-        Route::Collections => screens::collections(&app.core, t),
+        Route::Collections => screens::collections(app, t),
         Route::Local => screens::local(&app.core, t),
         Route::History => screens::history(&app.core, t),
         Route::Stats => screens::stats(&app.core, t),

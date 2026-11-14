@@ -44,7 +44,6 @@ pub struct PlaylistId(pub u8);
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Playlist {
     pub name: String,
-    pub description: String,
     pub tracks: Vec<TrackId>,
 }
 
@@ -175,7 +174,6 @@ impl Library {
             if slot.is_none() {
                 self.playlists[i] = Some(Playlist {
                     name,
-                    description: String::new(),
                     tracks: Vec::new(),
                 });
                 return Some(PlaylistId(i as u8));
@@ -252,9 +250,7 @@ impl Library {
         true
     }
 
-    /// Rename a collection. Proven but not yet surfaced in the UI; kept
-    /// `#[cfg(test)]` so the binary carries no dead code.
-    #[cfg(test)]
+    /// Rename a collection.
     pub fn rename_collection(&mut self, idx: usize, name: String) -> bool {
         match self.collections.get_mut(idx) {
             Some(c) => {
@@ -334,10 +330,8 @@ impl Library {
                 return Err(Violation::HistoryOutOfRange);
             }
         }
-        for (i, &t) in self.history.iter().enumerate() {
-            if self.history[..i].contains(&t) {
-                return Err(Violation::HistoryDuplicate);
-            }
+        if has_dup(&self.history) {
+            return Err(Violation::HistoryDuplicate);
         }
         for p in self.playlists.iter().flatten() {
             if p.tracks.len() > PLAYLIST_TRACK_CAP {
@@ -348,10 +342,8 @@ impl Library {
                     return Err(Violation::PlaylistTrackOutOfRange);
                 }
             }
-            for (i, &t) in p.tracks.iter().enumerate() {
-                if p.tracks[..i].contains(&t) {
-                    return Err(Violation::PlaylistDuplicate);
-                }
+            if has_dup(&p.tracks) {
+                return Err(Violation::PlaylistDuplicate);
             }
         }
         if self.collections.len() > MAX_COLLECTIONS {
@@ -369,14 +361,19 @@ impl Library {
                     return Err(Violation::CollectionPlaylistMissing);
                 }
             }
-            for (i, &p) in c.playlists.iter().enumerate() {
-                if c.playlists[..i].contains(&p) {
-                    return Err(Violation::CollectionPlaylistDuplicate);
-                }
+            if has_dup(&c.playlists) {
+                return Err(Violation::CollectionPlaylistDuplicate);
             }
         }
         Ok(())
     }
+}
+
+/// True when a slice has a duplicate. Shared by the three duplicate checks in
+/// [`Library::check`].
+#[cfg(test)]
+fn has_dup<T: PartialEq>(xs: &[T]) -> bool {
+    xs.iter().enumerate().any(|(i, x)| xs[..i].contains(x))
 }
 
 #[cfg(test)]

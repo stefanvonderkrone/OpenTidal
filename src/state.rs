@@ -227,10 +227,10 @@ pub fn open_section(s: &mut State, route: Route) {
 /// playlist that no longer exists is refused, so a dangling route can never
 /// enter the stack.
 pub fn open_detail(s: &mut State, route: Route) {
-    if let Route::UserPlaylist(id) = route {
-        if s.lib.playlist(id).is_none() {
-            return;
-        }
+    if let Route::UserPlaylist(id) = route
+        && s.lib.playlist(id).is_none()
+    {
+        return;
     }
     if s.stack.last() != Some(&route) {
         s.stack.push(route);

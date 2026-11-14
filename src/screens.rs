@@ -214,10 +214,6 @@ fn all_artists_grid(t: tok::Theme) -> El {
     grid(cards, 6)
 }
 
-fn all_tracks() -> Vec<Track> {
-    catalog::TRACKS.to_vec()
-}
-
 // --- Section screens -----------------------------------------------------
 
 pub fn home(t: tok::Theme) -> El {
@@ -256,7 +252,7 @@ pub fn popular(s: &State, t: tok::Theme) -> El {
     let body = match s.popular_tab {
         PopularTab::Artists => all_artists_grid(t),
         PopularTab::Albums => all_albums_grid(t),
-        PopularTab::Tracks => track_list(all_tracks(), s.now_playing, t),
+        PopularTab::Tracks => track_list(catalog::TRACKS.to_vec(), s.now_playing, t),
     };
     page("Popular", "Global charts", t,
         col().gap(space::S3).child(tabs).child(body))
@@ -337,7 +333,8 @@ pub fn playlists(s: &State, t: tok::Theme) -> El {
     page("Playlists", "Your playlists", t, body)
 }
 
-pub fn collections(s: &State, t: tok::Theme) -> El {
+pub fn collections(app: &App, t: tok::Theme) -> El {
+    let s = &app.core;
     let new_btn = el().key("new-collection").label("New collection")
         .h(40.0).px(space::S3).radius(radius::MD).center_y().focusable(true)
         .fill(t.text)
@@ -347,15 +344,38 @@ pub fn collections(s: &State, t: tok::Theme) -> El {
         })
         .child(text("New collection").key("label").font(type_::BODY).color(t.bg));
 
+    let rename_field = text_input(&app.rename, type_::BODY)
+        .key("col-rename-box")
+        .w_full()
+        .px(space::S3)
+        .py(space::S2)
+        .radius(radius::MD)
+        .fill(t.hover)
+        .single_line()
+        .on_edit(|a: &mut App| &mut a.rename)
+        .placeholder("Rename a collection", t.text_secondary);
+
     let mut body = col().gap(space::S3).child(new_btn);
     if s.lib.collections.is_empty() {
         body = body.child(empty("No collections yet. Create one.", t));
+    } else {
+        body = body.child(rename_field);
     }
     for (idx, c) in s.lib.collections.iter().enumerate() {
         let mut block = col().gap(space::S1);
         let mut head = row().center_y().gap(space::S2);
         head = head
             .child(text(&c.name).key("col-name").font(type_::SECTION).color(t.text).grow(1.0))
+            .child(el().key(format!("ren-col-{idx}")).label("Rename")
+                .h(28.0).px(space::S2).radius(radius::SM).center_y().hover(t.hover).focusable(true)
+                .on_press(move |a: &mut App| {
+                    let name = a.rename.text.trim().to_string();
+                    if !name.is_empty() {
+                        a.core.lib.rename_collection(idx, name);
+                        a.rename.clear();
+                    }
+                })
+                .child(text("Rename").key("label").font(type_::LABEL).color(t.text_secondary)))
             .child(el().key(format!("add-to-col-{idx}")).label("Add playlist")
                 .h(28.0).px(space::S2).radius(radius::SM).center_y().hover(t.hover).focusable(true)
                 .on_press(move |a: &mut App| {
@@ -421,15 +441,15 @@ pub fn history(s: &State, t: tok::Theme) -> El {
 }
 
 pub fn stats(s: &State, t: tok::Theme) -> El {
-    let (top_artist, top_track) = top_artist_and_track(s);
+    let (recent_artist, recent_track) = recent_artist_and_track(s);
     let playlists = s.lib.playlists.iter().filter(|p| p.is_some()).count();
     let stats: [(&str, String); 6] = [
         ("Liked tracks", s.lib.liked.count_ones().to_string()),
         ("Saved albums", s.lib.saved_albums.count_ones().to_string()),
         ("Followed artists", s.lib.followed.count_ones().to_string()),
         ("Playlists", playlists.to_string()),
-        ("Top artist", top_artist),
-        ("Top track", top_track),
+        ("Recent artist", recent_artist),
+        ("Recent track", recent_track),
     ];
     let mut g = row().gap(space::S3);
     for (label, value) in stats {
@@ -443,22 +463,16 @@ pub fn stats(s: &State, t: tok::Theme) -> El {
     page("Stats", "Your library at a glance", t, g)
 }
 
-fn top_artist_and_track(s: &State) -> (String, String) {
-    use std::collections::HashMap;
-    let mut artists: HashMap<catalog::ArtistId, usize> = HashMap::new();
-    let mut tracks: HashMap<TrackId, usize> = HashMap::new();
-    for &id in &s.lib.history {
-        let tr = catalog::track(id);
-        *artists.entry(tr.artist).or_insert(0) += 1;
-        *tracks.entry(id).or_insert(0) += 1;
-    }
-    let top_artist = artists.into_iter().max_by_key(|&(_, c)| c)
-        .map(|(a, _)| catalog::artist(a).name.to_string())
+/// The artist and track at the front of history. History is duplicate-free, so
+/// it cannot rank by play frequency; the front is the honest "most recent".
+fn recent_artist_and_track(s: &State) -> (String, String) {
+    let artist = s.lib.history.first()
+        .map(|&id| catalog::artist(catalog::track(id).artist).name.to_string())
         .unwrap_or_else(|| "—".into());
-    let top_track = tracks.into_iter().max_by_key(|&(_, c)| c)
-        .map(|(id, _)| catalog::track(id).title.to_string())
+    let track = s.lib.history.first()
+        .map(|&id| catalog::track(id).title.to_string())
         .unwrap_or_else(|| "—".into());
-    (top_artist, top_track)
+    (artist, track)
 }
 
 pub fn downloads(s: &State, t: tok::Theme) -> El {

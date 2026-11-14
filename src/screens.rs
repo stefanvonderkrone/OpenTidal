@@ -286,6 +286,35 @@ pub fn downloads(t: tok::Theme) -> El {
 }
 
 pub fn search(t: tok::Theme, edit: &TextEdit) -> El {
+    let query = edit.text.trim();
+    let results = if query.is_empty() {
+        albums_grid(t)
+    } else {
+        let q = query.to_lowercase();
+        let albums: Vec<El> = data::ALBUMS.iter().enumerate()
+            .filter(|(_, a)| a.title.to_lowercase().contains(&q) || a.artist.to_lowercase().contains(&q))
+            .map(|(i, a)| album_card(i, *a, t)).collect();
+        let artists: Vec<El> = data::ARTISTS.iter().enumerate()
+            .filter(|(_, a)| a.name.to_lowercase().contains(&q))
+            .map(|(i, a)| artist_card(i, *a, t)).collect();
+        let tracks: Vec<El> = data::TRACKS.iter().enumerate()
+            .filter(|(_, tr)| tr.title.to_lowercase().contains(&q) || tr.artist.to_lowercase().contains(&q))
+            .map(|(i, tr)| track_row(i, *tr, false, t)).collect();
+        if albums.is_empty() && artists.is_empty() && tracks.is_empty() {
+            text(format!("No results for \"{query}\""))
+                .key("search-empty").font(type_::BODY).color(t.text_secondary)
+        } else {
+            let mut results = col().gap(space::S3);
+            for (title, cards, per) in [("Albums", albums, 5), ("Artists", artists, 6), ("Tracks", tracks, 1)] {
+                if !cards.is_empty() {
+                    results = results
+                        .child(text(title).key(format!("result-{title}")).font(type_::SECTION).color(t.text))
+                        .child(grid(cards, per));
+                }
+            }
+            results
+        }
+    };
     let field = text_input(edit, type_::BODY)
         .key("search-box")
         .h(40.0)
@@ -297,7 +326,7 @@ pub fn search(t: tok::Theme, edit: &TextEdit) -> El {
         .on_edit(|a: &mut App| &mut a.search)
         .placeholder("Search artists, albums, tracks", t.text_secondary);
     page("Search", "Find anything in the catalogue", t,
-        col().gap(space::S3).child(field).child(albums_grid(t)))
+        col().gap(space::S3).child(field).child(results))
 }
 
 pub fn settings(t: tok::Theme) -> El {

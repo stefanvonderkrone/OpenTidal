@@ -7,6 +7,39 @@
 /// `main.rs` asserts that equality at compile time.
 pub const ACCENT_LEN: usize = 6;
 
+/// The three tabs on the Popular screen.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum PopularTab {
+    Artists,
+    Albums,
+    Tracks,
+}
+
+/// A subpage of the Settings screen, reached by drilling from the settings
+/// index. Each carries no payload; the page builder renders its rows.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum SettingsPage {
+    Playback,
+    Quality,
+    Downloads,
+    Notifications,
+    Import,
+    About,
+}
+
+impl SettingsPage {
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsPage::Playback => "Playback",
+            SettingsPage::Quality => "Quality",
+            SettingsPage::Downloads => "Downloads",
+            SettingsPage::Notifications => "Notifications",
+            SettingsPage::Import => "Import",
+            SettingsPage::About => "About",
+        }
+    }
+}
+
 /// A screen in the app. The section variants are the top-level sidebar and
 /// top-bar entries. The detail variants carry a catalog id so a detail screen
 /// can never exist without its subject.
@@ -27,6 +60,7 @@ pub enum Route {
     Downloads,
     Search,
     Settings,
+    SettingsPage(SettingsPage),
     Album(usize),
     Artist(usize),
     Playlist(usize),
@@ -62,6 +96,7 @@ impl Route {
             Route::Downloads => "Downloads",
             Route::Search => "Search",
             Route::Settings => "Settings",
+            Route::SettingsPage(p) => p.label(),
             Route::Album(_) => "Album",
             Route::Artist(_) => "Artist",
             Route::Playlist(_) => "Playlist",
@@ -74,7 +109,9 @@ impl Route {
             Route::Home | Route::Feed | Route::Popular | Route::ForYou => Group::Primary,
             Route::LikedSongs | Route::Albums | Route::Artists | Route::Playlists
             | Route::Collections | Route::Local | Route::History | Route::Stats => Group::Library,
-            Route::Downloads | Route::Search | Route::Settings => Group::Bottom,
+            Route::Downloads | Route::Search | Route::Settings | Route::SettingsPage(_) => {
+                Group::Bottom
+            }
             Route::Album(_) | Route::Artist(_) | Route::Playlist(_) => Group::Library,
         }
     }
@@ -106,11 +143,21 @@ pub struct State {
     pub stack: Vec<Route>,
     pub playing: bool,
     pub accent: usize,
+    pub collapsed: bool,
+    pub popular_tab: PopularTab,
+    pub now_playing: Option<usize>,
 }
 
 impl Default for State {
     fn default() -> Self {
-        State { stack: vec![Route::Home], playing: true, accent: 0 }
+        State {
+            stack: vec![Route::Home],
+            playing: true,
+            accent: 0,
+            collapsed: false,
+            popular_tab: PopularTab::Artists,
+            now_playing: Some(0),
+        }
     }
 }
 
@@ -152,6 +199,23 @@ pub fn back(s: &mut State) {
 /// Toggle playback from the transport play button.
 pub fn tap_play(s: &mut State) {
     s.playing = !s.playing;
+}
+
+/// Collapse or expand the sidebar.
+pub fn toggle_sidebar(s: &mut State) {
+    s.collapsed = !s.collapsed;
+}
+
+/// Select the Popular tab.
+pub fn set_popular_tab(s: &mut State, tab: PopularTab) {
+    s.popular_tab = tab;
+}
+
+/// Select the now-playing track by index into `data::TRACKS`. The only writer
+/// of `now_playing`, so the index is in range by construction: `count == 0`
+/// yields `None`, otherwise `i` wraps into `[0, count)`.
+pub fn select_track(s: &mut State, i: usize, count: usize) {
+    s.now_playing = if count == 0 { None } else { Some(i % count) };
 }
 
 /// Handle a text key. Returns true when the key changed state. `"a"` advances
@@ -201,9 +265,15 @@ mod tests {
     const MAX_DEPTH: usize = 3;
 
     /// The detail routes the check exercises, with a fixed id set so the state
-    /// space stays finite.
-    const DETAILS: [Route; 4] =
-        [Route::Album(0), Route::Album(1), Route::Artist(0), Route::Playlist(0)];
+    /// space stays finite. Settings subpages are detail routes too.
+    const DETAILS: [Route; 6] = [
+        Route::Album(0),
+        Route::Album(1),
+        Route::Artist(0),
+        Route::Playlist(0),
+        Route::SettingsPage(SettingsPage::Playback),
+        Route::SettingsPage(SettingsPage::About),
+    ];
 
     fn applying(f: impl Fn(&mut State), s: &State) -> State {
         let mut t = s.clone();
@@ -212,7 +282,9 @@ mod tests {
     }
 
     /// The states reachable in one event: every section open, every detail
-    /// drill, back, the play tap, and the two handled keys.
+    /// drill, back, the play tap, the two handled keys, and the new toggles.
+    /// The toggles leave `accent` and `stack` alone, so they exercise the new
+    /// fields without changing the invariant's subject.
     fn successors(s: &State) -> Vec<State> {
         let mut out = Vec::new();
         for r in SECTIONS.iter().chain([Route::Search, Route::Settings].iter()) {
@@ -229,6 +301,9 @@ mod tests {
         out.push(applying(|st| {
             handle_key(st, " ");
         }, s));
+        out.push(applying(toggle_sidebar, s));
+        out.push(applying(|st| set_popular_tab(st, PopularTab::Albums), s));
+        out.push(applying(|st| select_track(st, 3, 10), s));
         out
     }
 
@@ -269,5 +344,22 @@ mod tests {
         open_detail(&mut s, Route::Album(0));
         back(&mut s);
         assert_eq!(s.stack.len(), 1, "back from a detail did not return to the root");
+    }
+
+    /// `select_track` is the only writer of `now_playing`, and it clamps the
+    /// index into `[0, count)` for the real catalog length, so the view can
+    /// index `data::TRACKS` without an out-of-range panic.
+    #[test]
+    fn track_index_stays_in_bounds() {
+        let n = crate::data::TRACKS.len();
+        assert!(n > 0, "the catalog must not be empty");
+        let mut s = State::default();
+        for i in [0, 3, n - 1, n, usize::MAX] {
+            select_track(&mut s, i, n);
+            assert!(s.now_playing.unwrap() < n, "selected {i} out of range for {n}");
+        }
+        let mut empty = State::default();
+        select_track(&mut empty, 0, 0);
+        assert_eq!(empty.now_playing, None, "an empty catalog must select nothing");
     }
 }

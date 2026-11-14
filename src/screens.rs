@@ -2,9 +2,10 @@
 //! track-row builders over the placeholder catalog in `data`.
 
 use rune::tok::{self, radius, space, type_};
-use rune::{Color, El, ScrollSpec, col, el, oklch, row, text};
+use rune::{Color, El, ScrollSpec, TextEdit, col, el, oklch, row, text, text_input};
+use crate::app::App;
 use crate::data::{self, Album, Artist, Playlist, Track};
-use crate::state::{self, Route, State};
+use crate::state::{self, PopularTab, Route, SettingsPage, State};
 
 /// A colourful vertical gradient for a placeholder cover.
 pub fn cover(i: usize) -> (Color, Color) {
@@ -30,7 +31,7 @@ fn card(i: usize, title: &str, subtitle: &str, route: Route, t: tok::Theme) -> E
     col().key(format!("card-{i}"))
         .w(168.0)
         .gap(space::S2)
-        .on_press(move |st: &mut State| state::open_detail(st, route))
+        .on_press(move |a: &mut App| state::open_detail(&mut a.core, route))
         .child(
             el().key("cover")
                 .size(168.0, 168.0)
@@ -51,7 +52,7 @@ fn artist_card(i: usize, a: Artist, t: tok::Theme) -> El {
     col().key(format!("artist-{i}"))
         .w(120.0)
         .gap(space::S2)
-        .on_press(move |st: &mut State| state::open_detail(st, Route::Artist(i)))
+        .on_press(move |a: &mut App| state::open_detail(&mut a.core, Route::Artist(i)))
         .child(
             el().key("cover")
                 .size(120.0, 120.0)
@@ -188,24 +189,31 @@ pub fn feed(t: tok::Theme) -> El {
     page("Feed", "Activity from artists you follow", t, rows)
 }
 
-pub fn popular(t: tok::Theme) -> El {
+pub fn popular(s: &State, t: tok::Theme) -> El {
     let tabs = row().gap(space::S2).pb(space::S3)
-        .child(tab("Artists", true, t))
-        .child(tab("Albums", false, t))
-        .child(tab("Tracks", false, t));
+        .child(tab("Artists", PopularTab::Artists, s, t))
+        .child(tab("Albums", PopularTab::Albums, s, t))
+        .child(tab("Tracks", PopularTab::Tracks, s, t));
+    let body = match s.popular_tab {
+        PopularTab::Artists => artists_grid(t),
+        PopularTab::Albums => albums_grid(t),
+        PopularTab::Tracks => track_list(t),
+    };
     page("Popular", "Global charts", t,
-        col().gap(space::S3).child(tabs).child(artists_grid(t)))
+        col().gap(space::S3).child(tabs).child(body))
 }
 
-fn tab(label: &str, active: bool, t: tok::Theme) -> El {
+fn tab(label: &str, tab: PopularTab, s: &State, t: tok::Theme) -> El {
+    let active = s.popular_tab == tab;
     el().key(format!("tab-{label}"))
         .label(label)
         .h(34.0)
         .px(space::S3)
         .radius(17.0)
         .center_y()
+        .checked(active)
         .fill(if active { t.text } else { t.hover })
-        .on_press(|_: &mut State| {})
+        .on_press(move |a: &mut App| state::set_popular_tab(&mut a.core, tab))
         .child(text(label).key("label").font(type_::BODY).color(if active { t.bg } else { t.text }))
 }
 
@@ -273,30 +281,48 @@ pub fn downloads(t: tok::Theme) -> El {
     page("Downloads", "Your download queue", t, rows)
 }
 
-pub fn search(t: tok::Theme) -> El {
-    let bar = el().key("search-box")
+pub fn search(t: tok::Theme, edit: &TextEdit) -> El {
+    let field = text_input(edit, type_::BODY)
+        .key("search-box")
         .h(40.0)
         .w_full()
         .px(space::S3)
         .radius(radius::MD)
-        .center_y()
         .fill(t.hover)
-        .child(text("Search artists, albums, tracks").key("hint").font(type_::BODY).color(t.text_secondary));
+        .single_line()
+        .on_edit(|a: &mut App| &mut a.search)
+        .placeholder("Search artists, albums, tracks", t.text_secondary);
     page("Search", "Find anything in the catalogue", t,
-        col().gap(space::S3).child(bar).child(albums_grid(t)))
+        col().gap(space::S3).child(field).child(albums_grid(t)))
 }
 
 pub fn settings(t: tok::Theme) -> El {
     let mut rows = col().gap(space::S1);
-    let items: [&str; 6] = ["Playback", "Quality", "Downloads", "Notifications", "Import", "About"];
-    for (i, s) in items.iter().enumerate() {
+    let items: [SettingsPage; 6] = [
+        SettingsPage::Playback,
+        SettingsPage::Quality,
+        SettingsPage::Downloads,
+        SettingsPage::Notifications,
+        SettingsPage::Import,
+        SettingsPage::About,
+    ];
+    for (i, page) in items.iter().enumerate() {
+        let p = *page;
         rows = rows.child(
             row().key(format!("set-{i}")).h(44.0).px(space::S3).radius(radius::MD).center_y().justify_between().hover(t.hover)
-                .child(text(*s).key("label").font(type_::BODY).color(t.text))
+                .focusable(true)
+                .on_press(move |a: &mut App| state::open_detail(&mut a.core, Route::SettingsPage(p)))
+                .child(text(p.label()).key("label").font(type_::BODY).color(t.text))
                 .child(text(">").key("chevron").font(type_::BODY).color(t.text_secondary)),
         );
     }
     page("Settings", "Tune OpenTidal", t, rows)
+}
+
+/// A settings subpage. The rows themselves are placeholders until a real
+/// settings model exists; the navigation and back behaviour are real.
+pub fn settings_page(p: SettingsPage, t: tok::Theme) -> El {
+    page(p.label(), "Settings", t, col().gap(space::S3))
 }
 
 // --- Detail screens ------------------------------------------------------
@@ -310,7 +336,7 @@ fn action_button(label: &str, accent: Color, filled: bool, t: tok::Theme) -> El 
         .center_y()
         .fill(if filled { accent } else { t.hover })
         .focusable(true)
-        .on_press(|_: &mut State| {})
+        .on_press(|_: &mut App| {})
         .child(text(label).key("label").font(type_::BODY).color(if filled { t.bg } else { t.text }))
 }
 

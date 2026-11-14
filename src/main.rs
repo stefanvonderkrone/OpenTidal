@@ -2,12 +2,14 @@
 //! `cargo run` opens the window.
 //! `cargo run -- --snap out.png --scene default` renders headless.
 
+mod app;
 mod data;
 mod screens;
 mod state;
 
 use rune::tok::{self, radius, space, type_};
 use rune::{AppSpec, Color, Cx, El, Icon, Key, ScrollSpec, col, el, icon, row, text};
+use app::App;
 use state::{Group, Route, State};
 
 // The accent count must match the rune palette the app draws from.
@@ -18,7 +20,15 @@ const PAUSE: Icon = Icon { name: "pause", view: 24.0, body: "<path d=\"M7 5h4v14
 const PREV: Icon = Icon { name: "prev", view: 24.0, body: "<path d=\"M6 5h2v14H6zM20 5v14l-9-7z\"/>" };
 const NEXT: Icon = Icon { name: "next", view: 24.0, body: "<path d=\"M4 5l9 7-9 7zM16 5h2v14h-2z\"/>" };
 
-fn view(s: &State, _cx: &mut Cx<State>) -> El {
+const SCENES: [(&str, fn(&mut App)); 4] = [
+    ("default", |_| {}),
+    ("accent-blue", |a| a.core.accent = 0),
+    ("accent-pink", |a| a.core.accent = 2),
+    ("paused", |a| a.core.playing = false),
+];
+
+fn view(app: &App, _cx: &mut Cx<App>) -> El {
+    let s = &app.core;
     let t = tok::theme(true);
     let accent = tok::accent(s.accent, true);
 
@@ -30,7 +40,7 @@ fn view(s: &State, _cx: &mut Cx<State>) -> El {
         .child(
             row().key("body").grow(1.0).min_h(0.0)
                 .child(sidebar(s, t, accent))
-                .child(main_col(s, t, accent)),
+                .child(main_col(app, t, accent)),
         )
         .child(now_playing(s, t, accent))
 }
@@ -47,7 +57,7 @@ fn nav_item(route: Route, selected: bool, t: tok::Theme, accent: Color) -> El {
         .fill(if selected { t.hover } else { Color::TRANSPARENT })
         .hover(t.hover)
         .focusable(true)
-        .on_press(move |st: &mut State| state::open_section(st, route))
+        .on_press(move |a: &mut App| state::open_section(&mut a.core, route))
         .child(
             text(name)
                 .key("label")
@@ -107,7 +117,7 @@ fn back_button(t: tok::Theme) -> El {
         .center_y()
         .hover(t.hover)
         .focusable(true)
-        .on_press(state::back)
+        .on_press(|a: &mut App| state::back(&mut a.core))
         .child(text("Back").key("label").font(type_::BODY).color(t.text))
 }
 
@@ -120,7 +130,7 @@ fn search_button(t: tok::Theme) -> El {
         .center_y()
         .hover(t.hover)
         .focusable(true)
-        .on_press(|st: &mut State| state::open_section(st, Route::Search))
+        .on_press(|a: &mut App| state::open_section(&mut a.core, Route::Search))
         .child(text("Search").key("label").font(type_::BODY).color(t.text_secondary))
 }
 
@@ -133,7 +143,7 @@ fn settings_button(t: tok::Theme) -> El {
         .center_y()
         .hover(t.hover)
         .focusable(true)
-        .on_press(|st: &mut State| state::open_section(st, Route::Settings))
+        .on_press(|a: &mut App| state::open_section(&mut a.core, Route::Settings))
         .child(text("Settings").key("label").font(type_::BODY).color(t.text_secondary))
 }
 
@@ -154,19 +164,19 @@ fn top_bar(s: &State, t: tok::Theme) -> El {
         .child(settings_button(t))
 }
 
-fn main_col(s: &State, t: tok::Theme, accent: Color) -> El {
+fn main_col(app: &App, t: tok::Theme, accent: Color) -> El {
     col().key("main")
         .grow(1.0)
         .min_h(0.0)
-        .child(top_bar(s, t))
-        .child(screen_body(s, t, accent))
+        .child(top_bar(&app.core, t))
+        .child(screen_body(app, t, accent))
 }
 
-fn screen_body(s: &State, t: tok::Theme, accent: Color) -> El {
-    match state::current(s) {
+fn screen_body(app: &App, t: tok::Theme, accent: Color) -> El {
+    match state::current(&app.core) {
         Route::Home => screens::home(t),
         Route::Feed => screens::feed(t),
-        Route::Popular => screens::popular(t),
+        Route::Popular => screens::popular(&app.core, t),
         Route::ForYou => screens::for_you(t),
         Route::LikedSongs => screens::liked_songs(t),
         Route::Albums => screens::albums(t),
@@ -177,8 +187,9 @@ fn screen_body(s: &State, t: tok::Theme, accent: Color) -> El {
         Route::History => screens::history(t),
         Route::Stats => screens::stats(t),
         Route::Downloads => screens::downloads(t),
-        Route::Search => screens::search(t),
+        Route::Search => screens::search(t, &app.search),
         Route::Settings => screens::settings(t),
+        Route::SettingsPage(p) => screens::settings_page(p, t),
         route => screens::detail(route, accent, t),
     }
 }
@@ -191,7 +202,7 @@ fn now_playing(s: &State, t: tok::Theme, accent: Color) -> El {
         .center()
         .hover(t.hover)
         .focusable(true)
-        .on_press(|_: &mut State| {})
+        .on_press(|_: &mut App| {})
         .child(icon(&PREV, 16.0).color(t.text));
     let play_btn = el().key("play")
         .label(if s.playing { "Pause" } else { "Play" })
@@ -200,7 +211,7 @@ fn now_playing(s: &State, t: tok::Theme, accent: Color) -> El {
         .center()
         .fill(accent)
         .focusable(true)
-        .on_press(|st: &mut State| state::tap_play(st))
+        .on_press(|a: &mut App| state::tap_play(&mut a.core))
         .child(icon(if s.playing { &PAUSE } else { &PLAY }, 20.0).color(t.bg));
     let next_btn = el().key("next")
         .label("Next")
@@ -209,7 +220,7 @@ fn now_playing(s: &State, t: tok::Theme, accent: Color) -> El {
         .center()
         .hover(t.hover)
         .focusable(true)
-        .on_press(|_: &mut State| {})
+        .on_press(|_: &mut App| {})
         .child(icon(&NEXT, 16.0).color(t.text));
 
     row()
@@ -262,14 +273,14 @@ fn volume(t: tok::Theme, accent: Color) -> El {
 }
 
 fn main() {
-    rune::run(AppSpec::<State> {
-        scenes: &state::SCENES,
-        on_key: Some(|s, ev, _tx| {
+    rune::run(AppSpec::<App> {
+        scenes: &SCENES,
+        on_key: Some(|app, ev, _tx| {
             if let Key::Text(k) = &ev.key {
-                return state::handle_key(s, k.as_str());
+                return state::handle_key(&mut app.core, k.as_str());
             }
             false
         }),
-        ..AppSpec::new("OpenTidal", (1280.0, 800.0), State::default, view)
+        ..AppSpec::new("OpenTidal", (1280.0, 800.0), App::default, view)
     });
 }

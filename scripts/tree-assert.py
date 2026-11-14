@@ -12,6 +12,7 @@ Predicates (all keys are element `key` strings from `--tree`):
   has=KEY               a keyed element named KEY exists
   label=KEY=VALUE       element KEY's label equals VALUE
   label-has=KEY=SUB     element KEY's label contains SUB
+  text=KEY=VALUE        element KEY's text equals VALUE
   checked=KEY           accessibility node KEY has state "checked"
   unchecked=KEY         accessibility node KEY has state "unchecked"
   fill=KEY=VALUE        element KEY's fill equals VALUE
@@ -72,6 +73,11 @@ def main():
             e = find(elements, key)
             ok = e is not None and sub in (e.get("label") or "")
             detail = f"label {key!r} {(e and e.get('label'))!r} lacks {sub!r}"
+        elif name == "text":
+            key, want = arg.split("=", 1)
+            e = find(elements, key)
+            ok = e is not None and e.get("text") == want
+            detail = f"text {key!r} {(e and e.get('text'))!r} != {want!r}"
         elif name in ("checked", "unchecked"):
             node = acc_find(acc, arg)
             states = (node or {}).get("states", [])

@@ -1,20 +1,22 @@
 # Navigate
 
-Navigate selects one of the six sidebar sections (Home, Explore, My Collection, Radio, My Mixes,
-Favorites). The selected item is highlighted and its accessibility state is `checked`; the others
-are `unchecked`. Selection is the user-visible change: in this build the content pane title is
-static, so only the sidebar highlight moves.
+Navigate moves between the app's screens. The sidebar selects one of thirteen sections (Home,
+Feed, Popular, For You, then the "Your Library" sections and Downloads), each with its own content
+pane. Cards drill into a detail screen, and a Back button in the top bar returns. The selected
+sidebar item is `checked` and the content pane title names the current section.
 
 ## Sub-features
 
-- `nav-default` opens on Home, the first item, checked.
-- `nav-select` chooses an item by click and moves the checked state to it.
-- `nav-radio` selects a non-adjacent item (Radio) to show selection is not index-adjacent.
+- `nav-default` opens on Home, checked, with no Back button.
+- `nav-select` chooses a section by click and swaps the content pane to it.
+- `nav-drill` opens a detail screen from a card, showing a Back button.
+- `nav-back` returns from a detail to the previous section.
 
 ## How to get to it (user POV)
 
-- Click a sidebar item: `Home`, `Explore`, `My Collection`, `Radio`, `My Mixes`, or `Favorites`.
-- The sidebar is the left column; each item is a button.
+- Click a sidebar item, for example `Albums`.
+- Click a card, for example the first album card.
+- Click `Back` in the top bar while on a detail screen.
 
 ## Driving it with control-opentidal
 
@@ -25,23 +27,29 @@ Preconditions:
 
 - **Open on Home.** Drive the default scene with no input.
   Run `scripts/control-opentidal drive scripts/verify/mark.json artifacts/navigate/home --scene default`. Assert
-  `scripts/tree-assert.py artifacts/navigate/home/tree.json checked=nav-Home unchecked=nav-Explore`.
-- **Choose Explore.** Tap `nav-Explore` and assert the state moves.
-  Write a script
-  `{"events":[{"t":0.1,"type":"tap","key":"nav-Explore"},{"t":0.5,"type":"mark","name":"end"}]}`,
-  run `scripts/control-opentidal drive SCRIPT artifacts/navigate/explore`, then assert
-  `scripts/tree-assert.py artifacts/navigate/explore/tree.json checked=nav-Explore unchecked=nav-Home`.
-- **Choose Radio.** Tap `nav-Radio` from a fresh run and assert only Radio is checked.
-  Use `{"events":[{"t":0.1,"type":"tap","key":"nav-Radio"},{"t":0.5,"type":"mark","name":"end"}]}`,
-  run `scripts/control-opentidal drive SCRIPT artifacts/navigate/radio`, then assert
-  `scripts/tree-assert.py artifacts/navigate/radio/tree.json checked=nav-Radio unchecked=nav-Explore unchecked=nav-Home`.
+  `scripts/tree-assert.py artifacts/navigate/home/tree.json checked=nav-Home unchecked=nav-Albums text=title=Home`.
+- **Choose a section.** Tap `nav-Albums`. Use
+  `{"events":[{"t":0.1,"type":"tap","key":"nav-Albums"},{"t":0.5,"type":"mark","name":"end"}]}`, run
+  `scripts/control-opentidal drive SCRIPT artifacts/navigate/albums`, then assert
+  `scripts/tree-assert.py artifacts/navigate/albums/tree.json checked=nav-Albums unchecked=nav-Home text=title=Albums`.
+- **Drill into a detail.** From a fresh run, tap the first card. Use
+  `{"events":[{"t":0.1,"type":"tap","key":"card-0"},{"t":0.5,"type":"mark","name":"end"}]}`, run
+  `scripts/control-opentidal drive SCRIPT artifacts/navigate/drill`, then assert
+  `scripts/tree-assert.py artifacts/navigate/drill/tree.json has=back has=hero-title text=hero-title=Currents`.
+- **Go back.** Tap `back` after drilling. Use
+  `{"events":[{"t":0.1,"type":"tap","key":"card-0"},{"t":0.5,"type":"tap","key":"back"},{"t":0.9,"type":"mark","name":"end"}]}`,
+  run `scripts/control-opentidal drive SCRIPT artifacts/navigate/back`, then assert
+  `scripts/tree-assert.py artifacts/navigate/back/tree.json has=shelf-title` and that `back` is gone
+  (the `has` predicate has no negative form; assert the Home title instead via `text=title=Home`).
 - **Proof.** Save the `drive` artifacts and the `tree-assert.py` output under
-  `artifacts/navigate/<case>/`. The tree shows the tapped item checked and the others unchecked.
+  `artifacts/navigate/<case>/`.
 
 ## Gotchas
 
-- The content pane title always reads `Home`; do not assert it changes with selection.
-- The global space key toggles play/pause, it does not activate the focused nav item; drive
-  selection by `tap`, not by key.
-- `nav-select` must start from a fresh run; tapping two items in one script leaves the last one
-  checked, so a per-case script taps exactly one item.
+- Sidebar keys carry spaces for multi-word labels: `nav-For You`, `nav-Liked Songs`,
+  `nav-On this device`. Quote them exactly.
+- The Back button exists only at detail depth; at Home the top bar has Search and Settings only.
+- The content pane title is per-section now, so assert it changes with selection, unlike the old
+  prototype whose pane was hard-coded to Home.
+- Each case starts from a fresh run; a script that drills and then taps Back proves the round trip
+  in one run.

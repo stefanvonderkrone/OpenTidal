@@ -48,7 +48,7 @@ commands, and observable proof.
 
 ## Features
 
-- [Navigate](./navigate.md) — sidebar selection moves and the checked state follows.
+- [Navigate](./navigate.md) — sidebar selection, card drill into details, and back.
 - [Play / pause](./play-pause.md) — the transport play button and the space key toggle state.
 - [Accent](./accent.md) — the `a` key cycles the accent colour.
-- [Library](./library.md) — the Home grid, sidebar and now-playing bar render.
+- [Library](./library.md) — the shell structure: sidebar, top bar, Home shelves, now-playing.

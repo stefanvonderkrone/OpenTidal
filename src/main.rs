@@ -67,6 +67,21 @@ fn nav_item(route: Route, selected: bool, t: tok::Theme, accent: Color) -> El {
 }
 
 fn sidebar(s: &State, t: tok::Theme, accent: Color) -> El {
+    let sidebar = col().key("sidebar")
+        .w(if s.collapsed { 64.0 } else { 240.0 })
+        .h_full()
+        .child(
+            text(if s.collapsed { "T" } else { "TIDAL" })
+                .key("logo")
+                .font(type_::TITLE)
+                .color(t.text)
+                .px(if s.collapsed { space::S3 } else { space::S6 })
+                .pt(space::S6)
+                .pb(space::S3),
+        );
+    if s.collapsed {
+        return sidebar;
+    }
     let mut primary = col().key("primary").gap(space::S1).px(space::S2).pt(space::S2);
     let mut library = col().key("library").gap(space::S1).px(space::S2);
     let mut bottom = col().key("bottom").gap(space::S1).px(space::S2).pb(space::S2).pt(space::S3);
@@ -90,19 +105,7 @@ fn sidebar(s: &State, t: tok::Theme, accent: Color) -> El {
         }
     }
 
-    col()
-        .key("sidebar")
-        .w(240.0)
-        .h_full()
-        .child(
-            text("TIDAL")
-                .key("logo")
-                .font(type_::TITLE)
-                .color(t.text)
-                .px(space::S6)
-                .pt(space::S6)
-                .pb(space::S3),
-        )
+    sidebar
         .child(primary)
         .child(library.grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }))
         .child(bottom)
@@ -148,7 +151,13 @@ fn settings_button(t: tok::Theme) -> El {
 }
 
 fn top_bar(s: &State, t: tok::Theme) -> El {
-    let mut left = row().gap(space::S3).center_y();
+    let label = if s.collapsed { "Expand sidebar" } else { "Collapse sidebar" };
+    let toggle = el().key("toggle-sidebar").label(label)
+        .h(32.0).px(space::S3).radius(radius::MD).center_y()
+        .hover(t.hover).focusable(true)
+        .on_press(|a: &mut App| state::toggle_sidebar(&mut a.core))
+        .child(text(label).key("label").font(type_::BODY).color(t.text_secondary));
+    let mut left = row().gap(space::S3).center_y().child(toggle);
     if s.stack.len() > 1 {
         left = left.child(back_button(t));
     }

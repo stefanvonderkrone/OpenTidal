@@ -352,10 +352,26 @@ pub fn settings(t: tok::Theme) -> El {
     page("Settings", "Tune OpenTidal", t, rows)
 }
 
-/// A settings subpage. The rows themselves are placeholders until a real
-/// settings model exists; the navigation and back behaviour are real.
+fn settings_row(key: String, label: &str, value: &str, t: tok::Theme) -> El {
+    row().key(key).h(44.0).px(space::S3).radius(radius::MD).center_y().justify_between()
+        .child(text(label).key("label").font(type_::BODY).color(t.text))
+        .child(text(value).key("value").font(type_::BODY).color(t.text_secondary))
+}
+
 pub fn settings_page(p: SettingsPage, t: tok::Theme) -> El {
-    page(p.label(), "Settings", t, col().gap(space::S3))
+    let items: &[(&str, &str)] = match p {
+        SettingsPage::Playback => &[("Crossfade", "Off"), ("Gapless playback", "On"), ("Normalize volume", "On")],
+        SettingsPage::Quality => &[("Streaming quality", "High"), ("Download quality", "High")],
+        SettingsPage::Downloads => &[("Download location", "On this device"), ("Wi-Fi only", "On")],
+        SettingsPage::Notifications => &[("New releases", "On"), ("Concert alerts", "Off")],
+        SettingsPage::Import => &[("Import from Spotify", ">"), ("Import from Last.fm", ">")],
+        SettingsPage::About => &[("Version", "0.1.0"), ("OpenTidal", "")],
+    };
+    let mut rows = col().gap(space::S1);
+    for (i, (label, value)) in items.iter().enumerate() {
+        rows = rows.child(settings_row(format!("opt-{i}"), label, value, t));
+    }
+    page(p.label(), "Settings", t, rows)
 }
 
 // --- Detail screens ------------------------------------------------------

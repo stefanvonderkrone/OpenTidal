@@ -2,22 +2,17 @@
 //! `cargo run` opens the window.
 //! `cargo run -- --snap out.png --scene default` renders headless.
 
+mod state;
+
 use rune::tok::{self, radius, space, type_};
 use rune::{AppSpec, Color, Cx, El, Icon, Key, ScrollSpec, col, el, icon, oklch, row, text};
+use state::State;
 
-struct State {
-    nav: usize,
-    playing: bool,
-    accent: usize,
-}
+// The accent count must match the rune palette the app draws from.
+const _: () = assert!(state::ACCENT_LEN == tok::ACCENT_NAMES.len());
 
-impl Default for State {
-    fn default() -> Self {
-        State { nav: 0, playing: true, accent: 0 }
-    }
-}
-
-const NAV: [&str; 6] = ["Home", "Explore", "My Collection", "Radio", "My Mixes", "Favorites"];
+const NAV: [&str; state::NAV_LEN] =
+    ["Home", "Explore", "My Collection", "Radio", "My Mixes", "Favorites"];
 const PLAYLISTS: [&str; 4] = ["Chill", "Workout", "Focus", "Road Trip"];
 const ALBUMS: [(&str, &str); 10] = [
     ("Currents", "Tame Impala"),
@@ -75,7 +70,7 @@ fn sidebar(s: &State, t: tok::Theme, accent: Color) -> El {
                 .fill(if selected { t.hover } else { Color::TRANSPARENT })
                 .hover(t.hover)
                 .focusable(true)
-                .on_press(move |st: &mut State| st.nav = i)
+                .on_press(move |st: &mut State| state::tap_nav(st, i))
                 .child(
                     text(*name)
                         .key("label")
@@ -200,7 +195,7 @@ fn now_playing(s: &State, t: tok::Theme, accent: Color) -> El {
         .center()
         .fill(accent)
         .focusable(true)
-        .on_press(|st: &mut State| st.playing = !st.playing)
+        .on_press(|st: &mut State| state::tap_play(st))
         .child(icon(if s.playing { &PAUSE } else { &PLAY }, 20.0).color(t.bg));
     let next_btn = el().key("next")
         .label("Next")
@@ -263,22 +258,10 @@ fn volume(t: tok::Theme, accent: Color) -> El {
 
 fn main() {
     rune::run(AppSpec::<State> {
-        scenes: &[
-            ("default", |_| {}),
-            ("accent-blue", |s| s.accent = 0),
-            ("accent-pink", |s| s.accent = 2),
-            ("paused", |s| s.playing = false),
-        ],
+        scenes: &state::SCENES,
         on_key: Some(|s, ev, _tx| {
             if let Key::Text(k) = &ev.key {
-                if k.as_str() == "a" {
-                    s.accent = (s.accent + 1) % 6;
-                    return true;
-                }
-                if k.as_str() == " " {
-                    s.playing = !s.playing;
-                    return true;
-                }
+                return state::handle_key(s, k.as_str());
             }
             false
         }),

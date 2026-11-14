@@ -3,13 +3,15 @@
 //! `cargo run -- --snap out.png --scene default` renders headless.
 
 mod app;
-mod data;
+mod catalog;
+mod library;
 mod screens;
 mod state;
 
 use rune::tok::{self, radius, space, type_};
 use rune::{AppSpec, Color, Cx, El, Icon, Key, ScrollSpec, col, el, icon, row, text};
 use app::App;
+use catalog::TrackId;
 use state::{Group, Route, State};
 
 // The accent count must match the rune palette the app draws from.
@@ -19,6 +21,7 @@ const PLAY: Icon = Icon { name: "play", view: 24.0, body: "<path d=\"M8 5v14l11-
 const PAUSE: Icon = Icon { name: "pause", view: 24.0, body: "<path d=\"M7 5h4v14H7zM13 5h4v14h-4z\"/>" };
 const PREV: Icon = Icon { name: "prev", view: 24.0, body: "<path d=\"M6 5h2v14H6zM20 5v14l-9-7z\"/>" };
 const NEXT: Icon = Icon { name: "next", view: 24.0, body: "<path d=\"M4 5l9 7-9 7zM16 5h2v14h-2z\"/>" };
+const HEART: Icon = Icon { name: "heart", view: 24.0, body: "<path d=\"M12 21s-6.7-4.35-9.33-8.11C.6 9.9 2.08 5.9 5.5 5.9c2.07 0 3.44 1.17 4.5 2.56 1.06-1.39 2.43-2.56 4.5-2.56 3.42 0 4.9 4 2.83 6.99C18.7 16.65 12 21 12 21z\"/>" };
 
 const SCENES: [(&str, fn(&mut App)); 4] = [
     ("default", |_| {}),
@@ -105,9 +108,17 @@ fn sidebar(s: &State, t: tok::Theme, accent: Color) -> El {
         }
     }
 
+    let user = text(&s.lib.name)
+        .key("user-name")
+        .font(type_::LABEL)
+        .color(t.text_secondary)
+        .px(space::S3)
+        .pt(space::S2);
+
     sidebar
         .child(primary)
         .child(library.grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }))
+        .child(user)
         .child(bottom)
 }
 
@@ -188,23 +199,40 @@ fn screen_body(app: &App, t: tok::Theme, accent: Color) -> El {
         Route::Popular => screens::popular(&app.core, t),
         Route::ForYou => screens::for_you(t),
         Route::LikedSongs => screens::liked_songs(&app.core, t),
-        Route::Albums => screens::albums(t),
-        Route::Artists => screens::artists(t),
-        Route::Playlists => screens::playlists(t),
-        Route::Collections => screens::collections(t),
+        Route::Albums => screens::albums(&app.core, t),
+        Route::Artists => screens::artists(&app.core, t),
+        Route::Playlists => screens::playlists(&app.core, t),
+        Route::Collections => screens::collections(&app.core, t),
         Route::Local => screens::local(&app.core, t),
         Route::History => screens::history(&app.core, t),
-        Route::Stats => screens::stats(t),
-        Route::Downloads => screens::downloads(t),
+        Route::Stats => screens::stats(&app.core, t),
+        Route::Downloads => screens::downloads(&app.core, t),
         Route::Search => screens::search(t, &app.search),
         Route::Settings => screens::settings(t),
-        Route::SettingsPage(p) => screens::settings_page(p, t),
-        route => screens::detail(route, &app.core, accent, t),
+        Route::SettingsPage(p) => screens::settings_page(p, app, t),
+        route => screens::detail(route, app, accent, t),
     }
 }
 
 fn now_playing(s: &State, t: tok::Theme, accent: Color) -> El {
-    let tr = data::TRACKS.get(s.now_playing.unwrap_or(0)).copied().unwrap_or(data::TRACKS[0]);
+    let id = s.now_playing.unwrap_or(TrackId(0));
+    let tr = catalog::track(id);
+    let liked = s.lib.is_liked(id);
+
+    let like_btn = el().key("like")
+        .label(if liked { "Unlike" } else { "Like" })
+        .size(36.0, 36.0)
+        .radius(18.0)
+        .center()
+        .hover(t.hover)
+        .focusable(true)
+        .on_press(move |a: &mut App| {
+            if let Some(tr) = a.core.now_playing {
+                a.core.lib.toggle_like(tr);
+            }
+        })
+        .child(icon(&HEART, 16.0).color(if liked { accent } else { t.text_secondary }));
+
     let prev_btn = el().key("prev")
         .label("Previous")
         .size(36.0, 36.0)
@@ -243,9 +271,13 @@ fn now_playing(s: &State, t: tok::Theme, accent: Color) -> El {
         .fill(t.card)
         .border(1.0, t.separator)
         .child(
-            col().gap(2.0)
-                .child(text(tr.title).key("track").font(type_::BODY).color(t.text))
-                .child(text(tr.artist).key("artist").font(type_::LABEL).color(t.text_secondary)),
+            row().gap(space::S3).center_y()
+                .child(like_btn)
+                .child(
+                    col().gap(2.0)
+                        .child(text(tr.title).key("track").font(type_::BODY).color(t.text))
+                        .child(text(catalog::artist(tr.artist).name).key("artist").font(type_::LABEL).color(t.text_secondary)),
+                ),
         )
         .child(
             col().key("transport").w(480.0).gap(space::S1)

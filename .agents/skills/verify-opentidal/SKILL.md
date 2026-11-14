@@ -83,6 +83,9 @@ Capture the action and the resulting state, not just the final screen:
   prove the state. Pair them.
 - Track rows select the now-playing track. Settings option rows show static values.
 - Search filters the catalog. The sidebar toggle hides or shows the navigation groups.
+- The user-management journeys in `features/` prove like/save/follow/download, playlist
+  create/add/delete, and collections. Rename (playlist and profile) types into a text field the
+  headless driver does not fill, so those two operations are proven by `cargo test` instead.
 
 ## Cleanup
 

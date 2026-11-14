@@ -126,6 +126,18 @@ fn track_list(selected: Option<usize>, t: tok::Theme) -> El {
     l
 }
 
+/// The tracks by one artist, keeping each track's original index so the
+/// now-playing selector stays in range.
+fn artist_tracks(artist: &str, selected: Option<usize>, t: tok::Theme) -> El {
+    let mut l = col().key("tracks").gap(space::S1);
+    for (i, tr) in data::TRACKS.iter().enumerate() {
+        if tr.artist == artist {
+            l = l.child(track_row(i, *tr, selected == Some(i), t));
+        }
+    }
+    l
+}
+
 fn header(title: &str, subtitle: &str, t: tok::Theme) -> El {
     col().px(space::S6).pt(space::S6).pb(space::S3).gap(space::S1)
         .child(text(title).key("title").font(type_::TITLE).color(t.text))
@@ -305,21 +317,33 @@ pub fn search(t: tok::Theme, edit: &TextEdit) -> El {
                 .key("search-empty").font(type_::BODY).color(t.text_secondary)
         } else {
             let mut results = col().gap(space::S3);
-            for (title, cards, per) in [("Albums", albums, 5), ("Artists", artists, 6), ("Tracks", tracks, 1)] {
-                if !cards.is_empty() {
-                    results = results
-                        .child(text(title).key(format!("result-{title}")).font(type_::SECTION).color(t.text))
-                        .child(grid(cards, per));
+            if !albums.is_empty() {
+                results = results
+                    .child(text("Albums").key("result-Albums").font(type_::SECTION).color(t.text))
+                    .child(grid(albums, 5));
+            }
+            if !artists.is_empty() {
+                results = results
+                    .child(text("Artists").key("result-Artists").font(type_::SECTION).color(t.text))
+                    .child(grid(artists, 6));
+            }
+            if !tracks.is_empty() {
+                let mut list = col().gap(space::S1);
+                for tr in tracks {
+                    list = list.child(tr);
                 }
+                results = results
+                    .child(text("Tracks").key("result-Tracks").font(type_::SECTION).color(t.text))
+                    .child(list);
             }
             results
         }
     };
     let field = text_input(edit, type_::BODY)
         .key("search-box")
-        .h(40.0)
         .w_full()
         .px(space::S3)
+        .py(space::S2)
         .radius(radius::MD)
         .fill(t.hover)
         .single_line()
@@ -436,6 +460,18 @@ pub fn detail(route: Route, s: &State, accent: Color, t: tok::Theme) -> El {
                 .scroll(ScrollSpec { stick_bottom: false })
                 .px(space::S6)
                 .pb(space::S6)
-                .child(track_list(s.now_playing, t)),
+                .child(detail_tracks(route, s.now_playing, t)),
         )
+}
+
+/// The track list a detail screen shows. An album or artist lists only its
+/// own tracks; a playlist mixes the whole catalog, which is the placeholder
+/// behaviour until real per-playlist tracks exist.
+fn detail_tracks(route: Route, selected: Option<usize>, t: tok::Theme) -> El {
+    match route {
+        Route::Album(i) => artist_tracks(album_at(i).artist, selected, t),
+        Route::Artist(i) => artist_tracks(artist_at(i).name, selected, t),
+        Route::Playlist(_) => track_list(selected, t),
+        _ => track_list(selected, t),
+    }
 }

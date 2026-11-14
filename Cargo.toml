@@ -1,0 +1,21 @@
+[package]
+name = "opentidal"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace]
+exclude = ["rune"]
+
+[dependencies]
+rune = { path = "rune/crates/rune" }
+
+# Rune patches these four crates in its own workspace. A dependency's [patch]
+# does not reach this workspace, so replicate them here in path form, since
+# rune is vendored locally. See rune/VENDORED.md and rune's "Depending on Rune"
+# README section.
+[patch.crates-io]
+wgpu-hal = { path = "rune/vendor/wgpu-hal" }
+winit = { path = "rune/vendor/winit" }
+parley_engine = { path = "rune/vendor/parley_engine" }
+accesskit_windows = { path = "rune/vendor/accesskit_windows" }

@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Headless verification harness for OpenTidal. Read .agents/skills/verify-opentidal/SKILL.md.
+#
+#   scripts/control-opentidal build
+#   scripts/control-opentidal doctor
+#   scripts/control-opentidal drive SCRIPT.json OUT_DIR [--scene NAME]
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN="$ROOT/target/debug/opentidal"
+TREE_ASSERT="$ROOT/scripts/tree-assert.py"
+
+usage() {
+    echo "usage: control-opentidal {build|doctor|drive} ..." >&2
+    exit 2
+}
+
+build() {
+    (cd "$ROOT" && cargo build)
+}
+
+doctor() {
+    if [[ ! -x "$BIN" ]]; then
+        echo "doctor: no binary at $BIN" >&2
+        echo "doctor: run \`scripts/control-opentidal build\` first" >&2
+        exit 1
+    fi
+    "$BIN" --list-scenes | grep -qx default \
+        || { echo "doctor: scene 'default' missing" >&2; exit 1; }
+    "$BIN" --list-windows | grep -qx main \
+        || { echo "doctor: window 'main' missing" >&2; exit 1; }
+    local tmp
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' RETURN
+    "$BIN" --scene default --tree "$tmp/t.json" >/dev/null 2>&1
+    python3 "$TREE_ASSERT" "$tmp/t.json" title=OpenTidal viewport=1280x800 has=play >/dev/null
+    echo "ok: window main, scene default, title OpenTidal, viewport 1280x800"
+}
+
+drive() {
+    # drive SCRIPT.json OUT_DIR [--scene NAME]
+    local script="${1:-}"; shift || true
+    local out="${1:-}"; shift || true
+    local scene="default"
+    if [[ $# -gt 0 ]]; then
+        [[ "$1" == "--scene" ]] || { echo "drive: unknown option $1" >&2; usage; }
+        scene="${2:?--scene needs a name}"
+    fi
+    [[ -n "$script" && -n "$out" ]] || usage
+    [[ -x "$BIN" ]] || { echo "drive: no binary; run \`scripts/control-opentidal build\`" >&2; exit 1; }
+    [[ -f "$script" ]] || { echo "drive: no script $script" >&2; exit 1; }
+
+    mkdir -p "$out"
+    cp "$script" "$out/script.json"
+    if ! "$BIN" --script "$script" --scene "$scene" \
+        --tree "$out/tree.json" --snap "$out/frame.png" \
+        > "$out/run.log" 2>&1; then
+        echo "drive: app exited non-zero; see $out/run.log" >&2
+        tail -n 5 "$out/run.log" >&2
+        exit 1
+    fi
+    echo "wrote $out/script.json $out/tree.json $out/frame.png $out/run.log"
+    tail -n 1 "$out/run.log"
+}
+
+case "${1:-}" in
+    build) shift; build ;;
+    doctor) shift; doctor ;;
+    drive) shift; drive "$@" ;;
+    *) usage ;;
+esac

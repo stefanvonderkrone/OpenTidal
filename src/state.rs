@@ -32,6 +32,16 @@ pub enum Route {
     Playlist(usize),
 }
 
+/// Which sidebar region a section route belongs to. `Search` and `Settings`
+/// live in the top bar and are absent from `SECTIONS`, so their group is
+/// never used by the sidebar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Group {
+    Primary,
+    Library,
+    Bottom,
+}
+
 impl Route {
     /// The route's human name. Detail routes return a generic name; the view
     /// replaces it with the catalog entry's title.
@@ -55,6 +65,17 @@ impl Route {
             Route::Album(_) => "Album",
             Route::Artist(_) => "Artist",
             Route::Playlist(_) => "Playlist",
+        }
+    }
+
+    /// The sidebar region the section route belongs to.
+    pub fn group(self) -> Group {
+        match self {
+            Route::Home | Route::Feed | Route::Popular | Route::ForYou => Group::Primary,
+            Route::LikedSongs | Route::Albums | Route::Artists | Route::Playlists
+            | Route::Collections | Route::Local | Route::History | Route::Stats => Group::Library,
+            Route::Downloads | Route::Search | Route::Settings => Group::Bottom,
+            Route::Album(_) | Route::Artist(_) | Route::Playlist(_) => Group::Library,
         }
     }
 }

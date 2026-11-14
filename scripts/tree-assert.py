@@ -10,6 +10,7 @@ Predicates (all keys are element `key` strings from `--tree`):
   title=VALUE           top-level window title equals VALUE
   viewport=WxH          top-level viewport equals [W, H]
   has=KEY               a keyed element named KEY exists
+  absent=KEY            no keyed element named KEY exists
   label=KEY=VALUE       element KEY's label equals VALUE
   label-has=KEY=SUB     element KEY's label contains SUB
   text=KEY=VALUE        element KEY's text equals VALUE
@@ -63,6 +64,9 @@ def main():
         elif name == "has":
             ok = find(elements, arg) is not None
             detail = f"element {arg!r} missing"
+        elif name == "absent":
+            ok = find(elements, arg) is None
+            detail = f"element {arg!r} unexpectedly present"
         elif name == "label":
             key, want = arg.split("=", 1)
             e = find(elements, key)

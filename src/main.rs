@@ -178,23 +178,24 @@ fn screen_body(app: &App, t: tok::Theme, accent: Color) -> El {
         Route::Feed => screens::feed(t),
         Route::Popular => screens::popular(&app.core, t),
         Route::ForYou => screens::for_you(t),
-        Route::LikedSongs => screens::liked_songs(t),
+        Route::LikedSongs => screens::liked_songs(&app.core, t),
         Route::Albums => screens::albums(t),
         Route::Artists => screens::artists(t),
         Route::Playlists => screens::playlists(t),
         Route::Collections => screens::collections(t),
-        Route::Local => screens::local(t),
-        Route::History => screens::history(t),
+        Route::Local => screens::local(&app.core, t),
+        Route::History => screens::history(&app.core, t),
         Route::Stats => screens::stats(t),
         Route::Downloads => screens::downloads(t),
         Route::Search => screens::search(t, &app.search),
         Route::Settings => screens::settings(t),
         Route::SettingsPage(p) => screens::settings_page(p, t),
-        route => screens::detail(route, accent, t),
+        route => screens::detail(route, &app.core, accent, t),
     }
 }
 
 fn now_playing(s: &State, t: tok::Theme, accent: Color) -> El {
+    let tr = data::TRACKS.get(s.now_playing.unwrap_or(0)).copied().unwrap_or(data::TRACKS[0]);
     let prev_btn = el().key("prev")
         .label("Previous")
         .size(36.0, 36.0)
@@ -234,8 +235,8 @@ fn now_playing(s: &State, t: tok::Theme, accent: Color) -> El {
         .border(1.0, t.separator)
         .child(
             col().gap(2.0)
-                .child(text("Blinding Lights").key("track").font(type_::BODY).color(t.text))
-                .child(text("The Weeknd").key("artist").font(type_::LABEL).color(t.text_secondary)),
+                .child(text(tr.title).key("track").font(type_::BODY).color(t.text))
+                .child(text(tr.artist).key("artist").font(type_::LABEL).color(t.text_secondary)),
         )
         .child(
             col().key("transport").w(480.0).gap(space::S1)

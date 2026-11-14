@@ -97,8 +97,12 @@ fn grid(cards: Vec<El>, per: usize) -> El {
     g
 }
 
-fn track_row(i: usize, tr: Track, t: tok::Theme) -> El {
+fn track_row(i: usize, tr: Track, selected: bool, t: tok::Theme) -> El {
     row().key(format!("track-{i}"))
+        .checked(selected)
+        .fill(if selected { t.hover } else { Color::TRANSPARENT })
+        .focusable(true)
+        .on_press(move |a: &mut App| state::select_track(&mut a.core, i, data::TRACKS.len()))
         .h(44.0)
         .px(space::S2)
         .radius(radius::MD)
@@ -109,15 +113,15 @@ fn track_row(i: usize, tr: Track, t: tok::Theme) -> El {
         .child(
             col().grow(1.0).gap(2.0)
                 .child(text(tr.title).key("title").font(type_::BODY).color(t.text))
-                .child(text(tr.artist).key("artist").font(type_::LABEL).color(t.text_secondary)),
+                .child(text(tr.artist).key("track-artist").font(type_::LABEL).color(t.text_secondary)),
         )
         .child(text(tr.duration).key("duration").font(type_::LABEL).color(t.text_secondary))
 }
 
-fn track_list(t: tok::Theme) -> El {
+fn track_list(selected: Option<usize>, t: tok::Theme) -> El {
     let mut l = col().key("tracks").gap(space::S1);
     for (i, tr) in data::TRACKS.iter().enumerate() {
-        l = l.child(track_row(i, *tr, t));
+        l = l.child(track_row(i, *tr, selected == Some(i), t));
     }
     l
 }
@@ -197,7 +201,7 @@ pub fn popular(s: &State, t: tok::Theme) -> El {
     let body = match s.popular_tab {
         PopularTab::Artists => artists_grid(t),
         PopularTab::Albums => albums_grid(t),
-        PopularTab::Tracks => track_list(t),
+        PopularTab::Tracks => track_list(s.now_playing, t),
     };
     page("Popular", "Global charts", t,
         col().gap(space::S3).child(tabs).child(body))
@@ -226,8 +230,8 @@ pub fn for_you(t: tok::Theme) -> El {
             .child(shelf("From your genres", t, b)))
 }
 
-pub fn liked_songs(t: tok::Theme) -> El {
-    page("Liked Songs", "Tracks you saved", t, track_list(t))
+pub fn liked_songs(s: &State, t: tok::Theme) -> El {
+    page("Liked Songs", "Tracks you saved", t, track_list(s.now_playing, t))
 }
 
 pub fn albums(t: tok::Theme) -> El {
@@ -246,12 +250,12 @@ pub fn collections(t: tok::Theme) -> El {
     page("Collections", "Folders and collections", t, playlists_grid(t))
 }
 
-pub fn local(t: tok::Theme) -> El {
-    page("On this device", "Music you downloaded", t, track_list(t))
+pub fn local(s: &State, t: tok::Theme) -> El {
+    page("On this device", "Music you downloaded", t, track_list(s.now_playing, t))
 }
 
-pub fn history(t: tok::Theme) -> El {
-    page("History", "Recently played", t, track_list(t))
+pub fn history(s: &State, t: tok::Theme) -> El {
+    page("History", "Recently played", t, track_list(s.now_playing, t))
 }
 
 pub fn stats(t: tok::Theme) -> El {
@@ -355,7 +359,7 @@ fn hero(cover_el: El, title: &str, subtitle: &str, accent: Color, t: tok::Theme)
 
 /// A detail screen: a hero over a track list. The back affordance lives in
 /// the top bar, not here.
-pub fn detail(route: Route, accent: Color, t: tok::Theme) -> El {
+pub fn detail(route: Route, s: &State, accent: Color, t: tok::Theme) -> El {
     let (cover_el, title, subtitle) = match route {
         Route::Album(i) => {
             let a = album_at(i);
@@ -387,6 +391,6 @@ pub fn detail(route: Route, accent: Color, t: tok::Theme) -> El {
                 .scroll(ScrollSpec { stick_bottom: false })
                 .px(space::S6)
                 .pb(space::S6)
-                .child(track_list(t)),
+                .child(track_list(s.now_playing, t)),
         )
 }

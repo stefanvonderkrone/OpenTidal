@@ -1,43 +1,131 @@
-//! OpenTidal's application state and its transitions, extracted from the view so
-//! a checker can prove the state-machine invariant without compiling the
+//! OpenTidal's application state and its transitions, extracted from the view
+//! so a checker can prove the state-machine invariant without compiling the
 //! rune/wgpu view layer. `main.rs` delegates every state change to these
 //! functions; nothing here depends on `rune`.
-
-/// Number of sidebar sections. `main.rs` writes the section names as
-/// `const NAV: [&str; state::NAV_LEN]`, so the label list cannot drift from this
-/// count.
-pub const NAV_LEN: usize = 6;
 
 /// Number of accent colours. Matches `rune::tok::ACCENT_NAMES.len()`;
 /// `main.rs` asserts that equality at compile time.
 pub const ACCENT_LEN: usize = 6;
 
-/// The app's state: the selected section, whether playback is running, and the
-/// current accent.
+/// A screen in the app. The section variants are the top-level sidebar and
+/// top-bar entries. The detail variants carry a catalog id so a detail screen
+/// can never exist without its subject.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Route {
+    Home,
+    Feed,
+    Popular,
+    ForYou,
+    LikedSongs,
+    Albums,
+    Artists,
+    Playlists,
+    Collections,
+    Local,
+    History,
+    Stats,
+    Downloads,
+    Search,
+    Settings,
+    Album(usize),
+    Artist(usize),
+    Playlist(usize),
+}
+
+impl Route {
+    /// The route's human name. Detail routes return a generic name; the view
+    /// replaces it with the catalog entry's title.
+    pub fn label(self) -> &'static str {
+        match self {
+            Route::Home => "Home",
+            Route::Feed => "Feed",
+            Route::Popular => "Popular",
+            Route::ForYou => "For You",
+            Route::LikedSongs => "Liked Songs",
+            Route::Albums => "Albums",
+            Route::Artists => "Artists",
+            Route::Playlists => "Playlists",
+            Route::Collections => "Collections",
+            Route::Local => "On this device",
+            Route::History => "History",
+            Route::Stats => "Stats",
+            Route::Downloads => "Downloads",
+            Route::Search => "Search",
+            Route::Settings => "Settings",
+            Route::Album(_) => "Album",
+            Route::Artist(_) => "Artist",
+            Route::Playlist(_) => "Playlist",
+        }
+    }
+}
+
+/// The sidebar sections in order (tideway's primary block, then "Your
+/// Library", then Downloads). `Search` and `Settings` live in the top bar and
+/// are absent here.
+pub const SECTIONS: [Route; 13] = [
+    Route::Home,
+    Route::Feed,
+    Route::Popular,
+    Route::ForYou,
+    Route::LikedSongs,
+    Route::Albums,
+    Route::Artists,
+    Route::Playlists,
+    Route::Collections,
+    Route::Local,
+    Route::History,
+    Route::Stats,
+    Route::Downloads,
+];
+
+/// The app's state. The navigation stack is never empty; its last element is
+/// the current screen.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct State {
-    pub nav: usize,
+    pub stack: Vec<Route>,
     pub playing: bool,
     pub accent: usize,
 }
 
 impl Default for State {
     fn default() -> Self {
-        State { nav: 0, playing: true, accent: 0 }
+        State { stack: vec![Route::Home], playing: true, accent: 0 }
     }
 }
 
 /// The safety invariant the verification proves: every reachable state has
 /// `accent < ACCENT_LEN`, so the `accent + 1` in [`handle_key`] can never
-/// overflow `usize`, and `nav < NAV_LEN`, so the selected item is a real
-/// section.
+/// overflow `usize`, and a non-empty stack, so [`current`] always names a
+/// screen.
 pub fn invariant(s: &State) -> bool {
-    s.accent < ACCENT_LEN && s.nav < NAV_LEN
+    s.accent < ACCENT_LEN && !s.stack.is_empty()
 }
 
-/// Select a sidebar section by its index.
-pub fn tap_nav(s: &mut State, i: usize) {
-    s.nav = i;
+/// The current screen. Falls back to Home on an empty stack, which the
+/// invariant says never happens.
+pub fn current(s: &State) -> Route {
+    *s.stack.last().unwrap_or(&Route::Home)
+}
+
+/// Open a top-level section, replacing any detail depth.
+pub fn open_section(s: &mut State, route: Route) {
+    s.stack.clear();
+    s.stack.push(route);
+}
+
+/// Drill into a detail screen, stacking it on the current one. Reopening the
+/// same route is a no-op, which keeps the stack finite.
+pub fn open_detail(s: &mut State, route: Route) {
+    if s.stack.last() != Some(&route) {
+        s.stack.push(route);
+    }
+}
+
+/// Go back one screen, never below the root.
+pub fn back(s: &mut State) {
+    if s.stack.len() > 1 {
+        s.stack.pop();
+    }
 }
 
 /// Toggle playback from the transport play button.
@@ -87,54 +175,78 @@ mod tests {
     use super::*;
     use std::collections::{HashSet, VecDeque};
 
-    /// The states reachable in one event from `s`: every nav tap, the play tap,
-    /// and the two handled keys.
-    fn successors(s: State) -> Vec<State> {
+    /// The stack depth the exhaustive check explores. The shell never drills
+    /// deeper than section -> detail -> detail, so three covers real use.
+    const MAX_DEPTH: usize = 3;
+
+    /// The detail routes the check exercises, with a fixed id set so the state
+    /// space stays finite.
+    const DETAILS: [Route; 4] =
+        [Route::Album(0), Route::Album(1), Route::Artist(0), Route::Playlist(0)];
+
+    fn applying(f: impl Fn(&mut State), s: &State) -> State {
+        let mut t = s.clone();
+        f(&mut t);
+        t
+    }
+
+    /// The states reachable in one event: every section open, every detail
+    /// drill, back, the play tap, and the two handled keys.
+    fn successors(s: &State) -> Vec<State> {
         let mut out = Vec::new();
-        for i in 0..NAV_LEN {
-            let mut t = s;
-            tap_nav(&mut t, i);
-            out.push(t);
+        for r in SECTIONS.iter().chain([Route::Search, Route::Settings].iter()) {
+            out.push(applying(|st| open_section(st, *r), s));
         }
-        let mut t = s;
-        tap_play(&mut t);
-        out.push(t);
-        let mut t = s;
-        handle_key(&mut t, "a");
-        out.push(t);
-        let mut t = s;
-        handle_key(&mut t, " ");
-        out.push(t);
+        for r in DETAILS {
+            out.push(applying(|st| open_detail(st, r), s));
+        }
+        out.push(applying(back, s));
+        out.push(applying(tap_play, s));
+        out.push(applying(|st| {
+            handle_key(st, "a");
+        }, s));
+        out.push(applying(|st| {
+            handle_key(st, " ");
+        }, s));
         out
     }
 
-    /// Exhaustively explores every reachable state from every initial state and
-    /// asserts the invariant holds at each. The state domain is finite
-    /// (`NAV_LEN * ACCENT_LEN * 2` states), so this is a complete proof, not a
-    /// sample. The final length check fails if the exploration was not
-    /// exhaustive over the whole domain.
+    /// Exhaustively explores every reachable state up to `MAX_DEPTH` and
+    /// asserts the invariant at each. The accent dimension is explored in full
+    /// (all six accents and both playing states are reached at depth one), so
+    /// the accent bound holds at every depth, not only up to the bound.
     #[test]
     fn every_reachable_state_satisfies_invariant() {
         let mut seen = HashSet::new();
         let mut queue = VecDeque::new();
         for init in inits() {
             assert!(invariant(&init), "initial state breaks the invariant: {init:?}");
-            if seen.insert(init) {
+            if seen.insert(init.clone()) {
                 queue.push_back(init);
             }
         }
         while let Some(s) = queue.pop_front() {
             assert!(invariant(&s), "reachable state breaks the invariant: {s:?}");
-            for next in successors(s) {
-                if seen.insert(next) {
+            for next in successors(&s) {
+                if next.stack.len() <= MAX_DEPTH && seen.insert(next.clone()) {
                     queue.push_back(next);
                 }
             }
         }
-        assert_eq!(
-            seen.len(),
-            NAV_LEN * ACCENT_LEN * 2,
-            "the exploration was not exhaustive over the full state domain"
-        );
+        let accents: HashSet<usize> = seen.iter().map(|s| s.accent).collect();
+        let playing: HashSet<bool> = seen.iter().map(|s| s.playing).collect();
+        assert_eq!(accents.len(), ACCENT_LEN, "accent dimension was not fully explored");
+        assert_eq!(playing.len(), 2, "playing dimension was not fully explored");
+    }
+
+    /// The back transition never empties the stack, whatever the depth.
+    #[test]
+    fn back_never_empties_the_stack() {
+        let mut s = State::default();
+        back(&mut s);
+        assert!(!s.stack.is_empty(), "back from the root emptied the stack");
+        open_detail(&mut s, Route::Album(0));
+        back(&mut s);
+        assert_eq!(s.stack.len(), 1, "back from a detail did not return to the root");
     }
 }

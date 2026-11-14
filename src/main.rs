@@ -6,14 +6,11 @@ mod state;
 
 use rune::tok::{self, radius, space, type_};
 use rune::{AppSpec, Color, Cx, El, Icon, Key, ScrollSpec, col, el, icon, oklch, row, text};
-use state::State;
+use state::{Route, State};
 
 // The accent count must match the rune palette the app draws from.
 const _: () = assert!(state::ACCENT_LEN == tok::ACCENT_NAMES.len());
 
-const NAV: [&str; state::NAV_LEN] =
-    ["Home", "Explore", "My Collection", "Radio", "My Mixes", "Favorites"];
-const PLAYLISTS: [&str; 4] = ["Chill", "Workout", "Focus", "Road Trip"];
 const ALBUMS: [(&str, &str); 10] = [
     ("Currents", "Tame Impala"),
     ("Blonde", "Frank Ocean"),
@@ -50,56 +47,34 @@ fn view(s: &State, _cx: &mut Cx<State>) -> El {
         .child(
             row().key("body").grow(1.0).min_h(0.0)
                 .child(sidebar(s, t, accent))
-                .child(main_pane(t)),
+                .child(content(s, t)),
         )
         .child(now_playing(s, t, accent))
 }
 
 fn sidebar(s: &State, t: tok::Theme, accent: Color) -> El {
     let mut nav = col().key("nav").gap(space::S1).px(space::S3);
-    for (i, name) in NAV.iter().enumerate() {
-        let selected = i == s.nav;
+    for route in state::SECTIONS {
+        let selected = state::current(s) == route;
+        let name = route.label();
         nav = nav.child(
             el().key(format!("nav-{name}"))
-                .label(*name)
+                .label(name)
                 .checked(selected)
-                .h(40.0)
+                .h(36.0)
                 .px(space::S3)
                 .radius(radius::MD)
                 .center_y()
                 .fill(if selected { t.hover } else { Color::TRANSPARENT })
                 .hover(t.hover)
                 .focusable(true)
-                .on_press(move |st: &mut State| state::tap_nav(st, i))
+                .on_press(move |st: &mut State| state::open_section(st, route))
                 .child(
-                    text(*name)
+                    text(name)
                         .key("label")
                         .font(type_::BODY)
                         .color(if selected { accent } else { t.text_secondary }),
                 ),
-        );
-    }
-
-    let mut pl = col().key("playlists").gap(space::S1).pt(space::S6).px(space::S3);
-    pl = pl.child(
-        text("Playlists")
-            .key("pl-header")
-            .font(type_::SECTION)
-            .color(t.text_secondary)
-            .px(space::S3),
-    );
-    for name in PLAYLISTS.iter() {
-        pl = pl.child(
-            el().key(format!("pl-{name}"))
-                .label(*name)
-                .h(34.0)
-                .px(space::S3)
-                .radius(radius::MD)
-                .center_y()
-                .hover(t.hover)
-                .focusable(true)
-                .on_press(|_: &mut State| {})
-                .child(text(*name).key("label").font(type_::BODY).color(t.text_secondary)),
         );
     }
 
@@ -117,10 +92,16 @@ fn sidebar(s: &State, t: tok::Theme, accent: Color) -> El {
                 .pb(space::S3),
         )
         .child(nav)
-        .child(pl)
 }
 
-fn main_pane(t: tok::Theme) -> El {
+fn content(s: &State, t: tok::Theme) -> El {
+    match state::current(s) {
+        Route::Home => home_screen(t),
+        route => placeholder_screen(route, t),
+    }
+}
+
+fn home_screen(t: tok::Theme) -> El {
     let mut grid = col().key("grid").gap(space::S6);
     let mut r = row().gap(space::S6);
     for (i, (title, artist)) in ALBUMS.iter().enumerate() {
@@ -154,6 +135,23 @@ fn main_pane(t: tok::Theme) -> El {
                 .px(space::S6)
                 .pb(space::S6)
                 .child(grid),
+        )
+}
+
+fn placeholder_screen(route: Route, t: tok::Theme) -> El {
+    col()
+        .key("main")
+        .grow(1.0)
+        .min_h(0.0)
+        .px(space::S6)
+        .pt(space::S6)
+        .gap(space::S1)
+        .child(text(route.label()).key("title").font(type_::TITLE).color(t.text))
+        .child(
+            text("This screen is next.")
+                .key("subtitle")
+                .font(type_::BODY)
+                .color(t.text_secondary),
         )
 }
 

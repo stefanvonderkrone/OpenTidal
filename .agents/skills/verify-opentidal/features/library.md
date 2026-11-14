@@ -2,8 +2,8 @@
 
 Library is the shell's structure: a `TIDAL` brand, the grouped sidebar (primary, Your Library,
 Downloads), a top bar with Search and Settings, the Home shelves of album cards, and the
-now-playing bar with transport, progress and volume. It is drawn but static, so the proof is
-element presence plus a rendered frame, not a state change.
+now-playing bar with transport, progress and volume. This recipe checks element presence and a rendered frame.
+Use the now-playing selector and sidebar collapse recipes to check their state changes.
 
 ## Sub-features
 

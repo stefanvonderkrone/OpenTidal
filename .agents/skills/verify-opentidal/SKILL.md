@@ -1,6 +1,6 @@
 ---
 name: verify-opentidal
-description: Headless verification of OpenTidal, the Rust/Rune Tidal-style desktop music app. Use to prove navigation, play/pause, accent cycling and library rendering, before or after changing src/main.rs.
+description: Headless verification of OpenTidal, the Rust/Rune music app. Use to check navigation, playback, search filters, settings subpages, sidebar collapse, accent cycling, and library rendering.
 ---
 
 # Verify OpenTidal
@@ -67,7 +67,7 @@ Assert the resulting state with `scripts/tree-assert.py`:
 scripts/tree-assert.py OUT_DIR/tree.json checked=nav-Explore unchecked=nav-Home label=play=Pause
 ```
 
-Predicates: `title=`, `viewport=`, `has=`, `label=KEY=`, `label-has=KEY=`, `checked=`,
+Predicates: `title=`, `viewport=`, `has=KEY`, `absent=KEY`, `text=KEY=`, `label=KEY=`, `label-has=KEY=`, `checked=`,
 `unchecked=`, `fill=KEY=`, `fill-not=KEY=`. It prints `PASS`/`FAIL` per predicate and exits
 non-zero on any `FAIL`. Use stable element `key`s from the app (see `features/`), never pixel
 coordinates; the `--tree` `elements` array lists every keyed element.
@@ -81,8 +81,8 @@ Capture the action and the resulting state, not just the final screen:
 - Run the matching `tree-assert.py` and save its output as `artifacts/<feature>/<case>/assert.txt`.
 - Screenshots alone are weak: a `frame.png` proves the pixels, but the `tree.json` assertions
   prove the state. Pair them.
-- The grid and transport are drawn but static in this build; their proof is `has=` element
-  presence plus a non-empty `frame.png`, not a state change.
+- Track rows select the now-playing track. Settings option rows show static values.
+- Search filters the catalog. The sidebar toggle hides or shows the navigation groups.
 
 ## Cleanup
 

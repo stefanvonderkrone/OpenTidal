@@ -52,3 +52,7 @@ commands, and observable proof.
 - [Play / pause](./play-pause.md) — the transport play button and the space key toggle state.
 - [Accent](./accent.md) — the `a` key cycles the accent colour.
 - [Library](./library.md) — the shell structure: sidebar, top bar, Home shelves, now-playing.
+- [Now-playing selector](./now-playing.md) selects a track from a track list.
+- [Search filters](./search.md) filters albums, artists, and tracks as you type.
+- [Settings subpages](./settings.md) shows option rows for each settings page.
+- [Sidebar collapse](./collapse.md) hides and restores sidebar navigation.

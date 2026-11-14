@@ -39,8 +39,7 @@ Preconditions:
 - **Go back.** Tap `back` after drilling. Use
   `{"events":[{"t":0.1,"type":"tap","key":"card-0"},{"t":0.5,"type":"tap","key":"back"},{"t":0.9,"type":"mark","name":"end"}]}`,
   run `scripts/control-opentidal drive SCRIPT artifacts/navigate/back`, then assert
-  `scripts/tree-assert.py artifacts/navigate/back/tree.json has=shelf-title` and that `back` is gone
-  (the `has` predicate has no negative form; assert the Home title instead via `text=title=Home`).
+  `scripts/tree-assert.py artifacts/navigate/back/tree.json has=shelf-title absent=back text=title=Home`.
 - **Proof.** Save the `drive` artifacts and the `tree-assert.py` output under
   `artifacts/navigate/<case>/`.
 

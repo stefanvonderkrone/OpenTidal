@@ -47,41 +47,47 @@ directory.
 ```
 user(id TEXT PRIMARY KEY, name TEXT NOT NULL, updated_at INTEGER NOT NULL)
 
-like(user_id  TEXT NOT NULL REFERENCES user, track_id  TEXT NOT NULL,
-     added_at INTEGER NOT NULL, PRIMARY KEY (user_id, track_id))
-save(user_id  TEXT NOT NULL REFERENCES user, album_id  TEXT NOT NULL,
-     added_at INTEGER NOT NULL, PRIMARY KEY (user_id, album_id))
-follow(user_id TEXT NOT NULL REFERENCES user, artist_id TEXT NOT NULL,
-     added_at INTEGER NOT NULL, PRIMARY KEY (user_id, artist_id))
-download(user_id TEXT NOT NULL REFERENCES user, album_id TEXT NOT NULL,
+like(user_id TEXT NOT NULL REFERENCES user, track_id INTEGER NOT NULL,
+     PRIMARY KEY (user_id, track_id))
+save(user_id TEXT NOT NULL REFERENCES user, album_id INTEGER NOT NULL,
+     PRIMARY KEY (user_id, album_id))
+follow(user_id TEXT NOT NULL REFERENCES user, artist_id INTEGER NOT NULL,
+     PRIMARY KEY (user_id, artist_id))
+download(user_id TEXT NOT NULL REFERENCES user, album_id INTEGER NOT NULL,
      PRIMARY KEY (user_id, album_id))
 
-playlist(id INTEGER PRIMARY KEY, user_id TEXT NOT NULL REFERENCES user,
-         name TEXT NOT NULL, position INTEGER NOT NULL)
-playlist_track(playlist_id INTEGER NOT NULL REFERENCES playlist,
-               position INTEGER NOT NULL, track_id TEXT NOT NULL,
-               PRIMARY KEY (playlist_id, position))
+playlist(slot INTEGER NOT NULL, user_id TEXT NOT NULL REFERENCES user,
+         name TEXT NOT NULL, PRIMARY KEY (user_id, slot))
+playlist_track(user_id TEXT NOT NULL REFERENCES user, slot INTEGER NOT NULL,
+               position INTEGER NOT NULL, track_id INTEGER NOT NULL,
+               PRIMARY KEY (user_id, slot, position),
+               FOREIGN KEY (user_id, slot) REFERENCES playlist(user_id, slot))
 
-collection(id INTEGER PRIMARY KEY, user_id TEXT NOT NULL REFERENCES user,
-           name TEXT NOT NULL, position INTEGER NOT NULL)
-collection_playlist(collection_id INTEGER NOT NULL REFERENCES collection,
-                    playlist_id INTEGER NOT NULL REFERENCES playlist,
-                    position INTEGER NOT NULL,
-                    PRIMARY KEY (collection_id, position))
+collection(idx INTEGER NOT NULL, user_id TEXT NOT NULL REFERENCES user,
+           name TEXT NOT NULL, PRIMARY KEY (user_id, idx))
+collection_playlist(user_id TEXT NOT NULL REFERENCES user, idx INTEGER NOT NULL,
+                    position INTEGER NOT NULL, playlist_slot INTEGER NOT NULL,
+                    PRIMARY KEY (user_id, idx, position),
+                    FOREIGN KEY (user_id, idx) REFERENCES collection(user_id, idx))
 
 history(user_id TEXT NOT NULL REFERENCES user, position INTEGER NOT NULL,
-        track_id TEXT NOT NULL, played_at INTEGER NOT NULL,
+        track_id INTEGER NOT NULL,
         PRIMARY KEY (user_id, position))
 ```
 
 Notes:
 
 - Every table hangs off `user.id`. No table assumes one user.
+- Playlist slots and collection indices are local to a user. A global slot
+  key would prevent two users from each storing slot zero. Child keys include
+  `user_id` for the same reason.
+- The current model has no stable playlist id and no item timestamps.
+  Slots persist as stored. Timestamp columns arrive with the Tidal sync.
 - `history` orders by `position`, never by rowid. A rowid can be reused after
   a delete, and history order is user-visible.
-- `track_id`, `album_id`, `artist_id` hold catalogue ids. The catalogue ships
-  with the app and never changes, so the schema cannot carry a foreign key to
-  it. `Library::check` validates these ids on load.
+- `track_id`, `album_id`, `artist_id` hold integer catalogue indices. The
+  catalogue ships with the app and never changes, so the schema cannot carry
+  a foreign key to it. `Library::check` validates these ids on load.
 - No `is_active` column. The keychain token decides who is active. A stored
   flag would be a second source of truth and could disagree after a crash.
 
@@ -122,9 +128,12 @@ While the app is read-only, the library is a mirror of Tidal, not a truth.
 Every row came from Tidal. Tidal still holds it. This settles recovery: a
 broken row needs no repair, because the next sync returns it.
 
-So load never repairs, holds, or asks. It maps rows in, and a leaf that fails
-`Library::check` is dropped and logged. The container stays visible with the
-leaves it has. The next sync restores the leaf.
+The Tidal sync drops and logs a leaf that fails `Library::check`. The container
+stays visible with the leaves it has. The next sync restores the leaf.
+
+The disk store has a stricter boundary. `Store::load` returns an error for an
+invalid stored library. It never drops rows or repairs data. The app's recovery
+path must handle that error when it connects the store to start.
 
 The rule ends the day the app writes to Tidal. From then on a local-only row
 exists, a drop loses data the server never had, and recovery needs a real
@@ -174,18 +183,20 @@ Load is a new way into that state, so it must not bypass the proof.
 
 The rules:
 
-1. Persist `playlist.id`, not `PlaylistId`. `PlaylistId` is a slot. A hole in
-   the slot array would make a stored slot name the wrong playlist.
-2. On load, fill slots in ascending `playlist.id` order. Routes are not
-   persisted, so a renumber between runs is safe.
+1. Persist `PlaylistId` as `playlist.slot`. The model has no `playlist.id`.
+   Preserve empty slots so a collection still names the same playlist.
+2. On load, restore each playlist to its exact slot. Restore collections in
+   `idx` order and their playlist references in `position` order.
 3. Do not derive `Serialize` on `Library`. Map rows into a fresh `Library`
-   through the constructors that every other change uses.
-4. Run `Library::check` on the loaded value. A row that fails the check is
-   dropped and logged. Load never panics on bad data.
+   field by field. Validate catalogue indices before a bit shift or cast.
+4. Run `Library::check` on the loaded value. Return `StoreError::Sql` if the
+   check fails. Reject a missing playlist reference with its table and slot.
+   Load never panics on bad data.
 5. The caps in `library.rs` are real: `MAX_PLAYLISTS`, `HISTORY_CAP`,
    `PLAYLIST_TRACK_CAP`, `MAX_COLLECTIONS`, `COLLECTION_PLAYLIST_CAP`. A file
-   with more rows than a cap is truncated in `position` order, newest kept,
-   and the truncation is logged.
+   with more rows than a cap fails load. The store never silently truncates it.
+6. Read the library in one transaction so a concurrent save cannot mix two
+   versions. Save replaces one user's rows in one transaction.
 
 ## Many accounts, one session
 
@@ -204,7 +215,10 @@ deliberate: the `user_id` column costs nothing now and the door stays open.
 | --- | --- |
 | A library survives a round trip | Property test: random ops, save, load, equal, `check` clean |
 | Load cannot break the invariant | The same test asserts `Library::check` on the loaded value |
-| A broken leaf does not stop a start | Seed a row with an unknown track id, assert the app opens and the row is gone |
+| The store rejects a broken leaf | Seed an unknown track id, assert load returns an error with the table and value |
+| Playlist slots survive deletion | Delete slot zero, save and load, assert slot one and its collection reference stay intact |
+| Users do not share slots | Save two populated libraries with the same slots, assert each loads unchanged |
+| A failed save loses nothing | Abort a child insert with a trigger, assert the previous library still loads |
 | A partial sync loses nothing | Fail the read after page 2, assert every row still present |
 | A partial sync deletes nothing | Same test, assert the delete pass did not run |
 | The sync never touches local tables | Seed a `download` and a `history` row, run a sync, assert both rows remain |

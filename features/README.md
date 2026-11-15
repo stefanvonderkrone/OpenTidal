@@ -29,6 +29,11 @@ The journeys:
 | `playlist-create` | New playlist → open → add track. |
 | `playlist-delete` | Delete returns to Playlists and leaves no dangling route. |
 | `collection` | A collection holds a playlist and removes it. |
+| `sign-in` | Sign in and the sidebar shows the signed-in user's name. |
+
+The `sign-in` journey runs against the deterministic fake service, which signs
+in at once, so no browser or network is needed headless. The `signed-in` scene
+starts already signed in for a quick look.
 
 Rename (playlist, collection, and profile) uses a text field, which the
 headless driver does not type into. A unit test covers the operations

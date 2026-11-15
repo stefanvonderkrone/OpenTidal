@@ -43,3 +43,19 @@ The proven shell state in `src/state.rs`.
 
 The rule the proof checks after every operation: no route, playlist, history,
 or saved item references an id that does not exist.
+
+## Tidal
+
+The remote half, behind the `MusicService` port in `src/tidal.rs`. Read-only
+today; the catalogue and library stay local until the later PRs move them.
+
+- **service** — the `MusicService` port. The app reaches Tidal only through it.
+  The deterministic fake backs every proof; the real client backs
+  `OPENTIDAL_LIVE=1`.
+- **sign in** — start the OAuth authorization-code flow with PKCE. The live
+  build opens the browser and a loopback listener; the deterministic build
+  signs in at once.
+- **session** — the signed-in state on `App`, not `State`. Its variants are
+  `SignedOut`, `Authorizing`, `SignedIn`, and `Failed`, from `src/auth.rs`.
+- **token** — an OAuth access token and its refresh token. The refresh token
+  persists in the macOS keychain.

@@ -2,3 +2,5 @@
 /target
 rune/target/
 /artifacts/
+/opentidal.json
+/opentidal.local.json

@@ -10,6 +10,18 @@ exclude = ["rune"]
 [dependencies]
 rune = { path = "rune/crates/rune" }
 
+# Tidal API: a blocking reqwest client (rustls, no openssl), JSON parsing, and
+# the PKCE S256 primitives. Tokens persist in the macOS keychain.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
 # Rune patches these four crates in its own workspace. A dependency's [patch]
 # does not reach this workspace, so replicate them here in path form, since
 # rune is vendored locally. See rune/VENDORED.md and rune's "Depending on Rune"

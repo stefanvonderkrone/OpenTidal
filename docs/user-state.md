@@ -225,29 +225,41 @@ deliberate: the `user_id` column costs nothing now and the door stays open.
 
 ## Evidence
 
-| Claim | Check |
-| --- | --- |
-| A library survives a round trip | Property test: random ops, save, load, equal, `check` clean |
-| Load cannot break the invariant | The same test asserts `Library::check` on the loaded value |
-| An unknown item costs only that item | Seed an unknown track id, assert load drops it, keeps the rest, and reports a count |
-| A container survives a dropped leaf | One bad track in a playlist, assert the playlist keeps its name and good tracks |
-| A second account starts empty | Sign in, sign out, sign in with another id, assert no rows carried over |
-| A broken file is never overwritten | Write junk to the path, assert no database opens and the bytes stay |
-| A restart shows the library | Save, reopen the file, assert the library and the name come back |
-| Playlist slots survive deletion | Delete slot zero, save and load, assert slot one and its collection reference stay intact |
-| Users do not share slots | Save two populated libraries with the same slots, assert each loads unchanged |
-| A failed save loses nothing | Abort a child insert with a trigger, assert the previous library still loads |
-| A partial sync loses nothing | Fail the read after page 2, assert every row still present |
-| A partial sync deletes nothing | Same test, assert the delete pass did not run |
-| The sync never touches local tables | Seed a `download` and a `history` row, run a sync, assert both rows remain |
-| No data loss at sign-in | Kill matrix: exit between the row write and the keychain write, and the reverse |
-| Start needs no network | Run with the network off, name and playlist visible |
-| A library screen needs no network | Open Liked Songs offline, assert the disk rows paint and no spinner shows |
-| A refresh writes no rows | Count rows before and after a refresh, `user_version` unchanged |
-| File is private | `stat -f '%Lp'` returns `600` |
-| Schema is sound | `PRAGMA integrity_check` returns `ok`, and no row has an orphan `user_id` |
-| Token is not in the file | `strings opentidal.db` shows no token |
-| The key holds offline | `uid` read from the keychain alone, no network, before any fetch |
+Each row names its status. `test:` names a real test and `scripts/evidence-status.py`
+fails when the name does not exist. `live:` names a check done by hand. `pending:`
+names work this branch does not build.
+
+| Claim | Check | Status |
+| --- | --- | --- |
+| A library survives a round trip | Random ops, write, load, equal, `check` clean | test: `random_walk_round_trips`, `operations_round_trip` |
+| Load cannot break the invariant | The loaded value satisfies `Library::check` | test: `random_walk_round_trips`, `every_reachable_library_satisfies_check` |
+| An unknown item costs only that item | Seed an unknown track id, assert the rest loads and a count is reported | test: `an_unknown_track_is_dropped_not_fatal`, `an_unknown_item_costs_only_that_item` |
+| A container survives a dropped leaf | One bad track in a playlist, assert the name and good tracks stay | test: `a_container_survives_a_dropped_leaf` |
+| Every catalogue table drops an unknown id | Break each table in turn, assert the drop and the invariant | test: `every_catalogue_table_drops_an_unknown_id` |
+| A second account starts empty | Sign out of one account, open another, assert no rows carried over | test: `a_second_account_does_not_inherit_the_first` |
+| A broken file is never overwritten | Write junk to the path, assert no library opens and the bytes stay | test: `a_broken_file_is_never_overwritten` |
+| A restart shows the library | Write, reopen the file, assert the library and the name come back | test: `a_restart_reads_the_written_library`, `a_restart_shows_the_saved_library` |
+| A quit writes what is outstanding | Change the library, quit, reopen, assert the change is there | test: `a_quit_writes_what_is_outstanding` |
+| A dirty library asks for a frame | A change wakes the loop, a clean library does not | test: `only_a_dirty_library_asks_for_a_frame` |
+| Playlist slots survive deletion | Delete slot zero, write and load, assert slot one and its reference stay | test: `slot_hole_survives` |
+| A collection gap does not misplace a reference | Move a collection's index, assert the reference follows it | test: `a_collection_gap_does_not_misplace_a_reference` |
+| Users do not share slots | Two populated libraries with the same slots, assert each loads unchanged | test: `users_are_isolated` |
+| A failed write loses nothing | Abort a child insert with a trigger, assert the previous library loads | test: `a_failed_write_is_atomic` |
+| A repeated write makes no duplicates | Write twice, assert one row per bit | test: `write_is_idempotent` |
+| An email is not a display name | A profile whose `username` is an address asserts `You` | test: `an_email_is_not_used_as_a_name` |
+| The key holds offline | `uid` read from the keychain alone, no network, before any fetch | test: `the_user_id_comes_from_the_token`, `the_fake_token_names_no_user` |
+| The file is private | `stat -f '%Lp'` returns `600` | live: 2026-11-15, plus `a_restart_reads_the_written_library` |
+| Schema is sound | `PRAGMA integrity_check` is `ok` and no row has an orphan `user_id` | live: 2026-11-15, plus `replacement_removes_stale_rows` |
+| A like reaches the disk from a live session | Like a track, wait for idle, read the row | live: 2026-11-15 |
+| Token is not in the file | `strings opentidal.db` shows no token | live: 2026-11-15, and the schema has no token column |
+| The database is out of the backup | `xattr -p com.apple.metadata:com_apple_backup_excludeItem` shows `com.apple.backupd` | test: `the_database_is_excluded_from_backups` |
+| No data loss at sign-in | Kill the process between the keychain write and the library write, and the reverse | pending: no kill harness. The keychain-first order makes a token without a row read as a new account, so the loss is a name, not the library |
+| Start needs no network | Launch with the network off, name and playlist visible | pending: no test. Start reads the disk first, then fetches the profile |
+| A library screen needs no network | Open Liked Songs offline, assert the disk rows paint | pending: no test |
+| A refresh writes no rows | Count rows before and after a refresh, `user_version` unchanged | pending: no test. A refresh writes the keychain only |
+| A partial sync loses nothing | Fail the read after page 2, assert every row is still present | pending: sync PR |
+| A partial sync deletes nothing | Same test, assert the delete pass did not run | pending: sync PR |
+| The sync never touches local tables | Seed a `download` and a `history` row, sync, assert both remain | pending: sync PR |
 
 ## Confirmed live
 

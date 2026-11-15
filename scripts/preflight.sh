@@ -23,6 +23,9 @@ echo "== clippy"
 # crate must be clean, because this crate is the one a change here touches.
 cargo clippy -q -p opentidal --all-targets --no-deps "${fix[@]}" -- -D warnings
 
+echo "== evidence table"
+python3 scripts/evidence-status.py
+
 echo "== no copied scope list"
 # The scope list lives in `DEFAULT_SCOPE` and nowhere else. It was pasted into
 # four files and drifted twice. An empty scope already means every read scope,

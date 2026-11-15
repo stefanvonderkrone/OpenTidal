@@ -67,6 +67,7 @@ impl Store {
             .mode(0o600)
             .open(path)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        exclude_from_backup(path)?;
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         Self::configure(conn)
@@ -359,6 +360,32 @@ impl Store {
     }
 }
 
+/// Keep the database out of a Time Machine backup. The library comes back from
+/// Tidal, and the file holds a name and a listening history, so a backup copies
+/// a privacy risk for no gain.
+///
+/// This sets the extended attribute `tmutil addexclusion` sets, rather than
+/// running `tmutil`: that call takes eleven seconds on this machine, and this one
+/// runs on the startup path.
+#[cfg(target_os = "macos")]
+fn exclude_from_backup(path: &Path) -> Result<(), StoreError> {
+    let _ = std::process::Command::new("xattr")
+        .args([
+            "-w",
+            "com.apple.metadata:com_apple_backup_excludeItem",
+            "com.apple.backupd",
+            &path.to_string_lossy(),
+        ])
+        .status();
+    // A sandbox that hides `xattr` must not stop the app opening its database.
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn exclude_from_backup(_path: &Path) -> Result<(), StoreError> {
+    Ok(())
+}
+
 /// A catalogue index, rejected when it names nothing the catalogue ships.
 fn index(value: i64, len: usize) -> Result<usize, ()> {
     if value < 0 || value as u64 >= len as u64 {
@@ -408,6 +435,31 @@ fn load_bits(
 mod tests {
     use super::*;
     use crate::catalog::{AlbumId, ArtistId};
+
+    /// Opening a database keeps it out of a Time Machine backup.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_database_is_excluded_from_backups() {
+        let dir = std::env::temp_dir().join(format!("opentidal-backup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("opentidal.db");
+        Store::open(&path).unwrap();
+
+        let out = std::process::Command::new("xattr")
+            .args([
+                "-p",
+                "com.apple.metadata:com_apple_backup_excludeItem",
+                &path.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("com.apple.backupd"),
+            "the database is not excluded from backups"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The library from a load that dropped nothing, which is every load the
     /// round-trip tests expect.

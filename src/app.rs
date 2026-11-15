@@ -35,6 +35,10 @@ pub struct App {
     /// The library as last written to disk, so a frame can tell whether the
     /// in-memory library changed.
     saved: Library,
+    /// Wakes the event loop so `poll` runs after a change. A windowed app stops
+    /// drawing frames at rest, so without this a click in the last frame before
+    /// idle would sit unsaved until the next input.
+    waker: Option<Waker>,
     /// Whether the live client is on, from `OPENTIDAL_LIVE` or the config file.
     pub live: bool,
     /// A counter bumped on sign-out and new sign-ins. In-flight profile results
@@ -70,7 +74,8 @@ impl App {
     /// expired token first.
     pub fn setup(&mut self, waker: Waker) {
         self.auth_flow.set_waker(waker.clone());
-        self.profile.set_waker(waker);
+        self.profile.set_waker(waker.clone());
+        self.waker = Some(waker);
         if self.auth == Auth::SignedOut
             && let Some(token) = self.store.load()
         {
@@ -97,6 +102,10 @@ impl App {
     }
     /// The testable half of [`App::restore_library`], with the path supplied.
     fn open_library(&mut self, user_id: &str, path: &std::path::Path) {
+        // The user id and the open database are one fact: a session that can
+        // write needs both, so taking the id here means no caller can open the
+        // library and forget the key it will save under.
+        self.user_id = Some(user_id.to_string());
         let db = match Store::open(path) {
             Ok(db) => db,
             Err(error) => {
@@ -262,6 +271,22 @@ impl App {
         changed
     }
 
+    /// Ask for one more frame when the library changed. The store write happens
+    /// in that frame's `drain`. A window at rest draws no frames, so a change in
+    /// the frame that puts it to rest would otherwise wait for the next input.
+    pub fn wake_if_dirty(&self) {
+        if self.core.lib != self.saved
+            && let Some(waker) = &self.waker
+        {
+            waker();
+        }
+    }
+
+    /// Write anything outstanding before the app exits.
+    pub fn quit(&mut self) {
+        self.flush_library();
+    }
+
     #[cfg(target_os = "macos")]
     fn open_browser(&self, url: &str) {
         let _ = std::process::Command::new("open").arg(url).spawn();
@@ -354,6 +379,7 @@ impl Default for App {
             db: None,
             user_id: None,
             saved: Library::default(),
+            waker: None,
             live,
             session: 0,
             auth_flow: Latest::default(),
@@ -560,6 +586,55 @@ mod tests {
 
         assert!(first.core.lib.liked == 0, "account B inherited A's likes");
         assert!(first.db.is_some(), "account B has no database");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A quit writes what is outstanding. The window's quit takes the fast exit,
+    /// which drops no state, so a destructor would never run.
+    #[test]
+    fn a_quit_writes_what_is_outstanding() {
+        let dir = db_dir("quit");
+        let path = dir.join("opentidal.db");
+
+        let mut app = signed_in("173210380");
+        app.open_library("173210380", &path);
+        app.core.lib.set_name("Ada".to_string());
+        app.core.lib.toggle_like(TrackId(5));
+        app.quit();
+
+        let mut reread = signed_in("173210380");
+        reread.open_library("173210380", &path);
+        assert_eq!(reread.core.lib.name, "Ada");
+        assert!(reread.core.lib.is_liked(TrackId(5)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dirty library asks for another frame, and a clean one does not. A
+    /// window at rest draws no frames, so this is what gets a change on disk.
+    #[test]
+    fn only_a_dirty_library_asks_for_a_frame() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = db_dir("wake");
+        let path = dir.join("opentidal.db");
+        let mut app = signed_in("173210380");
+        app.open_library("173210380", &path);
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        app.waker = Some(Arc::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        app.wake_if_dirty();
+        assert_eq!(count.load(Ordering::SeqCst), 0, "a clean library woke the loop");
+
+        app.core.lib.toggle_like(TrackId(3));
+        app.wake_if_dirty();
+        assert_eq!(count.load(Ordering::SeqCst), 1, "a change did not wake the loop");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

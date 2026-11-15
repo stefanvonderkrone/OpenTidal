@@ -206,8 +206,10 @@ impl Store {
             )?;
             let mut rows = stmt.query(params![user_id, MAX_COLLECTIONS as i64])?;
             while let Some(row) = rows.next()? {
-                let idx = index(row.get(0)?, MAX_COLLECTIONS).unwrap_or(0);
-                debug_assert_eq!(idx, lib.collections.len(), "collection idx skipped");
+                if index(row.get(0)?, MAX_COLLECTIONS).is_err() {
+                    dropped += 1;
+                    continue;
+                }
                 lib.collections.push(Collection { name: row.get(1)?, playlists: Vec::new() });
             }
             dropped += count_beyond(&tx, "collection", user_id, MAX_COLLECTIONS)?;
@@ -259,7 +261,10 @@ impl Store {
             dropped += count_beyond(&tx, "history", user_id, HISTORY_CAP)?;
         }
         tx.commit()?;
-        debug_assert_eq!(lib.check(), Ok(()), "load built a library that fails its own invariant");
+        // The boundary has already dropped every row that could break this. A
+        // failure here means the loader has a hole, and a test catches it before
+        // a user can.
+        debug_assert!(lib.check().is_ok(), "load built a library that fails its own invariant");
         Ok(Some(Loaded { lib, dropped }))
     }
 

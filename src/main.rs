@@ -42,6 +42,9 @@ const SCENES: [Scene; 5] = [
 ];
 
 fn view(app: &App, _cx: &mut Cx<App>) -> El {
+    // The library may have changed during this frame's events. Ask for one more
+    // frame so `drain` writes it; a window at rest draws none.
+    app.wake_if_dirty();
     let s = &app.core;
     let t = tok::theme(true);
     let accent = tok::accent(s.accent, true);
@@ -340,7 +343,7 @@ fn volume(t: tok::Theme, accent: Color) -> El {
 }
 
 fn main() {
-    rune::run(AppSpec::<App> {
+    let spec = AppSpec::<App> {
         scenes: &SCENES,
         setup: Some(|app, waker| app.setup(waker)),
         poll: Some(|app, _t, _tx| app.drain()),
@@ -351,5 +354,12 @@ fn main() {
             false
         }),
         ..AppSpec::new("OpenTidal", (1280.0, 800.0), App::default, view)
-    });
+    };
+    // A quit takes the fast path, which drops no state, so the last save must
+    // happen in a window hook. `AppSpec` has no hook fields, so drive the app
+    // through `App`, which does.
+    rune::App::new(spec)
+        .on_quit(|app, _tx| app.quit())
+        .on_close(|app, _tx| app.quit())
+        .run();
 }

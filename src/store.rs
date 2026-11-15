@@ -8,13 +8,24 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::catalog::{self, TrackId};
-use crate::library::{Collection, Library, MAX_COLLECTIONS, MAX_PLAYLISTS, Playlist, PlaylistId};
+use crate::library::{
+    COLLECTION_PLAYLIST_CAP, Collection, HISTORY_CAP, Library, MAX_COLLECTIONS, MAX_PLAYLISTS,
+    PLAYLIST_TRACK_CAP, Playlist, PlaylistId,
+};
 
 const SCHEMA_VERSION: u32 = 1;
 
 /// A database that stores libraries by user id.
 pub struct Store {
     conn: Connection,
+}
+
+/// One account's library as read from disk, with the number of rows the
+/// catalogue could no longer resolve.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Loaded {
+    pub lib: Library,
+    pub dropped: usize,
 }
 
 /// A database or filesystem failure.
@@ -117,7 +128,13 @@ impl Store {
     }
 
     /// The stored library for a user, or `None` when the user row is absent.
-    pub fn load(&self, user_id: &str) -> Result<Option<Library>, StoreError> {
+    ///
+    /// A leaf that names an id the catalogue no longer ships is dropped and
+    /// counted. The container around it stays, so a playlist missing one track
+    /// still appears with the tracks it has. A leaf that comes back on the next
+    /// sync is recoverable, so dropping it costs nothing permanent. Only a file
+    /// that cannot be read at all is an error.
+    pub fn load(&self, user_id: &str) -> Result<Option<Loaded>, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         let name = tx
             .query_row("SELECT name FROM user WHERE id = ?1", [user_id], |row| {
@@ -127,102 +144,123 @@ impl Store {
         let Some(name) = name else {
             return Ok(None);
         };
+        let mut dropped = 0;
         let mut lib = Library {
             name,
-            liked: load_bits(&tx, user_id, "like", "track_id", catalog::TRACKS.len())?,
-            saved_albums: load_bits(&tx, user_id, "save", "album_id", catalog::ALBUMS.len())?,
-            followed: load_bits(&tx, user_id, "follow", "artist_id", catalog::ARTISTS.len())?,
-            downloaded: load_bits(&tx, user_id, "download", "album_id", catalog::ALBUMS.len())?,
+            liked: load_bits(&tx, user_id, "like", "track_id", catalog::TRACKS.len(), &mut dropped)?,
+            saved_albums: load_bits(&tx, user_id, "save", "album_id", catalog::ALBUMS.len(), &mut dropped)?,
+            followed: load_bits(&tx, user_id, "follow", "artist_id", catalog::ARTISTS.len(), &mut dropped)?,
+            downloaded: load_bits(&tx, user_id, "download", "album_id", catalog::ALBUMS.len(), &mut dropped)?,
             history: Vec::new(),
             playlists: std::array::from_fn(|_| None),
             collections: Vec::new(),
         };
         {
-            let mut stmt =
-                tx.prepare("SELECT slot, name FROM playlist WHERE user_id = ?1 ORDER BY slot")?;
-            let mut rows = stmt.query([user_id])?;
+            let mut stmt = tx.prepare(
+                "SELECT slot, name FROM playlist WHERE user_id = ?1 ORDER BY slot LIMIT ?2",
+            )?;
+            let mut rows = stmt.query(params![user_id, MAX_PLAYLISTS as i64])?;
             while let Some(row) = rows.next()? {
-                let slot = index("playlist", row.get(0)?, MAX_PLAYLISTS)?;
-                lib.playlists[slot] = Some(Playlist {
-                    name: row.get(1)?,
-                    tracks: Vec::new(),
-                });
+                let Ok(slot) = index(row.get(0)?, MAX_PLAYLISTS) else {
+                    dropped += 1;
+                    continue;
+                };
+                lib.playlists[slot] = Some(Playlist { name: row.get(1)?, tracks: Vec::new() });
             }
+            dropped += count_beyond(&tx, "playlist", user_id, MAX_PLAYLISTS)?;
         }
         {
             let mut stmt = tx.prepare(
-                "SELECT slot, position, track_id FROM playlist_track
+                "SELECT slot, track_id FROM playlist_track
                  WHERE user_id = ?1 ORDER BY slot, position",
             )?;
             let mut rows = stmt.query([user_id])?;
             while let Some(row) = rows.next()? {
-                let raw_slot = row.get(0)?;
-                let slot = index("playlist_track", raw_slot, MAX_PLAYLISTS)?;
-                let playlist = lib.playlists[slot].as_mut().ok_or_else(|| {
-                    StoreError::Sql(format!("playlist_track missing slot {raw_slot}"))
-                })?;
-                position("playlist_track", row.get(1)?, playlist.tracks.len())?;
-                playlist.tracks.push(TrackId(index(
-                    "playlist_track",
-                    row.get(2)?,
-                    catalog::TRACKS.len(),
-                )? as u8));
-            }
-        }
-        {
-            let mut stmt =
-                tx.prepare("SELECT idx, name FROM collection WHERE user_id = ?1 ORDER BY idx")?;
-            let mut rows = stmt.query([user_id])?;
-            while let Some(row) = rows.next()? {
-                let idx = index("collection", row.get(0)?, MAX_COLLECTIONS)?;
-                position("collection", idx as i64, lib.collections.len())?;
-                lib.collections.push(Collection {
-                    name: row.get(1)?,
-                    playlists: Vec::new(),
-                });
+                let Ok(slot) = index(row.get(0)?, MAX_PLAYLISTS) else {
+                    dropped += 1;
+                    continue;
+                };
+                let Some(playlist) = lib.playlists[slot].as_mut() else {
+                    dropped += 1;
+                    continue;
+                };
+                if playlist.tracks.len() >= PLAYLIST_TRACK_CAP {
+                    dropped += 1;
+                    continue;
+                }
+                let Ok(track) = index(row.get(1)?, catalog::TRACKS.len()) else {
+                    dropped += 1;
+                    continue;
+                };
+                let track = TrackId(track as u8);
+                if playlist.tracks.contains(&track) {
+                    dropped += 1;
+                    continue;
+                }
+                playlist.tracks.push(track);
             }
         }
         {
             let mut stmt = tx.prepare(
-                "SELECT idx, position, playlist_slot FROM collection_playlist
+                "SELECT idx, name FROM collection WHERE user_id = ?1 ORDER BY idx LIMIT ?2",
+            )?;
+            let mut rows = stmt.query(params![user_id, MAX_COLLECTIONS as i64])?;
+            while let Some(row) = rows.next()? {
+                let idx = index(row.get(0)?, MAX_COLLECTIONS).unwrap_or(0);
+                debug_assert_eq!(idx, lib.collections.len(), "collection idx skipped");
+                lib.collections.push(Collection { name: row.get(1)?, playlists: Vec::new() });
+            }
+            dropped += count_beyond(&tx, "collection", user_id, MAX_COLLECTIONS)?;
+        }
+        {
+            let mut stmt = tx.prepare(
+                "SELECT idx, playlist_slot FROM collection_playlist
                  WHERE user_id = ?1 ORDER BY idx, position",
             )?;
             let mut rows = stmt.query([user_id])?;
             while let Some(row) = rows.next()? {
-                let raw_idx = row.get(0)?;
-                let idx = index("collection_playlist", raw_idx, lib.collections.len())?;
-                let raw_slot = row.get(2)?;
-                let slot = index("collection_playlist", raw_slot, MAX_PLAYLISTS)?;
-                if lib.playlists[slot].is_none() {
-                    return Err(StoreError::Sql(format!(
-                        "collection_playlist missing slot {raw_slot}"
-                    )));
-                }
+                let Ok(idx) = index(row.get(0)?, lib.collections.len()) else {
+                    dropped += 1;
+                    continue;
+                };
+                let Ok(slot) = index(row.get(1)?, MAX_PLAYLISTS) else {
+                    dropped += 1;
+                    continue;
+                };
                 let collection = &mut lib.collections[idx];
-                position(
-                    "collection_playlist",
-                    row.get(1)?,
-                    collection.playlists.len(),
-                )?;
-                collection.playlists.push(PlaylistId(slot as u8));
+                let playlist = PlaylistId(slot as u8);
+                if lib.playlists[slot].is_none()
+                    || collection.playlists.len() >= COLLECTION_PLAYLIST_CAP
+                    || collection.playlists.contains(&playlist)
+                {
+                    dropped += 1;
+                    continue;
+                }
+                collection.playlists.push(playlist);
             }
         }
         {
             let mut stmt = tx.prepare(
-                "SELECT position, track_id FROM history WHERE user_id = ?1 ORDER BY position",
+                "SELECT track_id FROM history WHERE user_id = ?1 ORDER BY position LIMIT ?2",
             )?;
-            let mut rows = stmt.query([user_id])?;
+            let mut rows = stmt.query(params![user_id, HISTORY_CAP as i64])?;
             while let Some(row) = rows.next()? {
-                position("history", row.get(0)?, lib.history.len())?;
-                lib.history.push(TrackId(
-                    index("history", row.get(1)?, catalog::TRACKS.len())? as u8,
-                ));
+                let Ok(track) = index(row.get(0)?, catalog::TRACKS.len()) else {
+                    dropped += 1;
+                    continue;
+                };
+                let track = TrackId(track as u8);
+                if lib.history.contains(&track) {
+                    dropped += 1;
+                    continue;
+                }
+                lib.history.push(track);
             }
+            dropped += count_beyond(&tx, "history", user_id, HISTORY_CAP)?;
         }
-        lib.check()
-            .map_err(|error| StoreError::Sql(format!("library invariant: {error:?}")))?;
         tx.commit()?;
-        Ok(Some(lib))
+        debug_assert_eq!(lib.check(), Ok(()), "load built a library that fails its own invariant");
+        Ok(Some(Loaded { lib, dropped }))
     }
 
     /// Replace the stored library for a user in one transaction.
@@ -306,22 +344,27 @@ impl Store {
     }
 }
 
-fn index(table: &str, value: i64, len: usize) -> Result<usize, StoreError> {
+/// A catalogue index, rejected when it names nothing the catalogue ships.
+fn index(value: i64, len: usize) -> Result<usize, ()> {
     if value < 0 || value as u64 >= len as u64 {
-        return Err(StoreError::Sql(format!(
-            "{table} out-of-range value {value}"
-        )));
+        return Err(());
     }
     Ok(value as usize)
 }
 
-fn position(table: &str, value: i64, expected: usize) -> Result<(), StoreError> {
-    if value != expected as i64 {
-        return Err(StoreError::Sql(format!(
-            "{table} invalid position {value}, expected {expected}"
-        )));
-    }
-    Ok(())
+/// How many rows a table holds beyond a cap, which load keeps the first of.
+fn count_beyond(
+    conn: &Connection,
+    table: &str,
+    user_id: &str,
+    cap: usize,
+) -> Result<usize, StoreError> {
+    let total: i64 = conn.query_row(
+        &format!("SELECT count(*) FROM \"{table}\" WHERE user_id = ?1"),
+        [user_id],
+        |row| row.get(0),
+    )?;
+    Ok((total.max(0) as usize).saturating_sub(cap))
 }
 
 fn load_bits(
@@ -330,6 +373,7 @@ fn load_bits(
     table: &str,
     column: &str,
     len: usize,
+    dropped: &mut usize,
 ) -> Result<u32, StoreError> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {column} FROM \"{table}\" WHERE user_id = ?1"
@@ -337,7 +381,10 @@ fn load_bits(
     let mut rows = stmt.query([user_id])?;
     let mut bits = 0;
     while let Some(row) = rows.next()? {
-        bits |= 1 << index(table, row.get(0)?, len)?;
+        match index(row.get(0)?, len) {
+            Ok(id) => bits |= 1 << id,
+            Err(()) => *dropped += 1,
+        }
     }
     Ok(bits)
 }
@@ -346,6 +393,14 @@ fn load_bits(
 mod tests {
     use super::*;
     use crate::catalog::{AlbumId, ArtistId};
+
+    /// The library from a load that dropped nothing, which is every load the
+    /// round-trip tests expect.
+    fn loaded_lib(store: &Store, user_id: &str) -> Option<Library> {
+        let loaded = store.load(user_id).unwrap()?;
+        assert_eq!(loaded.dropped, 0, "a round trip dropped rows");
+        Some(loaded.lib)
+    }
 
     fn populated(name: &str, track: u8) -> Library {
         let mut lib = Library::default();
@@ -373,7 +428,7 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let lib = Library::default();
         store.save("a", &lib).unwrap();
-        assert_eq!(store.load("a").unwrap(), Some(lib));
+        assert_eq!(loaded_lib(&store, "a"), Some(lib));
     }
 
     /// Real library operations produce a library that round-trips and passes the invariant.
@@ -382,7 +437,7 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let lib = populated("Ada", 3);
         store.save("a", &lib).unwrap();
-        let loaded = store.load("a").unwrap().unwrap();
+        let loaded = loaded_lib(&store, "a").unwrap();
         assert_eq!(loaded, lib);
         assert_eq!(loaded.check(), Ok(()));
     }
@@ -448,7 +503,7 @@ mod tests {
             assert_eq!(lib.check(), Ok(()));
             if step % 17 == 0 || step == 1_999 {
                 store.save("a", &lib).unwrap();
-                let loaded = store.load("a").unwrap().unwrap();
+                let loaded = loaded_lib(&store, "a").unwrap();
                 assert_eq!(loaded, lib, "step {step}");
                 assert_eq!(loaded.check(), Ok(()));
                 lib = loaded;
@@ -463,7 +518,7 @@ mod tests {
         let mut lib = populated("Ada", 0);
         lib.delete_playlist(PlaylistId(0));
         store.save("a", &lib).unwrap();
-        let loaded = store.load("a").unwrap().unwrap();
+        let loaded = loaded_lib(&store, "a").unwrap();
         assert!(loaded.playlists[0].is_none());
         assert_eq!(loaded.playlists[1], lib.playlists[1]);
         assert_eq!(loaded.collections[0].playlists, vec![PlaylistId(1)]);
@@ -474,7 +529,7 @@ mod tests {
     #[test]
     fn unknown_user_is_absent() {
         let store = Store::in_memory().unwrap();
-        assert_eq!(store.load("unknown").unwrap(), None);
+        assert_eq!(loaded_lib(&store, "unknown"), None);
     }
 
     /// Repeated saves replace rows without duplicates.
@@ -484,7 +539,7 @@ mod tests {
         let lib = populated("Ada", 0);
         store.save("a", &lib).unwrap();
         store.save("a", &lib).unwrap();
-        assert_eq!(store.load("a").unwrap(), Some(lib.clone()));
+        assert_eq!(loaded_lib(&store, "a"), Some(lib.clone()));
         let count: u32 = store
             .conn
             .query_row(
@@ -505,23 +560,51 @@ mod tests {
         store.save("a", &a).unwrap();
         store.save("b", &b).unwrap();
         store.save("a", &a).unwrap();
-        assert_eq!(store.load("a").unwrap(), Some(a));
-        assert_eq!(store.load("b").unwrap(), Some(b));
+        assert_eq!(loaded_lib(&store, "a"), Some(a));
+        assert_eq!(loaded_lib(&store, "b"), Some(b));
     }
 
-    /// Load rejects an out-of-range track id and names its table and value.
+    /// A like that names a track the catalogue lacks is dropped, and the rest of
+    /// the library loads. A drop is recoverable by the next sync, so it must not
+    /// cost the user the whole library.
     #[test]
-    fn invalid_track_is_rejected() {
+    fn an_unknown_track_is_dropped_not_fatal() {
         let mut store = Store::in_memory().unwrap();
-        store.save("a", &Library::default()).unwrap();
-        let bad = catalog::TRACKS.len() as i64;
+        let mut lib = Library::default();
+        lib.toggle_like(TrackId(0));
+        lib.toggle_like(TrackId(1));
+        store.save("a", &lib).unwrap();
         store
             .conn
-            .execute("INSERT INTO \"like\" VALUES ('a', ?1)", [bad])
+            .execute("INSERT INTO \"like\" VALUES ('a', 999)", [])
             .unwrap();
-        let error = store.load("a").unwrap_err();
-        assert!(matches!(error, StoreError::Sql(message)
-            if message.contains("like") && message.contains(&bad.to_string())));
+
+        let loaded = store.load("a").unwrap().unwrap();
+        assert_eq!(loaded.dropped, 1);
+        assert_eq!(loaded.lib, lib, "the good likes did not survive");
+        assert_eq!(loaded.lib.check(), Ok(()));
+    }
+
+    /// A playlist keeps its name and its remaining tracks when one track is
+    /// unknown. The container survives, only the leaf goes.
+    #[test]
+    fn a_container_survives_a_dropped_leaf() {
+        let mut store = Store::in_memory().unwrap();
+        let mut lib = Library::default();
+        let id = lib.create_playlist("Road trip".to_string()).unwrap();
+        lib.add_track(id, TrackId(0));
+        lib.add_track(id, TrackId(1));
+        store.save("a", &lib).unwrap();
+        store
+            .conn
+            .execute("UPDATE playlist_track SET track_id = 999 WHERE position = 1", [])
+            .unwrap();
+
+        let loaded = store.load("a").unwrap().unwrap();
+        assert_eq!(loaded.dropped, 1);
+        let playlist = loaded.lib.playlist(id).expect("the playlist disappeared");
+        assert_eq!(playlist.name, "Road trip");
+        assert_eq!(playlist.tracks, vec![TrackId(0)]);
     }
 
     /// A fresh database reports the schema version this build writes.
@@ -531,9 +614,10 @@ mod tests {
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     }
 
-    /// Load rejects a collection reference to an empty playlist slot.
+    /// A collection reference to an empty playlist slot is dropped, so the
+    /// invariant holds without the collection disappearing.
     #[test]
-    fn missing_playlist_is_rejected() {
+    fn a_reference_to_an_empty_slot_is_dropped() {
         let mut store = Store::in_memory().unwrap();
         let mut lib = Library::default();
         lib.create_collection("C".into());
@@ -542,21 +626,29 @@ mod tests {
             .conn
             .execute("INSERT INTO collection_playlist VALUES ('a', 0, 0, 1)", [])
             .unwrap();
-        assert!(matches!(store.load("a"), Err(StoreError::Sql(message))
-            if message.contains("collection_playlist") && message.contains('1')));
+
+        let loaded = store.load("a").unwrap().unwrap();
+        assert_eq!(loaded.dropped, 1);
+        assert_eq!(loaded.lib.collections[0].name, "C");
+        assert!(loaded.lib.collections[0].playlists.is_empty());
+        assert_eq!(loaded.lib.check(), Ok(()));
     }
 
-    /// Load runs the invariant checker and rejects duplicate history tracks.
+    /// A duplicated history entry is dropped, because a duplicate would fail
+    /// the invariant the whole app relies on.
     #[test]
-    fn invariant_violation_is_rejected() {
+    fn a_duplicate_history_entry_is_dropped() {
         let mut store = Store::in_memory().unwrap();
         store.save("a", &Library::default()).unwrap();
         store
             .conn
             .execute_batch("INSERT INTO history VALUES ('a', 0, 0), ('a', 1, 0);")
             .unwrap();
-        assert!(matches!(store.load("a"), Err(StoreError::Sql(message))
-            if message.contains("HistoryDuplicate")));
+
+        let loaded = store.load("a").unwrap().unwrap();
+        assert_eq!(loaded.dropped, 1);
+        assert_eq!(loaded.lib.history, vec![TrackId(0)]);
+        assert_eq!(loaded.lib.check(), Ok(()));
     }
 
     /// A failed replacement rolls back the user row and all child rows.
@@ -573,30 +665,33 @@ mod tests {
             )
             .unwrap();
         assert!(store.save("a", &populated("Changed", 2)).is_err());
-        assert_eq!(store.load("a").unwrap(), Some(lib));
+        assert_eq!(loaded_lib(&store, "a"), Some(lib));
     }
 
-    /// Load rejects negative and out-of-range catalogue ids in every catalogue table.
+    /// Every catalogue table drops a row that names an id the catalogue does not
+    /// ship, and reports it.
     #[test]
-    fn invalid_catalogue_ids_are_rejected() {
-        for (table, column, len) in [
-            ("like", "track_id", catalog::TRACKS.len()),
-            ("save", "album_id", catalog::ALBUMS.len()),
-            ("follow", "artist_id", catalog::ARTISTS.len()),
-            ("download", "album_id", catalog::ALBUMS.len()),
-            ("playlist_track", "track_id", catalog::TRACKS.len()),
-            ("history", "track_id", catalog::TRACKS.len()),
+    fn every_catalogue_table_drops_an_unknown_id() {
+        for (table, column) in [
+            ("like", "track_id"),
+            ("save", "album_id"),
+            ("follow", "artist_id"),
+            ("download", "album_id"),
+            ("playlist_track", "track_id"),
+            ("history", "track_id"),
         ] {
-            for value in [-1, len as i64, 256] {
-                let mut store = Store::in_memory().unwrap();
-                store.save("a", &populated("Ada", 0)).unwrap();
-                store.conn.execute(
-                    &format!("UPDATE \"{table}\" SET {column} = ?1 WHERE user_id = 'a' AND {column} = 0"),
-                    [value],
-                ).unwrap();
-                assert!(matches!(store.load("a"), Err(StoreError::Sql(message))
-                    if message.contains(table) && message.contains(&value.to_string())));
-            }
+            let mut store = Store::in_memory().unwrap();
+            store.save("a", &populated("Ada", 0)).unwrap();
+            store
+                .conn
+                .execute(
+                    &format!("UPDATE \"{table}\" SET {column} = -1 WHERE user_id = 'a'"),
+                    [],
+                )
+                .unwrap();
+            let loaded = store.load("a").unwrap().unwrap();
+            assert!(loaded.dropped > 0, "{table} accepted an unknown id");
+            assert_eq!(loaded.lib.check(), Ok(()), "{table} broke the invariant");
         }
     }
 
@@ -609,8 +704,8 @@ mod tests {
         store.save("b", &b).unwrap();
         let empty = Library::default();
         store.save("a", &empty).unwrap();
-        assert_eq!(store.load("a").unwrap(), Some(empty));
-        assert_eq!(store.load("b").unwrap(), Some(b));
+        assert_eq!(loaded_lib(&store, "a"), Some(empty));
+        assert_eq!(loaded_lib(&store, "b"), Some(b));
         let integrity: String = store
             .conn
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
@@ -626,12 +721,12 @@ mod tests {
         );
     }
 
-    /// Load rejects history beyond its cap instead of silently discarding rows.
+    /// History beyond its cap is trimmed to the cap, newest first, and counted.
     #[test]
-    fn excess_history_is_rejected() {
+    fn excess_history_is_trimmed() {
         let mut store = Store::in_memory().unwrap();
         store.save("a", &Library::default()).unwrap();
-        for position in 0..=crate::library::HISTORY_CAP {
+        for position in 0..HISTORY_CAP + 3 {
             store
                 .conn
                 .execute(
@@ -640,13 +735,16 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert!(matches!(store.load("a"), Err(StoreError::Sql(message))
-            if message.contains("HistoryTooLong")));
+        let loaded = store.load("a").unwrap().unwrap();
+        assert_eq!(loaded.lib.history.len(), HISTORY_CAP);
+        assert_eq!(loaded.dropped, 3);
+        assert_eq!(loaded.lib.check(), Ok(()));
     }
 
     /// Configuration preserves a current schema and rejects a schema from a newer build.
     #[test]
-    fn schema_version_controls_migration() {        let store = Store::in_memory().unwrap();
+    fn schema_version_controls_migration() {
+        let store = Store::in_memory().unwrap();
         let store = Store::configure(store.conn).unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         let foreign_keys: bool = store
@@ -687,7 +785,7 @@ mod tests {
         assert_eq!(mode, 0o600, "the database is not private");
 
         let second = Store::open(&path).unwrap();
-        assert_eq!(second.load("173210380").unwrap(), Some(lib));
+        assert_eq!(loaded_lib(&second, "173210380"), Some(lib));
         assert_eq!(second.schema_version().unwrap(), SCHEMA_VERSION);
 
         let _ = std::fs::remove_dir_all(&dir);

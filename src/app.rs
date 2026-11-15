@@ -104,25 +104,34 @@ impl App {
                 return;
             }
         };
+        // A missing row means a new account, so the in-memory library must not
+        // carry the previous account's rows into this one.
         match db.load(user_id) {
-            Ok(Some(lib)) => {
-                self.core.lib = lib;
-                self.saved = self.core.lib.clone();
-                self.db = Some(db);
+            Ok(Some(loaded)) => {
+                if loaded.dropped > 0 {
+                    eprintln!(
+                        "opentidal: {} stored item(s) name something the catalogue no longer has, and the next sync restores them",
+                        loaded.dropped
+                    );
+                }
+                self.core.lib = loaded.lib;
             }
             Ok(None) => {
-                self.saved = self.core.lib.clone();
-                self.db = Some(db);
+                self.core.lib = Library::default();
             }
             Err(error) => {
                 eprintln!("opentidal: cannot load the library, leaving it unwritten: {error:?}");
+                return;
             }
         }
+        self.saved = self.core.lib.clone();
+        self.db = Some(db);
     }
 
-    /// Write the library when it differs from what is on disk. One comparison
-    /// covers every operation in the UI, so a new screen action needs no
-    /// persistence call of its own.
+    /// Write the library when it differs from what is on disk. This runs at the
+    /// start of every frame, so a click in one frame is on disk by the next.
+    /// One comparison covers every operation in the UI, so a new screen action
+    /// needs no persistence call of its own.
     fn flush_library(&mut self) {
         if self.core.lib == self.saved {
             return;
@@ -172,7 +181,10 @@ impl App {
     pub fn sign_out(&mut self) {
         self.session += 1;
         match self.store.clear() {
-            Ok(()) => self.auth = Auth::SignedOut,
+            Ok(()) => {
+                self.forget_session();
+                self.auth = Auth::SignedOut;
+            }
             Err(e) => {
                 // Do not claim sign-out while the token still persists; the
                 // next launch would restore it.
@@ -180,6 +192,18 @@ impl App {
                 self.auth = Auth::Failed { message: format!("Sign-out failed: {e}") };
             }
         }
+    }
+
+    /// Drop everything tied to the signed-in account. The rows stay on disk, so
+    /// the next sign-in with that account finds its library. A kept library in
+    /// memory would show one account's data while another is signed in, and the
+    /// next save would write it under the new id.
+    fn forget_session(&mut self) {
+        self.flush_library();
+        self.db = None;
+        self.user_id = None;
+        self.core.lib = Library::default();
+        self.saved = Library::default();
     }
 
     /// Fetch the signed-in user's profile off the UI thread, refreshing an
@@ -345,9 +369,15 @@ fn session_user_id(token: &Token) -> Option<String> {
     auth::decode_claims(&token.access_token)?.user_id()
 }
 
-/// The library database path, beside the config file, so the app owns one
-/// directory per user.
+/// The library database path. `OPENTIDAL_DB` names it outright, which the
+/// headless harness uses to prove persistence. Otherwise it sits beside the
+/// config file, so the app owns one directory per user.
 fn db_path() -> Option<std::path::PathBuf> {
+    if let Ok(path) = std::env::var("OPENTIDAL_DB")
+        && !path.is_empty()
+    {
+        return Some(std::path::PathBuf::from(path));
+    }
     Some(config_path()?.with_file_name("opentidal.db"))
 }
 
@@ -455,8 +485,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An unreadable file leaves the session without a writable database, so
-    /// the next save cannot replace a library the app failed to read.
+    /// A stored item the catalogue cannot resolve costs only that item. The app
+    /// opens, keeps the rest of the library, and stays writable, because the
+    /// next sync restores what was dropped.
+    #[test]
+    fn an_unknown_item_costs_only_that_item() {        let dir = db_dir("unreadable");
+        let path = dir.join("opentidal.db");
+
+        let mut seeded = signed_in("173210380");
+        seeded.open_library("173210380", &path);
+        seeded.core.lib.set_name("Ada".to_string());
+        seeded.core.lib.toggle_like(TrackId(0));
+        seeded.core.lib.toggle_like(TrackId(1));
+        seeded.flush_library();
+        drop(seeded);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE \"like\" SET track_id = 999 WHERE track_id = 1 AND user_id = '173210380'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut app = signed_in("173210380");
+        app.open_library("173210380", &path);
+        assert!(app.db.is_some(), "one unknown item closed the database");
+        assert_eq!(app.core.lib.name, "Ada");
+        assert_eq!(app.core.lib.liked.count_ones(), 1, "the good like was lost");
+
+        app.core.lib.toggle_like(TrackId(2));
+        app.flush_library();
+        let mut reread = signed_in("173210380");
+        reread.open_library("173210380", &path);
+        assert_eq!(reread.core.lib.liked.count_ones(), 2, "the new like was not saved");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that is not a database at all keeps its bytes. There is nothing to
+    /// open, and nothing to write over.
     #[test]
     fn a_broken_file_is_never_overwritten() {
         let dir = db_dir("broken");
@@ -464,9 +532,9 @@ mod tests {
         let path = dir.join("opentidal.db");
         std::fs::write(&path, b"not a database").unwrap();
 
-        let mut app = App::default();
+        let mut app = signed_in("173210380");
         app.open_library("173210380", &path);
-        assert!(app.db.is_none(), "a broken database was opened for writing");
+        assert!(app.db.is_none(), "a broken file was opened for writing");
 
         app.core.lib.set_name("Ada".to_string());
         app.flush_library();
@@ -475,37 +543,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A library that cannot be loaded leaves the database closed for writing,
-    /// and the file keeps its bytes. A save over it would destroy the rows the
-    /// app failed to read.
+    /// Signing out of account A and into account B shows B's empty library, not
+    /// A's rows. A leak here writes A's data under B's id.
     #[test]
-    fn an_unreadable_library_is_never_overwritten() {
-        let dir = db_dir("unreadable");
+    fn a_second_account_does_not_inherit_the_first() {
+        let dir = db_dir("accounts");
         let path = dir.join("opentidal.db");
 
-        let mut seeded = signed_in("173210380");
-        seeded.open_library("173210380", &path);
-        seeded.core.lib.set_name("Ada".to_string());
-        seeded.core.lib.toggle_like(TrackId(0));
-        seeded.flush_library();
-        drop(seeded);
+        let mut first = signed_in("111");
+        first.open_library("111", &path);
+        first.core.lib.set_name("Ada".to_string());
+        first.core.lib.toggle_like(TrackId(0));
+        first.flush_library();
+        first.sign_out();
+        first.open_library("222", &path);
 
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute(
-            "UPDATE \"like\" SET track_id = 999 WHERE user_id = '173210380'",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-
-        let mut app = App::default();
-        app.open_library("173210380", &path);
-        assert!(app.db.is_none(), "an unreadable library was opened for writing");
-
-        let before = std::fs::read(&path).unwrap();
-        app.core.lib.set_name("Changed".to_string());
-        app.flush_library();
-        assert_eq!(std::fs::read(&path).unwrap(), before, "the file was rewritten");
+        assert!(first.core.lib.liked == 0, "account B inherited A's likes");
+        assert!(first.db.is_some(), "account B has no database");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

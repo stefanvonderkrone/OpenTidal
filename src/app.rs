@@ -85,6 +85,14 @@ impl App {
         if self.auth == Auth::SignedOut
             && let Some(token) = self.tokens.load()
         {
+            // A stored token with no `uid` claim names no account, so there is
+            // no session to restore. That is a stale sentinel or a corrupt item,
+            // and signing out is the only honest reading.
+            if session_user_id(&token).is_none() {
+                eprintln!("opentidal: the stored token names no account, signing out");
+                let _ = self.tokens.clear();
+                return;
+            }
             eprintln!("opentidal: restoring a stored session");
             self.begin_session(token);
         }
@@ -110,7 +118,7 @@ impl App {
     /// cannot be read. Overwriting an unreadable library with the default would
     /// destroy it, and only a sync could rebuild it.
     fn open_library(&mut self, user_id: &str, path: &std::path::Path) {
-        let store = match Store::open(path) {
+        let mut store = match Store::open(path) {
             Ok(store) => store,
             Err(error) => {
                 eprintln!("opentidal: cannot open {}: {error:?}", path.display());
@@ -132,10 +140,15 @@ impl App {
             Ok(None) => {
                 self.core.lib = Library::default();
                 // Write the row now, so a restart finds this account even when
-                // the profile fetch never returns a name.
+                // the profile fetch never returns a name. This cannot go through
+                // `flush_library`, which skips a library equal to the one on
+                // disk, and a new account's library is exactly that.
+                if let Err(error) = store.write(user_id, &self.core.lib) {
+                    eprintln!("opentidal: cannot open a row for a new account: {error:?}");
+                    return;
+                }
+                self.on_disk = self.core.lib.clone();
                 self.library = Some(OpenLibrary { user_id: user_id.to_string(), store });
-                self.on_disk = Library::default();
-                self.flush_library();
                 return;
             }
             Err(error) => {
@@ -222,18 +235,15 @@ impl App {
     }
 
     /// Adopt a token as the current session: open that account's library, then
-    /// fetch the profile. A token with no `uid` claim names no account, so it
-    /// gets no library and nothing is written. The headless build signs in with
-    /// such a token.
+    /// fetch the profile. A token with no `uid` claim names no account, so it is
+    /// a failed sign-in rather than a session without a library. The deterministic
+    /// build does not come through here; [`App::start_sign_in`] signs in directly.
     fn begin_session(&mut self, token: Token) {
-        match session_user_id(&token) {
-            Some(user_id) => self.restore_library(&user_id),
-            None => {
-                self.library = None;
-                self.core.lib = Library::default();
-                self.on_disk = Library::default();
-            }
-        }
+        let Some(user_id) = session_user_id(&token) else {
+            self.auth = Auth::Failed { message: "the token names no account".to_string() };
+            return;
+        };
+        self.restore_library(&user_id);
         self.auth = Auth::SignedIn { token: token.clone() };
         self.fetch_profile(token);
     }
@@ -278,11 +288,13 @@ impl App {
                     self.core.lib.set_name(user.name);
                 }
                 Err(e) => {
-                    // A dead refresh token means no session at all: the old row
-                    // must not keep taking saves under a failed sign-in.
+                    // A dead refresh token means no session at all. The rows stay
+                    // on disk for a later sign-in, but the library in memory must
+                    // not survive, or the next account to sign in would inherit
+                    // it and save it under its own id.
                     if matches!(&e, ServiceError::InvalidGrant(_)) {
                         let _ = self.tokens.clear();
-                        self.library = None;
+                        self.forget_session();
                     }
                     self.auth = Auth::Failed { message: format!("{e:?}") };
                 }
@@ -545,6 +557,35 @@ mod tests {
         assert_eq!(second.core.lib.playlist(id).unwrap().tracks, vec![TrackId(3)]);
         assert!(second.library.is_some());
 
+    }
+
+    /// A stored token that names no account signs out instead of signing in.
+    /// Keeping it would show a session with no library behind it.
+    #[test]
+    fn a_token_without_an_account_signs_out() {
+        let mut app = app_without_a_session();
+        app.tokens.save(&fake_token());
+        app.setup(std::sync::Arc::new(|| ()));
+        assert_eq!(app.auth, Auth::SignedOut);
+        assert_eq!(app.tokens.load(), None, "the unusable token stayed stored");
+    }
+
+    /// A new account has a row on disk before any name arrives, so a restart
+    /// finds it. Without the row the next launch treats the account as new.
+    #[test]
+    fn a_new_account_is_written_at_once() {
+        let dir = TempDir::new("new-account");
+        let path = dir.path();
+
+        let mut app = app_without_a_session();
+        app.open_library("999", &path);
+        assert!(app.library.is_some(), "no session was established");
+
+        let reopened = Store::open(&path).unwrap();
+        assert!(
+            reopened.load("999").unwrap().is_some(),
+            "a new account left no row, so a restart would not find it"
+        );
     }
 
     /// A stored item the catalogue cannot resolve costs only that item. The app

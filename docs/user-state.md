@@ -97,7 +97,10 @@ The start path runs in this order. It never blocks on the network.
 
 1. Keychain has no token. Signed out. Do not open the file.
 2. Token present, `user_id()` returns `None`. Signed out. Write the
-   `signed-out` sentinel, as `KeychainStore::clear` already does.
+   `signed-out` sentinel, as `KeychainStore::clear` already does. A token that
+   names no account cannot be a session, so the app clears it rather than showing
+   a signed-in state with no library behind it. The deterministic build never
+   reaches this: `start_sign_in` signs it in directly.
 3. `user_id()` found, user row found. Signed in at once, name from the row.
 4. `user_id()` found, row missing. Signed in, name `You`, profile fetch fills
    the row. A missing row is not an error.
@@ -237,6 +240,8 @@ names work this branch does not build.
 | A container survives a dropped leaf | One bad track in a playlist, assert the name and good tracks stay | test: `a_container_survives_a_dropped_leaf` |
 | Every catalogue table drops an unknown id | Break each table in turn, assert the drop and the invariant | test: `every_catalogue_table_drops_an_unknown_id` |
 | A second account starts empty | Sign out of one account, open another, assert no rows carried over | test: `a_second_account_does_not_inherit_the_first` |
+| A new account has a row at once | Open a new account, reopen the file, assert the row is there | test: `a_new_account_is_written_at_once` |
+| A token with no account signs out | Store a token with no `uid`, start, assert signed out and cleared | test: `a_token_without_an_account_signs_out` |
 | A broken file is never overwritten | Write junk to the path, assert no library opens and the bytes stay | test: `a_broken_file_is_never_overwritten` |
 | A restart shows the library | Write, reopen the file, assert the library and the name come back | test: `a_restart_reads_the_written_library`, `a_restart_shows_the_saved_library` |
 | A quit writes what is outstanding | Change the library, quit, reopen, assert the change is there | test: `a_quit_writes_what_is_outstanding` |

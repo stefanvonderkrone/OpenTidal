@@ -364,17 +364,20 @@ impl Store {
 /// Tidal, and the file holds a name and a listening history, so a backup copies
 /// a privacy risk for no gain.
 ///
-/// This sets the extended attribute `tmutil addexclusion` sets, rather than
-/// running `tmutil`: that call takes eleven seconds on this machine, and this one
-/// runs on the startup path.
+/// This excludes the directory, not the file. In WAL mode SQLite keeps recent
+/// rows in `opentidal.db-wal`, and an exclusion on the database alone would leave
+/// them in the backup. It sets the extended attribute `tmutil addexclusion` sets,
+/// rather than running `tmutil`, which takes eleven seconds here and this runs on
+/// the startup path.
 #[cfg(target_os = "macos")]
 fn exclude_from_backup(path: &Path) -> Result<(), StoreError> {
+    let Some(dir) = path.parent() else { return Ok(()) };
     let _ = std::process::Command::new("xattr")
         .args([
             "-w",
             "com.apple.metadata:com_apple_backup_excludeItem",
             "com.apple.backupd",
-            &path.to_string_lossy(),
+            &dir.to_string_lossy(),
         ])
         .status();
     // A sandbox that hides `xattr` must not stop the app opening its database.
@@ -445,17 +448,19 @@ mod tests {
         let path = dir.join("opentidal.db");
         Store::open(&path).unwrap();
 
+        // The directory is what is excluded, so the WAL and SHM files beside the
+        // database stay out of the backup too.
         let out = std::process::Command::new("xattr")
             .args([
                 "-p",
                 "com.apple.metadata:com_apple_backup_excludeItem",
-                &path.to_string_lossy(),
+                &dir.to_string_lossy(),
             ])
             .output()
             .unwrap();
         assert!(
             String::from_utf8_lossy(&out.stdout).contains("com.apple.backupd"),
-            "the database is not excluded from backups"
+            "the database directory is not excluded from backups"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

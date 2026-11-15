@@ -35,13 +35,16 @@ the database keeps a row set per account id.
 
 The on-disk half, in `src/store.rs`. One SQLite file, one row set per account.
 
-- **store** — the SQLite database at
+- **store**: the SQLite database at
   `~/Library/Application Support/OpenTidal/opentidal.db`.
-- **slot** — a position in the fixed playlist array. A slot is empty after a
+- **keychain**: the token store. It holds the token and nothing else. Code calls
+  it `tokens`.
+- **slot**: a position in the fixed playlist array. A slot is empty after a
   delete, and a create reuses the first empty one. Routes are never persisted,
   so a slot means the same playlist across a restart.
-- **save** — write one account's whole library in one transaction. Read
-  `save` as the verb only where the album sense is clear from context.
+- **write**: replace one account's whole library in one transaction. This is
+  `Store::save` in code, read as "save an album" nowhere else, because the album
+  verb is **save** above.
 
 ## State
 
@@ -72,5 +75,5 @@ today; the catalogue and library stay local until the later PRs move them.
   `SignedOut`, `Authorizing`, `SignedIn`, and `Failed`, from `src/auth.rs`.
 - **token** — an OAuth access token and its refresh token. The refresh token
   persists in the macOS keychain.
-- **user id** — Tidal's account id, from the `uid` claim of the access token.
+- **user id**: Tidal's account id, from the `uid` claim of the access token.
   It is the database key. It does not change on a refresh or a fresh sign-in.

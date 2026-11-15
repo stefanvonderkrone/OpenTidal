@@ -418,7 +418,7 @@ mod tests {
         assert!(is_email("ada@example.com"));
         assert!(!is_email("ada"));
         assert!(!is_email("@example.com"));
-        assert!(!is_email("ada@localhost".replace("localhost", "").as_str()));
+        assert!(!is_email("ada@"));
     }
 
     /// The loopback port comes from the URI, and a URI without a port fails.

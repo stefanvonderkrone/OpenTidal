@@ -145,6 +145,8 @@ impl Store {
             return Ok(None);
         };
         let mut dropped = 0;
+        // The database `idx` of each loaded collection, in the order they load.
+        let mut collection_idx: Vec<usize> = Vec::new();
         let mut lib = Library {
             name,
             liked: load_bits(&tx, user_id, "like", "track_id", catalog::TRACKS.len(), &mut dropped)?,
@@ -206,10 +208,14 @@ impl Store {
             )?;
             let mut rows = stmt.query(params![user_id, MAX_COLLECTIONS as i64])?;
             while let Some(row) = rows.next()? {
-                if index(row.get(0)?, MAX_COLLECTIONS).is_err() {
+                // `LIMIT` already bounds the count, so the stored index only has
+                // to be non-negative. It is what a child row names, so a gap must
+                // not shift it.
+                let Ok(raw) = usize::try_from(row.get::<_, i64>(0)?) else {
                     dropped += 1;
                     continue;
-                }
+                };
+                collection_idx.push(raw);
                 lib.collections.push(Collection { name: row.get(1)?, playlists: Vec::new() });
             }
             dropped += count_beyond(&tx, "collection", user_id, MAX_COLLECTIONS)?;
@@ -221,7 +227,11 @@ impl Store {
             )?;
             let mut rows = stmt.query([user_id])?;
             while let Some(row) = rows.next()? {
-                let Ok(idx) = index(row.get(0)?, lib.collections.len()) else {
+                let raw: i64 = row.get(0)?;
+                let Some(idx) = usize::try_from(raw)
+                    .ok()
+                    .and_then(|raw| collection_idx.iter().position(|&i| i == raw))
+                else {
                     dropped += 1;
                     continue;
                 };
@@ -269,7 +279,7 @@ impl Store {
     }
 
     /// Replace the stored library for a user in one transaction.
-    pub fn save(&mut self, user_id: &str, lib: &Library) -> Result<(), StoreError> {
+    pub fn write(&mut self, user_id: &str, lib: &Library) -> Result<(), StoreError> {
         lib.check()
             .map_err(|error| StoreError::Sql(format!("library invariant: {error:?}")))?;
         let tx = self.conn.transaction()?;
@@ -432,7 +442,7 @@ mod tests {
     fn default_round_trips() {
         let mut store = Store::in_memory().unwrap();
         let lib = Library::default();
-        store.save("a", &lib).unwrap();
+        store.write("a", &lib).unwrap();
         assert_eq!(loaded_lib(&store, "a"), Some(lib));
     }
 
@@ -441,7 +451,7 @@ mod tests {
     fn operations_round_trip() {
         let mut store = Store::in_memory().unwrap();
         let lib = populated("Ada", 3);
-        store.save("a", &lib).unwrap();
+        store.write("a", &lib).unwrap();
         let loaded = loaded_lib(&store, "a").unwrap();
         assert_eq!(loaded, lib);
         assert_eq!(loaded.check(), Ok(()));
@@ -507,7 +517,7 @@ mod tests {
             }
             assert_eq!(lib.check(), Ok(()));
             if step % 17 == 0 || step == 1_999 {
-                store.save("a", &lib).unwrap();
+                store.write("a", &lib).unwrap();
                 let loaded = loaded_lib(&store, "a").unwrap();
                 assert_eq!(loaded, lib, "step {step}");
                 assert_eq!(loaded.check(), Ok(()));
@@ -522,7 +532,7 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let mut lib = populated("Ada", 0);
         lib.delete_playlist(PlaylistId(0));
-        store.save("a", &lib).unwrap();
+        store.write("a", &lib).unwrap();
         let loaded = loaded_lib(&store, "a").unwrap();
         assert!(loaded.playlists[0].is_none());
         assert_eq!(loaded.playlists[1], lib.playlists[1]);
@@ -537,13 +547,13 @@ mod tests {
         assert_eq!(loaded_lib(&store, "unknown"), None);
     }
 
-    /// Repeated saves replace rows without duplicates.
+    /// Repeated writes replace rows without duplicates.
     #[test]
-    fn save_is_idempotent() {
+    fn write_is_idempotent() {
         let mut store = Store::in_memory().unwrap();
         let lib = populated("Ada", 0);
-        store.save("a", &lib).unwrap();
-        store.save("a", &lib).unwrap();
+        store.write("a", &lib).unwrap();
+        store.write("a", &lib).unwrap();
         assert_eq!(loaded_lib(&store, "a"), Some(lib.clone()));
         let count: u32 = store
             .conn
@@ -562,9 +572,9 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let a = populated("Ada", 0);
         let b = populated("Bea", 4);
-        store.save("a", &a).unwrap();
-        store.save("b", &b).unwrap();
-        store.save("a", &a).unwrap();
+        store.write("a", &a).unwrap();
+        store.write("b", &b).unwrap();
+        store.write("a", &a).unwrap();
         assert_eq!(loaded_lib(&store, "a"), Some(a));
         assert_eq!(loaded_lib(&store, "b"), Some(b));
     }
@@ -578,7 +588,7 @@ mod tests {
         let mut lib = Library::default();
         lib.toggle_like(TrackId(0));
         lib.toggle_like(TrackId(1));
-        store.save("a", &lib).unwrap();
+        store.write("a", &lib).unwrap();
         store
             .conn
             .execute("INSERT INTO \"like\" VALUES ('a', 999)", [])
@@ -599,7 +609,7 @@ mod tests {
         let id = lib.create_playlist("Road trip".to_string()).unwrap();
         lib.add_track(id, TrackId(0));
         lib.add_track(id, TrackId(1));
-        store.save("a", &lib).unwrap();
+        store.write("a", &lib).unwrap();
         store
             .conn
             .execute("UPDATE playlist_track SET track_id = 999 WHERE position = 1", [])
@@ -610,6 +620,39 @@ mod tests {
         let playlist = loaded.lib.playlist(id).expect("the playlist disappeared");
         assert_eq!(playlist.name, "Road trip");
         assert_eq!(playlist.tracks, vec![TrackId(0)]);
+    }
+
+    /// A gap in the collection indices does not attach a reference to the wrong
+    /// folder. Save never writes a gap, so only a damaged file reaches this.
+    #[test]
+    fn a_collection_gap_does_not_misplace_a_reference() {
+        let mut store = Store::in_memory().unwrap();
+        let mut lib = Library::default();
+        let id = lib.create_playlist("P".to_string()).unwrap();
+        lib.create_collection("Second".into());
+        lib.add_to_collection(0, id);
+        store.write("a", &lib).unwrap();
+        // Move the only collection to idx 3, leaving a gap below it, and take
+        // its reference with it.
+        store
+            .conn
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 UPDATE collection SET idx = 3;
+                 UPDATE collection_playlist SET idx = 3;
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+
+        let loaded = store.load("a").unwrap().unwrap();
+        assert_eq!(loaded.lib.collections.len(), 1);
+        assert_eq!(loaded.lib.collections[0].name, "Second");
+        assert_eq!(
+            loaded.lib.collections[0].playlists,
+            vec![id],
+            "the reference landed on the wrong collection"
+        );
+        assert_eq!(loaded.lib.check(), Ok(()));
     }
 
     /// A fresh database reports the schema version this build writes.
@@ -626,7 +669,7 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let mut lib = Library::default();
         lib.create_collection("C".into());
-        store.save("a", &lib).unwrap();
+        store.write("a", &lib).unwrap();
         store
             .conn
             .execute("INSERT INTO collection_playlist VALUES ('a', 0, 0, 1)", [])
@@ -644,7 +687,7 @@ mod tests {
     #[test]
     fn a_duplicate_history_entry_is_dropped() {
         let mut store = Store::in_memory().unwrap();
-        store.save("a", &Library::default()).unwrap();
+        store.write("a", &Library::default()).unwrap();
         store
             .conn
             .execute_batch("INSERT INTO history VALUES ('a', 0, 0), ('a', 1, 0);")
@@ -656,12 +699,12 @@ mod tests {
         assert_eq!(loaded.lib.check(), Ok(()));
     }
 
-    /// A failed replacement rolls back the user row and all child rows.
+    /// A failed write rolls back the user row and all child rows.
     #[test]
-    fn failed_save_is_atomic() {
+    fn a_failed_write_is_atomic() {
         let mut store = Store::in_memory().unwrap();
         let lib = populated("Ada", 0);
-        store.save("a", &lib).unwrap();
+        store.write("a", &lib).unwrap();
         store
             .conn
             .execute_batch(
@@ -669,7 +712,7 @@ mod tests {
              BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
             )
             .unwrap();
-        assert!(store.save("a", &populated("Changed", 2)).is_err());
+        assert!(store.write("a", &populated("Changed", 2)).is_err());
         assert_eq!(loaded_lib(&store, "a"), Some(lib));
     }
 
@@ -686,7 +729,7 @@ mod tests {
             ("history", "track_id"),
         ] {
             let mut store = Store::in_memory().unwrap();
-            store.save("a", &populated("Ada", 0)).unwrap();
+            store.write("a", &populated("Ada", 0)).unwrap();
             store
                 .conn
                 .execute(
@@ -705,10 +748,10 @@ mod tests {
     fn replacement_removes_stale_rows() {
         let mut store = Store::in_memory().unwrap();
         let b = populated("Bea", 3);
-        store.save("a", &populated("Ada", 0)).unwrap();
-        store.save("b", &b).unwrap();
+        store.write("a", &populated("Ada", 0)).unwrap();
+        store.write("b", &b).unwrap();
         let empty = Library::default();
-        store.save("a", &empty).unwrap();
+        store.write("a", &empty).unwrap();
         assert_eq!(loaded_lib(&store, "a"), Some(empty));
         assert_eq!(loaded_lib(&store, "b"), Some(b));
         let integrity: String = store
@@ -730,7 +773,7 @@ mod tests {
     #[test]
     fn excess_history_is_trimmed() {
         let mut store = Store::in_memory().unwrap();
-        store.save("a", &Library::default()).unwrap();
+        store.write("a", &Library::default()).unwrap();
         for position in 0..HISTORY_CAP + 3 {
             store
                 .conn
@@ -783,7 +826,7 @@ mod tests {
 
         {
             let mut first = Store::open(&path).unwrap();
-            first.save("173210380", &lib).unwrap();
+            first.write("173210380", &lib).unwrap();
         }
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

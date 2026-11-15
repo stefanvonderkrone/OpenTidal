@@ -25,16 +25,15 @@ pub struct App {
     pub auth: Auth,
     pub service: Arc<dyn MusicService>,
     pub oauth: OAuthConfig,
-    pub store: Arc<dyn TokenStore>,
-    /// The library database, open only while the token names a user. The
-    /// deterministic fake signs in with a token that is not a JWT, so no user
-    /// id is known and nothing is written in the headless build.
-    pub db: Option<Store>,
-    /// The user id from the token's `uid` claim, when a session is established.
-    pub user_id: Option<String>,
+    /// The keychain, holding the token and nothing else.
+    pub tokens: Arc<dyn TokenStore>,
+    /// The open library database with the account id it belongs to, or `None`
+    /// when nothing can be saved. The pair is one value, so an account id can
+    /// never exist without the database it keys.
+    library: Option<OpenLibrary>,
     /// The library as last written to disk, so a frame can tell whether the
     /// in-memory library changed.
-    saved: Library,
+    on_disk: Library,
     /// Wakes the event loop so `poll` runs after a change. A windowed app stops
     /// drawing frames at rest, so without this a click in the last frame before
     /// idle would sit unsaved until the next input.
@@ -52,6 +51,13 @@ pub struct App {
     /// The profile fetch after sign-in, drained by `poll`. Carries the session
     /// it was started under and the possibly-refreshed token to persist.
     pub profile: Latest<ProfileFetch>,
+}
+
+/// One account's open library. The account id and the handle are one value, so a
+/// save always knows which rows it writes.
+struct OpenLibrary {
+    user_id: String,
+    store: Store,
 }
 
 /// A finished sign-in exchange, tagged with the session it ran under.
@@ -77,15 +83,10 @@ impl App {
         self.profile.set_waker(waker.clone());
         self.waker = Some(waker);
         if self.auth == Auth::SignedOut
-            && let Some(token) = self.store.load()
+            && let Some(token) = self.tokens.load()
         {
             eprintln!("opentidal: restoring a stored session");
-            self.user_id = session_user_id(&token);
-            if let Some(user_id) = self.user_id.clone() {
-                self.restore_library(&user_id);
-            }
-            self.auth = Auth::SignedIn { token: token.clone() };
-            self.fetch_profile(token);
+            self.begin_session(token);
         }
     }
 
@@ -100,14 +101,17 @@ impl App {
         };
         self.open_library(user_id, &path);
     }
-    /// The testable half of [`App::restore_library`], with the path supplied.
+
+    /// Open the database for an account and load its library. The account id and
+    /// the handle become one `Session`, so nothing downstream can save without
+    /// knowing which account it saves for.
+    ///
+    /// The library stays as it is, and no session is established, when the file
+    /// cannot be read. Overwriting an unreadable library with the default would
+    /// destroy it, and only a sync could rebuild it.
     fn open_library(&mut self, user_id: &str, path: &std::path::Path) {
-        // The user id and the open database are one fact: a session that can
-        // write needs both, so taking the id here means no caller can open the
-        // library and forget the key it will save under.
-        self.user_id = Some(user_id.to_string());
-        let db = match Store::open(path) {
-            Ok(db) => db,
+        let store = match Store::open(path) {
+            Ok(store) => store,
             Err(error) => {
                 eprintln!("opentidal: cannot open {}: {error:?}", path.display());
                 return;
@@ -115,7 +119,7 @@ impl App {
         };
         // A missing row means a new account, so the in-memory library must not
         // carry the previous account's rows into this one.
-        match db.load(user_id) {
+        match store.load(user_id) {
             Ok(Some(loaded)) => {
                 if loaded.dropped > 0 {
                     eprintln!(
@@ -127,14 +131,20 @@ impl App {
             }
             Ok(None) => {
                 self.core.lib = Library::default();
+                // Write the row now, so a restart finds this account even when
+                // the profile fetch never returns a name.
+                self.library = Some(OpenLibrary { user_id: user_id.to_string(), store });
+                self.on_disk = Library::default();
+                self.flush_library();
+                return;
             }
             Err(error) => {
                 eprintln!("opentidal: cannot load the library, leaving it unwritten: {error:?}");
                 return;
             }
         }
-        self.saved = self.core.lib.clone();
-        self.db = Some(db);
+        self.on_disk = self.core.lib.clone();
+        self.library = Some(OpenLibrary { user_id: user_id.to_string(), store });
     }
 
     /// Write the library when it differs from what is on disk. This runs at the
@@ -142,17 +152,14 @@ impl App {
     /// One comparison covers every operation in the UI, so a new screen action
     /// needs no persistence call of its own.
     fn flush_library(&mut self) {
-        if self.core.lib == self.saved {
+        if self.core.lib == self.on_disk {
             return;
         }
-        let Some(user_id) = self.user_id.clone() else {
+        let Some(open) = self.library.as_mut() else {
             return;
         };
-        let Some(db) = self.db.as_mut() else {
-            return;
-        };
-        match db.save(&user_id, &self.core.lib) {
-            Ok(()) => self.saved = self.core.lib.clone(),
+        match open.store.write(&open.user_id, &self.core.lib) {
+            Ok(()) => self.on_disk = self.core.lib.clone(),
             Err(error) => eprintln!("opentidal: cannot save the library: {error:?}"),
         }
     }
@@ -189,7 +196,7 @@ impl App {
 
     pub fn sign_out(&mut self) {
         self.session += 1;
-        match self.store.clear() {
+        match self.tokens.clear() {
             Ok(()) => {
                 self.forget_session();
                 self.auth = Auth::SignedOut;
@@ -209,10 +216,26 @@ impl App {
     /// next save would write it under the new id.
     fn forget_session(&mut self) {
         self.flush_library();
-        self.db = None;
-        self.user_id = None;
+        self.library = None;
         self.core.lib = Library::default();
-        self.saved = Library::default();
+        self.on_disk = Library::default();
+    }
+
+    /// Adopt a token as the current session: open that account's library, then
+    /// fetch the profile. A token with no `uid` claim names no account, so it
+    /// gets no library and nothing is written. The headless build signs in with
+    /// such a token.
+    fn begin_session(&mut self, token: Token) {
+        match session_user_id(&token) {
+            Some(user_id) => self.restore_library(&user_id),
+            None => {
+                self.library = None;
+                self.core.lib = Library::default();
+                self.on_disk = Library::default();
+            }
+        }
+        self.auth = Auth::SignedIn { token: token.clone() };
+        self.fetch_profile(token);
     }
 
     /// Fetch the signed-in user's profile off the UI thread, refreshing an
@@ -236,13 +259,8 @@ impl App {
             changed = true;
             match result {
                 Ok(token) => {
-                    self.store.save(&token);
-                    self.user_id = session_user_id(&token);
-                    if let Some(user_id) = self.user_id.clone() {
-                        self.restore_library(&user_id);
-                    }
-                    self.auth = Auth::SignedIn { token: token.clone() };
-                    self.fetch_profile(token);
+                    self.tokens.save(&token);
+                    self.begin_session(token);
                 }
                 Err(message) => self.auth = Auth::Failed { message },
             }
@@ -253,15 +271,18 @@ impl App {
             changed = true;
             match result {
                 Ok((token, user)) => {
-                    self.store.save(&token);
+                    self.tokens.save(&token);
                     if let Auth::SignedIn { token: held } = &mut self.auth {
                         *held = token;
                     }
                     self.core.lib.set_name(user.name);
                 }
                 Err(e) => {
+                    // A dead refresh token means no session at all: the old row
+                    // must not keep taking saves under a failed sign-in.
                     if matches!(&e, ServiceError::InvalidGrant(_)) {
-                        let _ = self.store.clear();
+                        let _ = self.tokens.clear();
+                        self.library = None;
                     }
                     self.auth = Auth::Failed { message: format!("{e:?}") };
                 }
@@ -275,7 +296,7 @@ impl App {
     /// in that frame's `drain`. A window at rest draws no frames, so a change in
     /// the frame that puts it to rest would otherwise wait for the next input.
     pub fn wake_if_dirty(&self) {
-        if self.core.lib != self.saved
+        if self.core.lib != self.on_disk
             && let Some(waker) = &self.waker
         {
             waker();
@@ -357,7 +378,7 @@ impl Default for App {
         } else {
             Arc::new(tidal::FakeService::default())
         };
-        let store: Arc<dyn TokenStore> = if live {
+        let tokens: Arc<dyn TokenStore> = if live {
             keychain_store()
         } else {
             Arc::new(auth::MemoryStore::default())
@@ -375,10 +396,9 @@ impl Default for App {
             auth: Auth::default(),
             service,
             oauth,
-            store,
-            db: None,
-            user_id: None,
-            saved: Library::default(),
+            tokens,
+            library: None,
+            on_disk: Library::default(),
             waker: None,
             live,
             session: 0,
@@ -476,25 +496,42 @@ mod tests {
     use super::*;
     use crate::catalog::TrackId;
 
-    fn db_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("opentidal-app-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    /// An app on its way to a session. The account id comes from `open_library`,
+    /// so nothing here can set one without the database it keys.
+    fn app_without_a_session() -> App {
+        App::default()
     }
 
-    /// An app with the user id a live session would carry, so a save has a key.
-    fn signed_in(user_id: &str) -> App {
-        App { user_id: Some(user_id.to_string()), ..Default::default() }
+    /// A temporary directory that removes itself, so a failing test leaves no
+    /// database behind.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            let dir = std::env::temp_dir()
+                .join(format!("opentidal-app-{name}-{}", std::process::id()));
+            TempDir(dir)
+        }
+
+        fn path(&self) -> std::path::PathBuf {
+            self.0.join("opentidal.db")
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// A library written by one run is the library the next run shows, with no
     /// network step in between.
     #[test]
     fn a_restart_shows_the_saved_library() {
-        let dir = db_dir("restart");
-        let path = dir.join("opentidal.db");
+        let dir = TempDir::new("restart");
+        let path = dir.path();
 
-        let mut first = signed_in("173210380");
+        let mut first = app_without_a_session();
         first.open_library("173210380", &path);
         first.core.lib.set_name("Ada".to_string());
         let id = first.core.lib.create_playlist("Road trip".to_string()).unwrap();
@@ -506,19 +543,19 @@ mod tests {
         assert_eq!(second.core.lib.name, "Ada");
         assert_eq!(second.core.lib.playlist(id).unwrap().name, "Road trip");
         assert_eq!(second.core.lib.playlist(id).unwrap().tracks, vec![TrackId(3)]);
-        assert!(second.db.is_some());
+        assert!(second.library.is_some());
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A stored item the catalogue cannot resolve costs only that item. The app
     /// opens, keeps the rest of the library, and stays writable, because the
     /// next sync restores what was dropped.
     #[test]
-    fn an_unknown_item_costs_only_that_item() {        let dir = db_dir("unreadable");
-        let path = dir.join("opentidal.db");
+    fn an_unknown_item_costs_only_that_item() {
+        let dir = TempDir::new("unknown-item");
+        let path = dir.path();
 
-        let mut seeded = signed_in("173210380");
+        let mut seeded = app_without_a_session();
         seeded.open_library("173210380", &path);
         seeded.core.lib.set_name("Ada".to_string());
         seeded.core.lib.toggle_like(TrackId(0));
@@ -534,49 +571,47 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let mut app = signed_in("173210380");
+        let mut app = app_without_a_session();
         app.open_library("173210380", &path);
-        assert!(app.db.is_some(), "one unknown item closed the database");
+        assert!(app.library.is_some(), "one unknown item closed the database");
         assert_eq!(app.core.lib.name, "Ada");
         assert_eq!(app.core.lib.liked.count_ones(), 1, "the good like was lost");
 
         app.core.lib.toggle_like(TrackId(2));
         app.flush_library();
-        let mut reread = signed_in("173210380");
+        let mut reread = app_without_a_session();
         reread.open_library("173210380", &path);
         assert_eq!(reread.core.lib.liked.count_ones(), 2, "the new like was not saved");
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A file that is not a database at all keeps its bytes. There is nothing to
     /// open, and nothing to write over.
     #[test]
     fn a_broken_file_is_never_overwritten() {
-        let dir = db_dir("broken");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("opentidal.db");
+        let dir = TempDir::new("broken");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.path();
         std::fs::write(&path, b"not a database").unwrap();
 
-        let mut app = signed_in("173210380");
+        let mut app = app_without_a_session();
         app.open_library("173210380", &path);
-        assert!(app.db.is_none(), "a broken file was opened for writing");
+        assert!(app.library.is_none(), "a broken file was opened for writing");
 
         app.core.lib.set_name("Ada".to_string());
         app.flush_library();
         assert_eq!(std::fs::read(&path).unwrap(), b"not a database");
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Signing out of account A and into account B shows B's empty library, not
     /// A's rows. A leak here writes A's data under B's id.
     #[test]
     fn a_second_account_does_not_inherit_the_first() {
-        let dir = db_dir("accounts");
-        let path = dir.join("opentidal.db");
+        let dir = TempDir::new("accounts");
+        let path = dir.path();
 
-        let mut first = signed_in("111");
+        let mut first = app_without_a_session();
         first.open_library("111", &path);
         first.core.lib.set_name("Ada".to_string());
         first.core.lib.toggle_like(TrackId(0));
@@ -585,30 +620,28 @@ mod tests {
         first.open_library("222", &path);
 
         assert!(first.core.lib.liked == 0, "account B inherited A's likes");
-        assert!(first.db.is_some(), "account B has no database");
+        assert!(first.library.is_some(), "account B has no database");
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A quit writes what is outstanding. The window's quit takes the fast exit,
     /// which drops no state, so a destructor would never run.
     #[test]
     fn a_quit_writes_what_is_outstanding() {
-        let dir = db_dir("quit");
-        let path = dir.join("opentidal.db");
+        let dir = TempDir::new("quit");
+        let path = dir.path();
 
-        let mut app = signed_in("173210380");
+        let mut app = app_without_a_session();
         app.open_library("173210380", &path);
         app.core.lib.set_name("Ada".to_string());
         app.core.lib.toggle_like(TrackId(5));
         app.quit();
 
-        let mut reread = signed_in("173210380");
+        let mut reread = app_without_a_session();
         reread.open_library("173210380", &path);
         assert_eq!(reread.core.lib.name, "Ada");
         assert!(reread.core.lib.is_liked(TrackId(5)));
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A dirty library asks for another frame, and a clean one does not. A
@@ -618,9 +651,9 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let dir = db_dir("wake");
-        let path = dir.join("opentidal.db");
-        let mut app = signed_in("173210380");
+        let dir = TempDir::new("wake");
+        let path = dir.path();
+        let mut app = app_without_a_session();
         app.open_library("173210380", &path);
 
         let count = Arc::new(AtomicUsize::new(0));
@@ -636,7 +669,6 @@ mod tests {
         app.wake_if_dirty();
         assert_eq!(count.load(Ordering::SeqCst), 1, "a change did not wake the loop");
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The fake token carries no `uid` claim, so the headless build never

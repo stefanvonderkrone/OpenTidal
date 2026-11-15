@@ -50,7 +50,7 @@ const SCENES: [Scene; 6] = [
             refresh_token: "fake-refresh".to_string(),
             expires_in: 0,
         };
-        a.store.save(&token);
+        a.tokens.save(&token);
         a.setup(std::sync::Arc::new(|| ()));
         a.core.lib.set_name("Stored User".to_string());
     }),

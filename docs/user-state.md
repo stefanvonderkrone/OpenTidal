@@ -140,6 +140,13 @@ went. Only a file that cannot be read at all is an error, and then the database
 stays closed for writing, so a save cannot overwrite what the app could not
 read.
 
+Two tables hold data no server has: `download` and `history`. A drop there is
+permanent, so the rule needs one more sentence. A drop happens only when the
+catalogue stops shipping an id, which means the app no longer has the album or
+the track. A downloaded album the app cannot name is not something the user can
+play, and a history entry it cannot name is not something a screen can show. So
+the row went with the content, and nothing the user can reach is lost.
+
 The rule ends the day the app writes to Tidal. From then on a local-only row
 exists, a drop loses data the server never had, and recovery needs a real
 answer.

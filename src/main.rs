@@ -8,6 +8,7 @@ mod catalog;
 mod library;
 mod screens;
 mod state;
+mod store;
 mod tidal;
 
 use rune::tok::{self, radius, space, type_};

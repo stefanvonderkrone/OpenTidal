@@ -56,6 +56,7 @@ impl App {
         if self.auth == Auth::SignedOut
             && let Some(token) = self.store.load()
         {
+            eprintln!("opentidal: restoring a stored session");
             self.auth = Auth::SignedIn { token: token.clone(), name: String::new() };
             self.fetch_profile(token);
         }
@@ -192,13 +193,22 @@ fn resolve_user(
 /// outright. A network or transport failure keeps the token, so a transient
 /// outage does not throw away a working session.
 fn refresh(config: &OAuthConfig, store: &Arc<dyn TokenStore>, token: &Token) -> Result<Token, String> {
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
     match tidal::refresh_token(&client, config, &token.refresh_token) {
-        Ok(fresh) => Ok(fresh),
+        Ok(fresh) => {
+            eprintln!("opentidal: refreshed the access token");
+            Ok(fresh)
+        }
         Err(e) => {
             let dead = matches!(&e, ServiceError::Auth(_));
             if dead {
                 let _ = store.clear();
+                eprintln!("opentidal: refresh rejected, session cleared: {e:?}");
+            } else {
+                eprintln!("opentidal: refresh failed: {e:?}");
             }
             Err(format!("{e:?}"))
         }

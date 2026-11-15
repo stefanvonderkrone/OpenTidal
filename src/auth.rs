@@ -133,11 +133,14 @@ pub fn parse_token(json: &str, fallback_refresh: &str) -> Result<Token, String> 
     })
 }
 
-/// The claims of a Tidal access token, which is a JWT. The `sub` claim is the
-/// user id; the name fields vary, so read them in order. `exp` is the absolute
-/// expiry, in seconds since the Unix epoch.
+/// The claims of a Tidal access token, which is a JWT. The `uid` claim is the
+/// user id (Tidal's tokens carry `uid`, not the OIDC `sub`); the name fields
+/// vary, so read them in order. `exp` is the absolute expiry, in seconds since
+/// the Unix epoch.
 #[derive(Default, Deserialize)]
 pub struct JwtClaims {
+    #[serde(default)]
+    pub uid: Option<String>,
     #[serde(default)]
     pub sub: Option<String>,
     #[serde(default)]
@@ -151,6 +154,15 @@ pub struct JwtClaims {
 }
 
 impl JwtClaims {
+    /// The user id: the `uid` claim Tidal puts in its tokens, with `sub` as a
+    /// fallback for any token that uses the OIDC name.
+    pub fn user_id(&self) -> Option<String> {
+        self.uid
+            .clone()
+            .or_else(|| self.sub.clone())
+            .filter(|s| !s.is_empty())
+    }
+
     /// A display name from the token, in order of preference.
     pub fn display_name(&self) -> Option<String> {
         [&self.username, &self.name, &self.email]
@@ -338,6 +350,20 @@ mod tests {
         let claims = decode_claims(&token).unwrap();
         assert_eq!(claims.sub.as_deref(), Some("123"));
         assert_eq!(claims.display_name().as_deref(), Some("ada"));
+    }
+
+    /// Tidal tokens carry the user id in `uid`; `user_id` prefers it over `sub`.
+    #[test]
+    fn user_id_prefers_uid_over_sub() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"uid":"42","sub":"43"}"#);
+        let token = format!("h.{payload}.sig");
+        let claims = decode_claims(&token).unwrap();
+        assert_eq!(claims.user_id().as_deref(), Some("42"));
+
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"sub":"43"}"#);
+        let token = format!("h.{payload}.sig");
+        assert_eq!(decode_claims(&token).unwrap().user_id().as_deref(), Some("43"));
     }
 
     /// Expiry comes from the JWT `exp` claim; a token without one is valid.

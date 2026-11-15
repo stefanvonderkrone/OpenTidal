@@ -1,10 +1,13 @@
 //! The section and detail screens, built from shared card, shelf, grid, and
-//! track-row builders over the placeholder catalog in `data`.
+//! track-row helpers over the catalogue and the user's library. The library is
+//! real state now: every screen reads it and every action mutates it through
+//! the proven operations.
 
 use rune::tok::{self, radius, space, type_};
 use rune::{Color, El, ScrollSpec, TextEdit, col, el, oklch, row, text, text_input};
 use crate::app::App;
-use crate::data::{self, Album, Artist, Playlist, Track};
+use crate::catalog::{self, Album, Artist, EditorialPlaylistId, Track, TrackId};
+use crate::library::{self, PlaylistId};
 use crate::state::{self, PopularTab, Route, SettingsPage, State};
 
 /// A colourful vertical gradient for a placeholder cover.
@@ -13,25 +16,18 @@ pub fn cover(i: usize) -> (Color, Color) {
     (oklch(0.62, 0.16, hue), oklch(0.34, 0.15, hue))
 }
 
-fn album_at(i: usize) -> Album {
-    data::ALBUMS.get(i).copied().unwrap_or(Album { title: "Album", artist: "Unknown" })
-}
-
-fn artist_at(i: usize) -> Artist {
-    data::ARTISTS.get(i).copied().unwrap_or(Artist { name: "Artist" })
-}
-
-fn playlist_at(i: usize) -> Playlist {
-    data::PLAYLISTS.get(i).copied().unwrap_or(Playlist { name: "Playlist", description: "" })
-}
+// --- Cards ---------------------------------------------------------------
 
 /// A square media card that drills into a detail route on press.
-fn card(i: usize, title: &str, subtitle: &str, route: Route, t: tok::Theme) -> El {
-    let (top, bottom) = cover(i);
-    col().key(format!("card-{i}"))
+fn card(key: &str, seed: usize, title: &str, subtitle: &str, route: Route, t: tok::Theme) -> El {
+    let (top, bottom) = cover(seed);
+    col().key(key)
         .w(168.0)
         .gap(space::S2)
-        .on_press(move |a: &mut App| state::open_detail(&mut a.core, route))
+        .on_press(move |a: &mut App| {
+            a.rename.clear();
+            state::open_detail(&mut a.core, route)
+        })
         .child(
             el().key("cover")
                 .size(168.0, 168.0)
@@ -43,16 +39,20 @@ fn card(i: usize, title: &str, subtitle: &str, route: Route, t: tok::Theme) -> E
         .child(text(subtitle).key("subtitle").font(type_::LABEL).color(t.text_secondary))
 }
 
-fn album_card(i: usize, a: Album, t: tok::Theme) -> El {
-    card(i, a.title, a.artist, Route::Album(i), t)
+fn album_card(a: Album, t: tok::Theme) -> El {
+    card(&format!("album-{}", a.id.0), a.id.0 as usize, a.title, catalog::artist(a.artist).name, Route::Album(a.id), t)
 }
 
-fn artist_card(i: usize, a: Artist, t: tok::Theme) -> El {
-    let (top, bottom) = cover(i + 3);
-    col().key(format!("artist-{i}"))
+fn artist_card(a: Artist, t: tok::Theme) -> El {
+    let id = a.id;
+    let (top, bottom) = cover(a.id.0 as usize + 3);
+    col().key(format!("artist-{}", a.id.0))
         .w(120.0)
         .gap(space::S2)
-        .on_press(move |a: &mut App| state::open_detail(&mut a.core, Route::Artist(i)))
+        .on_press(move |app: &mut App| {
+            app.rename.clear();
+            state::open_detail(&mut app.core, Route::Artist(id))
+        })
         .child(
             el().key("cover")
                 .size(120.0, 120.0)
@@ -63,9 +63,16 @@ fn artist_card(i: usize, a: Artist, t: tok::Theme) -> El {
         .child(text(a.name).key("name").font(type_::BODY).color(t.text).center())
 }
 
-fn playlist_card(i: usize, p: Playlist, t: tok::Theme) -> El {
-    card(i, p.name, p.description, Route::Playlist(i), t)
+fn editorial_card(id: EditorialPlaylistId, t: tok::Theme) -> El {
+    let p = catalog::editorial_playlist(id);
+    card(&format!("editorial-{}", id.0), id.0 as usize + 6, p.name, p.description, Route::EditorialPlaylist(id), t)
 }
+
+fn playlist_card(id: PlaylistId, name: &str, t: tok::Theme) -> El {
+    card(&format!("playlist-{}", id.0), id.0 as usize + 10, name, "Your playlist", Route::UserPlaylist(id), t)
+}
+
+// --- Shelves and grids ---------------------------------------------------
 
 /// A horizontal shelf: a section title over one scrollable row of cards.
 fn shelf(title: &str, t: tok::Theme, cards: Vec<El>) -> El {
@@ -97,46 +104,90 @@ fn grid(cards: Vec<El>, per: usize) -> El {
     g
 }
 
-fn track_row(i: usize, tr: Track, selected: bool, t: tok::Theme) -> El {
-    row().key(format!("track-{i}"))
+// --- Track rows ----------------------------------------------------------
+
+fn track_row(tr: Track, selected: bool, t: tok::Theme) -> El {
+    row().key(format!("track-{}", tr.id.0))
         .checked(selected)
         .fill(if selected { t.hover } else { Color::TRANSPARENT })
         .focusable(true)
-        .on_press(move |a: &mut App| state::select_track(&mut a.core, i, data::TRACKS.len()))
+        .on_press(move |a: &mut App| state::select_track(&mut a.core, tr.id))
         .h(44.0)
         .px(space::S2)
         .radius(radius::MD)
         .center_y()
         .gap(space::S3)
         .hover(t.hover)
-        .child(text(format!("{:02}", i + 1)).key("num").font(type_::LABEL).color(t.text_secondary).w(24.0))
         .child(
             col().grow(1.0).gap(2.0)
                 .child(text(tr.title).key("title").font(type_::BODY).color(t.text))
-                .child(text(tr.artist).key("track-artist").font(type_::LABEL).color(t.text_secondary)),
+                .child(text(catalog::artist(tr.artist).name).key("track-artist").font(type_::LABEL).color(t.text_secondary)),
         )
         .child(text(tr.duration).key("duration").font(type_::LABEL).color(t.text_secondary))
 }
 
-fn track_list(selected: Option<usize>, t: tok::Theme) -> El {
+fn track_list(tracks: Vec<Track>, selected: Option<TrackId>, t: tok::Theme) -> El {
     let mut l = col().key("tracks").gap(space::S1);
-    for (i, tr) in data::TRACKS.iter().enumerate() {
-        l = l.child(track_row(i, *tr, selected == Some(i), t));
+    for tr in tracks {
+        l = l.child(track_row(tr, selected == Some(tr.id), t));
     }
     l
 }
 
-/// The tracks by one artist, keeping each track's original index so the
-/// now-playing selector stays in range.
-fn artist_tracks(artist: &str, selected: Option<usize>, t: tok::Theme) -> El {
-    let mut l = col().key("tracks").gap(space::S1);
-    for (i, tr) in data::TRACKS.iter().enumerate() {
-        if tr.artist == artist {
-            l = l.child(track_row(i, *tr, selected == Some(i), t));
-        }
-    }
-    l
+fn empty(msg: &str, t: tok::Theme) -> El {
+    text(msg).key("empty").font(type_::BODY).color(t.text_secondary)
 }
+
+/// A track row inside a user playlist: selectable, with Remove, Up and Down.
+fn playlist_track_row(pid: PlaylistId, pos: usize, len: usize, tr: Track, selected: bool, t: tok::Theme) -> El {
+    let mut actions = row().gap(space::S1);
+    actions = actions.child(
+        el().key(format!("up-{}-{}", pid.0, pos)).label("Move up")
+            .size(28.0, 28.0).radius(radius::SM).center().hover(t.hover).focusable(true)
+            .on_press(move |a: &mut App| {
+                a.core.lib.move_track(pid, pos, pos.saturating_sub(1));
+            })
+            .child(text("↑").key("label").font(type_::BODY).color(t.text)),
+    );
+    actions = actions.child(
+        el().key(format!("down-{}-{}", pid.0, pos)).label("Move down")
+            .size(28.0, 28.0).radius(radius::SM).center().hover(t.hover).focusable(true)
+            .on_press(move |a: &mut App| {
+                let target = if pos + 1 < len { pos + 1 } else { pos };
+                a.core.lib.move_track(pid, pos, target);
+            })
+            .child(text("↓").key("label").font(type_::BODY).color(t.text)),
+    );
+    actions = actions.child(
+        el().key(format!("rm-{}-{}", pid.0, pos)).label("Remove")
+            .h(28.0).px(space::S2).radius(radius::SM).center_y().hover(t.hover).focusable(true)
+            .on_press(move |a: &mut App| {
+                a.core.lib.remove_track(pid, tr.id);
+            })
+            .child(text("Remove").key("label").font(type_::LABEL).color(t.text_secondary)),
+    );
+
+    row().key(format!("track-{}", tr.id.0))
+        .checked(selected)
+        .fill(if selected { t.hover } else { Color::TRANSPARENT })
+        .focusable(true)
+        .on_press(move |a: &mut App| state::select_track(&mut a.core, tr.id))
+        .h(44.0)
+        .px(space::S2)
+        .radius(radius::MD)
+        .center_y()
+        .gap(space::S3)
+        .hover(t.hover)
+        .child(
+            col().grow(1.0).gap(2.0)
+                .child(text(tr.title).key("title").font(type_::BODY).color(t.text))
+                .child(text(catalog::artist(tr.artist).name).key("track-artist").font(type_::LABEL).color(t.text_secondary)),
+        )
+        .child(text(tr.duration).key("duration").font(type_::LABEL).color(t.text_secondary))
+        .child(actions)
+}
+
+// --- Page scaffolding ----------------------------------------------------
 
 fn header(title: &str, subtitle: &str, t: tok::Theme) -> El {
     col().px(space::S6).pt(space::S6).pb(space::S3).gap(space::S1)
@@ -144,8 +195,7 @@ fn header(title: &str, subtitle: &str, t: tok::Theme) -> El {
         .child(text(subtitle).key("subtitle").font(type_::BODY).color(t.text_secondary))
 }
 
-/// A full page: a header over a scrollable body. Fills the space the top bar
-/// leaves.
+/// A full page: a header over a scrollable body.
 fn page(title: &str, subtitle: &str, t: tok::Theme, body: El) -> El {
     col().grow(1.0).min_h(0.0)
         .child(header(title, subtitle, t))
@@ -160,30 +210,25 @@ fn page(title: &str, subtitle: &str, t: tok::Theme, body: El) -> El {
         )
 }
 
-fn albums_grid(t: tok::Theme) -> El {
-    let cards: Vec<El> = data::ALBUMS.iter().enumerate().map(|(i, a)| album_card(i, *a, t)).collect();
+fn all_albums_grid(t: tok::Theme) -> El {
+    let cards: Vec<El> = catalog::ALBUMS.iter().map(|a| album_card(*a, t)).collect();
     grid(cards, 5)
 }
 
-fn artists_grid(t: tok::Theme) -> El {
-    let cards: Vec<El> = data::ARTISTS.iter().enumerate().map(|(i, a)| artist_card(i, *a, t)).collect();
+fn all_artists_grid(t: tok::Theme) -> El {
+    let cards: Vec<El> = catalog::ARTISTS.iter().map(|a| artist_card(*a, t)).collect();
     grid(cards, 6)
-}
-
-fn playlists_grid(t: tok::Theme) -> El {
-    let cards: Vec<El> = data::PLAYLISTS.iter().enumerate().map(|(i, p)| playlist_card(i, *p, t)).collect();
-    grid(cards, 5)
 }
 
 // --- Section screens -----------------------------------------------------
 
 pub fn home(t: tok::Theme) -> El {
-    let rec: Vec<El> = data::ALBUMS[0..5].iter().enumerate().map(|(i, a)| album_card(i, *a, t)).collect();
-    let new: Vec<El> = data::ALBUMS[5..].iter().enumerate().map(|(i, a)| album_card(i + 5, *a, t)).collect();
+    let rec: Vec<El> = catalog::ALBUMS[0..5].iter().map(|a| album_card(*a, t)).collect();
+    let edits: Vec<El> = catalog::EDITORIAL_PLAYLISTS.iter().map(|p| editorial_card(p.id, t)).collect();
     page("Home", "Your music, your way", t,
         col().gap(space::S6)
             .child(shelf("Recommended for you", t, rec))
-            .child(shelf("New releases", t, new)))
+            .child(shelf("Editor's picks", t, edits)))
 }
 
 pub fn feed(t: tok::Theme) -> El {
@@ -211,9 +256,9 @@ pub fn popular(s: &State, t: tok::Theme) -> El {
         .child(tab("Albums", PopularTab::Albums, s, t))
         .child(tab("Tracks", PopularTab::Tracks, s, t));
     let body = match s.popular_tab {
-        PopularTab::Artists => artists_grid(t),
-        PopularTab::Albums => albums_grid(t),
-        PopularTab::Tracks => track_list(s.now_playing, t),
+        PopularTab::Artists => all_artists_grid(t),
+        PopularTab::Albums => all_albums_grid(t),
+        PopularTab::Tracks => track_list(catalog::TRACKS.to_vec(), s.now_playing, t),
     };
     page("Popular", "Global charts", t,
         col().gap(space::S3).child(tabs).child(body))
@@ -234,8 +279,8 @@ fn tab(label: &str, tab: PopularTab, s: &State, t: tok::Theme) -> El {
 }
 
 pub fn for_you(t: tok::Theme) -> El {
-    let a: Vec<El> = data::ALBUMS.iter().take(5).enumerate().map(|(i, x)| album_card(i, *x, t)).collect();
-    let b: Vec<El> = data::ALBUMS.iter().skip(5).enumerate().map(|(i, x)| album_card(i + 5, *x, t)).collect();
+    let a: Vec<El> = catalog::ALBUMS.iter().take(5).map(|x| album_card(*x, t)).collect();
+    let b: Vec<El> = catalog::ALBUMS.iter().skip(5).map(|x| album_card(*x, t)).collect();
     page("For You", "Built from what you play", t,
         col().gap(space::S6)
             .child(shelf("New releases for you", t, a))
@@ -243,36 +288,176 @@ pub fn for_you(t: tok::Theme) -> El {
 }
 
 pub fn liked_songs(s: &State, t: tok::Theme) -> El {
-    page("Liked Songs", "Tracks you saved", t, track_list(s.now_playing, t))
+    let tracks: Vec<Track> = catalog::TRACKS.iter().filter(|tr| s.lib.is_liked(tr.id)).copied().collect();
+    let body = if tracks.is_empty() {
+        empty("Nothing liked yet. Tap the heart on the now-playing bar.", t)
+    } else {
+        track_list(tracks, s.now_playing, t)
+    };
+    page("Liked Songs", "Tracks you liked", t, body)
 }
 
-pub fn albums(t: tok::Theme) -> El {
-    page("Albums", "Saved albums", t, albums_grid(t))
+pub fn albums(s: &State, t: tok::Theme) -> El {
+    let saved: Vec<Album> = catalog::ALBUMS.iter().filter(|a| s.lib.is_saved_album(a.id)).copied().collect();
+    let body = if saved.is_empty() {
+        empty("No saved albums yet. Open an album and tap Save.", t)
+    } else {
+        grid(saved.into_iter().map(|a| album_card(a, t)).collect(), 5)
+    };
+    page("Albums", "Albums you saved", t, body)
 }
 
-pub fn artists(t: tok::Theme) -> El {
-    page("Artists", "Artists you follow", t, artists_grid(t))
+pub fn artists(s: &State, t: tok::Theme) -> El {
+    let followed: Vec<Artist> = catalog::ARTISTS.iter().filter(|a| s.lib.is_following(a.id)).copied().collect();
+    let body = if followed.is_empty() {
+        empty("No artists yet. Open an artist and tap Follow.", t)
+    } else {
+        grid(followed.into_iter().map(|a| artist_card(a, t)).collect(), 6)
+    };
+    page("Artists", "Artists you follow", t, body)
 }
 
-pub fn playlists(t: tok::Theme) -> El {
-    page("Playlists", "Your playlists", t, playlists_grid(t))
+pub fn playlists(s: &State, t: tok::Theme) -> El {
+    let new_btn = el().key("new-playlist").label("New playlist")
+        .h(40.0).px(space::S3).radius(radius::MD).center_y().focusable(true)
+        .fill(t.text)
+        .on_press(|a: &mut App| {
+            let n = a.core.lib.playlists.iter().filter(|p| p.is_some()).count() + 1;
+            a.core.lib.create_playlist(format!("Playlist {n}"));
+        })
+        .child(text("New playlist").key("label").font(type_::BODY).color(t.bg));
+    let cards: Vec<El> = s.lib.playlists.iter()
+        .enumerate()
+        .filter_map(|(i, p)| p.as_ref().map(|p| (PlaylistId(i as u8), p.name.clone())))
+        .map(|(id, name)| playlist_card(id, &name, t))
+        .collect();
+    let body = if cards.is_empty() {
+        col().gap(space::S3).child(new_btn).child(empty("No playlists yet. Create one.", t))
+    } else {
+        col().gap(space::S3).child(new_btn).child(grid(cards, 5))
+    };
+    page("Playlists", "Your playlists", t, body)
 }
 
-pub fn collections(t: tok::Theme) -> El {
-    page("Collections", "Folders and collections", t, playlists_grid(t))
+pub fn collections(app: &App, t: tok::Theme) -> El {
+    let s = &app.core;
+    let new_btn = el().key("new-collection").label("New collection")
+        .h(40.0).px(space::S3).radius(radius::MD).center_y().focusable(true)
+        .fill(t.text)
+        .on_press(|a: &mut App| {
+            let n = a.core.lib.collections.len() + 1;
+            a.core.lib.create_collection(format!("Collection {n}"));
+        })
+        .child(text("New collection").key("label").font(type_::BODY).color(t.bg));
+
+    let rename_field = text_input(&app.rename, type_::BODY)
+        .key("col-rename-box")
+        .w_full()
+        .px(space::S3)
+        .py(space::S2)
+        .radius(radius::MD)
+        .fill(t.hover)
+        .single_line()
+        .on_edit(|a: &mut App| &mut a.rename)
+        .placeholder("Rename a collection", t.text_secondary);
+
+    let mut body = col().gap(space::S3).child(new_btn);
+    if s.lib.collections.is_empty() {
+        body = body.child(empty("No collections yet. Create one.", t));
+    } else {
+        body = body.child(rename_field);
+    }
+    for (idx, c) in s.lib.collections.iter().enumerate() {
+        let mut block = col().gap(space::S1);
+        let mut head = row().center_y().gap(space::S2);
+        head = head
+            .child(text(&c.name).key("col-name").font(type_::SECTION).color(t.text).grow(1.0))
+            .child(el().key(format!("ren-col-{idx}")).label("Rename")
+                .h(28.0).px(space::S2).radius(radius::SM).center_y().hover(t.hover).focusable(true)
+                .on_press(move |a: &mut App| {
+                    let name = a.rename.text.trim().to_string();
+                    if !name.is_empty() {
+                        a.core.lib.rename_collection(idx, name);
+                        a.rename.clear();
+                    }
+                })
+                .child(text("Rename").key("label").font(type_::LABEL).color(t.text_secondary)))
+            .child(el().key(format!("add-to-col-{idx}")).label("Add playlist")
+                .h(28.0).px(space::S2).radius(radius::SM).center_y().hover(t.hover).focusable(true)
+                .on_press(move |a: &mut App| {
+                    for i in 0..library::MAX_PLAYLISTS {
+                        let pid = PlaylistId(i as u8);
+                        let in_col = a.core.lib.collections.get(idx)
+                            .map(|c| c.playlists.contains(&pid)).unwrap_or(false);
+                        if a.core.lib.playlist(pid).is_some() && !in_col {
+                            a.core.lib.add_to_collection(idx, pid);
+                            break;
+                        }
+                    }
+                })
+                .child(text("Add playlist").key("label").font(type_::LABEL).color(t.text_secondary)))
+            .child(el().key(format!("del-col-{idx}")).label("Delete")
+                .h(28.0).px(space::S2).radius(radius::SM).center_y().hover(t.hover).focusable(true)
+                .on_press(move |a: &mut App| {
+                    a.core.lib.delete_collection(idx);
+                })
+                .child(text("Delete").key("label").font(type_::LABEL).color(t.text_secondary)));
+        block = block.child(head);
+        for (pos, &pid) in c.playlists.iter().enumerate() {
+            let name = s.lib.playlist(pid).map(|p| p.name.clone()).unwrap_or_else(|| "Playlist".into());
+            block = block.child(
+                row().key(format!("col-item-{idx}-{pos}")).h(36.0).px(space::S2).radius(radius::MD).center_y().gap(space::S2).hover(t.hover)
+                    .child(text(name).key("name").font(type_::BODY).color(t.text).grow(1.0))
+                    .child(el().key(format!("rm-from-col-{idx}-{pos}")).label("Remove")
+                        .h(24.0).px(space::S2).radius(radius::SM).center_y().hover(t.hover).focusable(true)
+                        .on_press(move |a: &mut App| {
+                            a.core.lib.remove_from_collection(idx, pid);
+                        })
+                        .child(text("Remove").key("label").font(type_::LABEL).color(t.text_secondary))),
+            );
+        }
+        body = body.child(block);
+    }
+    page("Collections", "Folders of playlists", t, body)
 }
 
 pub fn local(s: &State, t: tok::Theme) -> El {
-    page("On this device", "Music you downloaded", t, track_list(s.now_playing, t))
+    let mut tracks: Vec<Track> = Vec::new();
+    for a in catalog::ALBUMS {
+        if s.lib.is_downloaded(a.id) {
+            tracks.extend(catalog::tracks_of_album(a.id));
+        }
+    }
+    let body = if tracks.is_empty() {
+        empty("Nothing on this device. Download an album first.", t)
+    } else {
+        track_list(tracks, s.now_playing, t)
+    };
+    page("On this device", "Music you downloaded", t, body)
 }
 
 pub fn history(s: &State, t: tok::Theme) -> El {
-    page("History", "Recently played", t, track_list(s.now_playing, t))
+    let tracks: Vec<Track> = s.lib.history.iter().map(|&id| catalog::track(id)).collect();
+    let body = if tracks.is_empty() {
+        empty("Nothing played yet.", t)
+    } else {
+        track_list(tracks, s.now_playing, t)
+    };
+    page("History", "Recently played", t, body)
 }
 
-pub fn stats(t: tok::Theme) -> El {
+pub fn stats(s: &State, t: tok::Theme) -> El {
+    let (recent_artist, recent_track) = recent_artist_and_track(s);
+    let playlists = s.lib.playlists.iter().filter(|p| p.is_some()).count();
+    let stats: [(&str, String); 6] = [
+        ("Liked tracks", s.lib.liked.count_ones().to_string()),
+        ("Saved albums", s.lib.saved_albums.count_ones().to_string()),
+        ("Followed artists", s.lib.followed.count_ones().to_string()),
+        ("Playlists", playlists.to_string()),
+        ("Recent artist", recent_artist),
+        ("Recent track", recent_track),
+    ];
     let mut g = row().gap(space::S3);
-    let stats: [(&str, &str); 4] = [("Top artist", "The Weeknd"), ("Top track", "Blinding Lights"), ("Scrobbles", "1,284"), ("Minutes", "4,210")];
     for (label, value) in stats {
         g = g.child(
             col().key(format!("stat-{label}")).w(200.0).px(space::S3).pt(space::S3).pb(space::S3).gap(space::S1)
@@ -281,17 +466,40 @@ pub fn stats(t: tok::Theme) -> El {
                 .child(text(value).key("value").font(type_::TITLE).color(t.text)),
         );
     }
-    page("Stats", "Your listening at a glance", t, g)
+    page("Stats", "Your library at a glance", t, g)
 }
 
-pub fn downloads(t: tok::Theme) -> El {
+/// The artist and track at the front of history. History is duplicate-free, so
+/// it cannot rank by play frequency; the front is the honest "most recent".
+fn recent_artist_and_track(s: &State) -> (String, String) {
+    let artist = s.lib.history.first()
+        .map(|&id| catalog::artist(catalog::track(id).artist).name.to_string())
+        .unwrap_or_else(|| "—".into());
+    let track = s.lib.history.first()
+        .map(|&id| catalog::track(id).title.to_string())
+        .unwrap_or_else(|| "—".into());
+    (artist, track)
+}
+
+pub fn downloads(s: &State, t: tok::Theme) -> El {
+    let downloaded: Vec<Album> = catalog::ALBUMS.iter().filter(|a| s.lib.is_downloaded(a.id)).copied().collect();
     let mut rows = col().gap(space::S1);
-    for (i, a) in data::ALBUMS.iter().take(5).enumerate() {
+    if downloaded.is_empty() {
+        rows = rows.child(empty("No downloads yet. Open an album and tap Download.", t));
+    }
+    for a in downloaded {
+        let id = a.id;
         rows = rows.child(
-            row().key(format!("dl-{i}")).h(44.0).px(space::S2).radius(radius::MD).center_y().gap(space::S3).hover(t.hover)
+            row().key(format!("dl-{}", a.id.0)).h(44.0).px(space::S2).radius(radius::MD).center_y().gap(space::S3).hover(t.hover)
                 .child(text(a.title).key("title").font(type_::BODY).color(t.text).grow(1.0))
-                .child(text(a.artist).key("artist").font(type_::LABEL).color(t.text_secondary))
-                .child(text("Done").key("state").font(type_::LABEL).color(t.text_secondary)),
+                .child(text(catalog::artist(a.artist).name).key("artist").font(type_::LABEL).color(t.text_secondary))
+                .child(text("Done").key("state").font(type_::LABEL).color(t.text_secondary))
+                .child(el().key(format!("rm-dl-{}", a.id.0)).label("Remove")
+                    .h(28.0).px(space::S2).radius(radius::SM).center_y().hover(t.hover).focusable(true)
+                    .on_press(move |app: &mut App| {
+                        app.core.lib.remove_download(id);
+                    })
+                    .child(text("Remove").key("label").font(type_::LABEL).color(t.text_secondary))),
         );
     }
     page("Downloads", "Your download queue", t, rows)
@@ -300,18 +508,18 @@ pub fn downloads(t: tok::Theme) -> El {
 pub fn search(t: tok::Theme, edit: &TextEdit) -> El {
     let query = edit.text.trim();
     let results = if query.is_empty() {
-        albums_grid(t)
+        all_albums_grid(t)
     } else {
         let q = query.to_lowercase();
-        let albums: Vec<El> = data::ALBUMS.iter().enumerate()
-            .filter(|(_, a)| a.title.to_lowercase().contains(&q) || a.artist.to_lowercase().contains(&q))
-            .map(|(i, a)| album_card(i, *a, t)).collect();
-        let artists: Vec<El> = data::ARTISTS.iter().enumerate()
-            .filter(|(_, a)| a.name.to_lowercase().contains(&q))
-            .map(|(i, a)| artist_card(i, *a, t)).collect();
-        let tracks: Vec<El> = data::TRACKS.iter().enumerate()
-            .filter(|(_, tr)| tr.title.to_lowercase().contains(&q) || tr.artist.to_lowercase().contains(&q))
-            .map(|(i, tr)| track_row(i, *tr, false, t)).collect();
+        let albums: Vec<El> = catalog::ALBUMS.iter()
+            .filter(|a| a.title.to_lowercase().contains(&q) || catalog::artist(a.artist).name.to_lowercase().contains(&q))
+            .map(|a| album_card(*a, t)).collect();
+        let artists: Vec<El> = catalog::ARTISTS.iter()
+            .filter(|a| a.name.to_lowercase().contains(&q))
+            .map(|a| artist_card(*a, t)).collect();
+        let tracks: Vec<El> = catalog::TRACKS.iter()
+            .filter(|tr| tr.title.to_lowercase().contains(&q) || catalog::artist(tr.artist).name.to_lowercase().contains(&q))
+            .map(|tr| track_row(*tr, false, t)).collect();
         if albums.is_empty() && artists.is_empty() && tracks.is_empty() {
             text(format!("No results for \"{query}\""))
                 .key("search-empty").font(type_::BODY).color(t.text_secondary)
@@ -355,12 +563,13 @@ pub fn search(t: tok::Theme, edit: &TextEdit) -> El {
 
 pub fn settings(t: tok::Theme) -> El {
     let mut rows = col().gap(space::S1);
-    let items: [SettingsPage; 6] = [
+    let items: [SettingsPage; 7] = [
         SettingsPage::Playback,
         SettingsPage::Quality,
         SettingsPage::Downloads,
         SettingsPage::Notifications,
         SettingsPage::Import,
+        SettingsPage::Account,
         SettingsPage::About,
     ];
     for (i, page) in items.iter().enumerate() {
@@ -368,7 +577,10 @@ pub fn settings(t: tok::Theme) -> El {
         rows = rows.child(
             row().key(format!("set-{i}")).h(44.0).px(space::S3).radius(radius::MD).center_y().justify_between().hover(t.hover)
                 .focusable(true)
-                .on_press(move |a: &mut App| state::open_detail(&mut a.core, Route::SettingsPage(p)))
+                .on_press(move |a: &mut App| {
+                    a.rename.clear();
+                    state::open_detail(&mut a.core, Route::SettingsPage(p))
+                })
                 .child(text(p.label()).key("label").font(type_::BODY).color(t.text))
                 .child(text(">").key("chevron").font(type_::BODY).color(t.text_secondary)),
         );
@@ -382,26 +594,62 @@ fn settings_row(key: String, label: &str, value: &str, t: tok::Theme) -> El {
         .child(text(value).key("value").font(type_::BODY).color(t.text_secondary))
 }
 
-pub fn settings_page(p: SettingsPage, t: tok::Theme) -> El {
-    let items: &[(&str, &str)] = match p {
-        SettingsPage::Playback => &[("Crossfade", "Off"), ("Gapless playback", "On"), ("Normalize volume", "On")],
-        SettingsPage::Quality => &[("Streaming quality", "High"), ("Download quality", "High")],
-        SettingsPage::Downloads => &[("Download location", "On this device"), ("Wi-Fi only", "On")],
-        SettingsPage::Notifications => &[("New releases", "On"), ("Concert alerts", "Off")],
-        SettingsPage::Import => &[("Import from Spotify", ">"), ("Import from Last.fm", ">")],
-        SettingsPage::About => &[("Version", "0.1.0"), ("OpenTidal", "")],
-    };
-    let mut rows = col().gap(space::S1);
-    for (i, (label, value)) in items.iter().enumerate() {
-        rows = rows.child(settings_row(format!("opt-{i}"), label, value, t));
+pub fn settings_page(p: SettingsPage, app: &App, t: tok::Theme) -> El {
+    match p {
+        SettingsPage::Account => account_page(app, t),
+        _ => {
+            let items: &[(&str, &str)] = match p {
+                SettingsPage::Playback => &[("Crossfade", "Off"), ("Gapless playback", "On"), ("Normalize volume", "On")],
+                SettingsPage::Quality => &[("Streaming quality", "High"), ("Download quality", "High")],
+                SettingsPage::Downloads => &[("Download location", "On this device"), ("Wi-Fi only", "On")],
+                SettingsPage::Notifications => &[("New releases", "On"), ("Concert alerts", "Off")],
+                SettingsPage::Import => &[("Import from Spotify", ">"), ("Import from Last.fm", ">")],
+                SettingsPage::About => &[("Version", "0.1.0"), ("OpenTidal", "")],
+                SettingsPage::Account => &[],
+            };
+            let mut rows = col().gap(space::S1);
+            for (i, (label, value)) in items.iter().enumerate() {
+                rows = rows.child(settings_row(format!("opt-{i}"), label, value, t));
+            }
+            page(p.label(), "Settings", t, rows)
+        }
     }
-    page(p.label(), "Settings", t, rows)
+}
+
+fn account_page(app: &App, t: tok::Theme) -> El {
+    let name = app.core.lib.name.clone();
+    let field = text_input(&app.rename, type_::BODY)
+        .key("name-box")
+        .w_full()
+        .px(space::S3)
+        .py(space::S2)
+        .radius(radius::MD)
+        .fill(t.hover)
+        .single_line()
+        .on_edit(|a: &mut App| &mut a.rename)
+        .placeholder("Your name", t.text_secondary);
+    let save_btn = el().key("save-name").label("Save name")
+        .h(40.0).px(space::S3).radius(radius::MD).center_y().focusable(true)
+        .fill(t.text)
+        .on_press(|a: &mut App| {
+            let name = a.rename.text.trim().to_string();
+            if !name.is_empty() {
+                a.core.lib.set_name(name);
+                a.rename.clear();
+            }
+        })
+        .child(text("Save name").key("label").font(type_::BODY).color(t.bg));
+    page("Account", "Your profile", t,
+        col().gap(space::S3)
+            .child(settings_row("acct-name".into(), "Name", &name, t))
+            .child(field)
+            .child(save_btn))
 }
 
 // --- Detail screens ------------------------------------------------------
 
-fn action_button(label: &str, accent: Color, filled: bool, t: tok::Theme) -> El {
-    el().key(format!("btn-{label}"))
+fn action_button<F: Fn(&mut App) + 'static>(key: &str, label: &str, accent: Color, filled: bool, t: tok::Theme, f: F) -> El {
+    el().key(key)
         .label(label)
         .h(40.0)
         .px(space::S3)
@@ -409,69 +657,172 @@ fn action_button(label: &str, accent: Color, filled: bool, t: tok::Theme) -> El 
         .center_y()
         .fill(if filled { accent } else { t.hover })
         .focusable(true)
-        .on_press(|_: &mut App| {})
+        .on_press(f)
         .child(text(label).key("label").font(type_::BODY).color(if filled { t.bg } else { t.text }))
 }
 
-fn hero(cover_el: El, title: &str, subtitle: &str, accent: Color, t: tok::Theme) -> El {
+fn hero(cover_el: El, title: &str, subtitle: &str, t: tok::Theme, actions: Vec<El>) -> El {
+    let mut btns = row().gap(space::S2).pt(space::S3);
+    for b in actions {
+        btns = btns.child(b);
+    }
     row().px(space::S6).pt(space::S6).pb(space::S3).gap(space::S6)
         .child(cover_el)
         .child(
             col().gap(space::S2)
                 .child(text(title).key("hero-title").font(type_::TITLE).color(t.text))
                 .child(text(subtitle).key("hero-subtitle").font(type_::BODY).color(t.text_secondary))
-                .child(row().gap(space::S2).pt(space::S3)
-                    .child(action_button("Play", accent, true, t))
-                    .child(action_button("Shuffle", accent, false, t))),
+                .child(btns),
         )
 }
 
-/// A detail screen: a hero over a track list. The back affordance lives in
-/// the top bar, not here.
-pub fn detail(route: Route, s: &State, accent: Color, t: tok::Theme) -> El {
-    let (cover_el, title, subtitle) = match route {
-        Route::Album(i) => {
-            let a = album_at(i);
-            let (top, bottom) = cover(i);
-            (el().key("hero-cover").size(200.0, 200.0).radius(radius::MD).gradient(top, bottom).shadow(2.0, 12.0, t.shadow_soft), a.title.to_string(), format!("Album by {}", a.artist))
-        }
-        Route::Artist(i) => {
-            let a = artist_at(i);
-            let (top, bottom) = cover(i + 3);
-            (el().key("hero-cover").size(200.0, 200.0).radius(100.0).gradient(top, bottom).shadow(2.0, 12.0, t.shadow_soft), a.name.to_string(), "Artist".to_string())
-        }
-        Route::Playlist(i) => {
-            let p = playlist_at(i);
-            let (top, bottom) = cover(i);
-            (el().key("hero-cover").size(200.0, 200.0).radius(radius::MD).gradient(top, bottom).shadow(2.0, 12.0, t.shadow_soft), p.name.to_string(), p.description.to_string())
-        }
-        _ => {
-            let (top, bottom) = cover(0);
-            (el().key("hero-cover").size(200.0, 200.0).radius(radius::MD).gradient(top, bottom), "Detail".to_string(), String::new())
-        }
-    };
+fn detail_body(body: El) -> El {
+    col().key("scroll")
+        .grow(1.0)
+        .min_h(0.0)
+        .scroll(ScrollSpec { stick_bottom: false })
+        .px(space::S6)
+        .pb(space::S6)
+        .child(body)
+}
+
+fn cover_el(seed: usize, size: f32, round: f32, t: tok::Theme) -> El {
+    let (top, bottom) = cover(seed);
+    el().key("hero-cover").size(size, size).radius(round).gradient(top, bottom).shadow(2.0, 12.0, t.shadow_soft)
+}
+
+/// A detail screen. The route variant selects the subject; the back affordance
+/// lives in the top bar, not here.
+pub fn detail(route: Route, app: &App, accent: Color, t: tok::Theme) -> El {
+    let s = &app.core;
+    match route {
+        Route::Album(id) => album_detail(id, s, accent, t),
+        Route::Artist(id) => artist_detail(id, s, accent, t),
+        Route::EditorialPlaylist(id) => editorial_detail(id, s, accent, t),
+        Route::UserPlaylist(id) => user_playlist_detail(id, app, accent, t),
+        _ => page("Detail", "", t, el()),
+    }
+}
+
+fn album_detail(id: catalog::AlbumId, s: &State, accent: Color, t: tok::Theme) -> El {
+    let a = catalog::album(id);
+    let saved = s.lib.is_saved_album(id);
+    let downloaded = s.lib.is_downloaded(id);
+    let artist = catalog::artist(a.artist).name;
+    let tracks: Vec<Track> = catalog::tracks_of_album(id).collect();
+
+    let actions = vec![
+        action_button("play", "Play", accent, true, t, move |a: &mut App| {
+            if let Some(first) = catalog::tracks_of_album(id).next() {
+                state::select_track(&mut a.core, first.id);
+            }
+        }),
+        action_button("save", if saved { "Remove" } else { "Save" }, accent, false, t, move |a: &mut App| {
+            a.core.lib.toggle_save_album(id);
+        }),
+        action_button("download", if downloaded { "Remove download" } else { "Download" }, accent, false, t, move |a: &mut App| {
+            a.core.lib.toggle_download(id);
+        }),
+    ];
 
     col().grow(1.0).min_h(0.0)
-        .child(hero(cover_el, &title, &subtitle, accent, t))
-        .child(
-            col().key("scroll")
-                .grow(1.0)
-                .min_h(0.0)
-                .scroll(ScrollSpec { stick_bottom: false })
-                .px(space::S6)
-                .pb(space::S6)
-                .child(detail_tracks(route, s.now_playing, t)),
-        )
+        .child(hero(cover_el(id.0 as usize, 200.0, radius::MD, t), a.title, &format!("Album by {artist}"), t, actions))
+        .child(detail_body(track_list(tracks, s.now_playing, t)))
 }
 
-/// The track list a detail screen shows. An album or artist lists only its
-/// own tracks; a playlist mixes the whole catalog, which is the placeholder
-/// behaviour until real per-playlist tracks exist.
-fn detail_tracks(route: Route, selected: Option<usize>, t: tok::Theme) -> El {
-    match route {
-        Route::Album(i) => artist_tracks(album_at(i).artist, selected, t),
-        Route::Artist(i) => artist_tracks(artist_at(i).name, selected, t),
-        Route::Playlist(_) => track_list(selected, t),
-        _ => track_list(selected, t),
+fn artist_detail(id: catalog::ArtistId, s: &State, accent: Color, t: tok::Theme) -> El {
+    let a = catalog::artist(id);
+    let following = s.lib.is_following(id);
+    let tracks: Vec<Track> = catalog::tracks_of_artist(id).collect();
+
+    let actions = vec![
+        action_button("play", "Play", accent, true, t, move |a: &mut App| {
+            if let Some(first) = catalog::tracks_of_artist(id).next() {
+                state::select_track(&mut a.core, first.id);
+            }
+        }),
+        action_button("follow", if following { "Following" } else { "Follow" }, accent, false, t, move |a: &mut App| {
+            a.core.lib.toggle_follow(id);
+        }),
+    ];
+
+    col().grow(1.0).min_h(0.0)
+        .child(hero(cover_el(id.0 as usize + 3, 200.0, 100.0, t), a.name, "Artist", t, actions))
+        .child(detail_body(track_list(tracks, s.now_playing, t)))
+}
+
+fn editorial_detail(id: EditorialPlaylistId, s: &State, accent: Color, t: tok::Theme) -> El {
+    let p = catalog::editorial_playlist(id);
+    let tracks: Vec<Track> = p.tracks.iter().map(|&tid| catalog::track(tid)).collect();
+
+    let actions = vec![
+        action_button("play", "Play", accent, true, t, move |a: &mut App| {
+            if let Some(&first) = catalog::editorial_playlist(id).tracks.first() {
+                state::select_track(&mut a.core, first);
+            }
+        }),
+    ];
+
+    col().grow(1.0).min_h(0.0)
+        .child(hero(cover_el(id.0 as usize + 6, 200.0, radius::MD, t), p.name, p.description, t, actions))
+        .child(detail_body(track_list(tracks, s.now_playing, t)))
+}
+
+fn user_playlist_detail(id: PlaylistId, app: &App, accent: Color, t: tok::Theme) -> El {
+    let s = &app.core;
+    let Some(p) = s.lib.playlist(id) else {
+        return page("Playlist", "", t, el());
+    };
+    let name = p.name.clone();
+    let tracks: Vec<Track> = p.tracks.iter().map(|&tid| catalog::track(tid)).collect();
+    let len = tracks.len();
+
+    let rename_field = text_input(&app.rename, type_::BODY)
+        .key("rename-box")
+        .w_full()
+        .px(space::S3)
+        .py(space::S2)
+        .radius(radius::MD)
+        .fill(t.hover)
+        .single_line()
+        .on_edit(|a: &mut App| &mut a.rename)
+        .placeholder("Rename this playlist", t.text_secondary);
+
+    let actions = vec![
+        action_button("add", "Add playing track", accent, true, t, move |a: &mut App| {
+            if let Some(tr) = a.core.now_playing {
+                a.core.lib.add_track(id, tr);
+            }
+        }),
+        action_button("delete-playlist", "Delete", accent, false, t, move |a: &mut App| {
+            state::delete_playlist(&mut a.core, id);
+        }),
+    ];
+
+    let rename_btn = el().key("rename-playlist").label("Rename")
+        .h(32.0).px(space::S3).radius(radius::MD).center_y().focusable(true)
+        .fill(t.text)
+        .on_press(move |a: &mut App| {
+            let name = a.rename.text.trim().to_string();
+            if !name.is_empty() {
+                a.core.lib.rename_playlist(id, name);
+                a.rename.clear();
+            }
+        })
+        .child(text("Rename").key("label").font(type_::BODY).color(t.bg));
+
+    let mut body = col().gap(space::S3).child(rename_field).child(rename_btn);
+    if tracks.is_empty() {
+        body = body.child(empty("No tracks yet. Select a track and tap Add playing track.", t));
+    } else {
+        let mut list = col().key("tracks").gap(space::S1);
+        for (pos, tr) in tracks.iter().enumerate() {
+            list = list.child(playlist_track_row(id, pos, len, *tr, s.now_playing == Some(tr.id), t));
+        }
+        body = body.child(list);
     }
+
+    col().grow(1.0).min_h(0.0)
+        .child(hero(cover_el(id.0 as usize + 10, 200.0, radius::MD, t), &name, "Your playlist", t, actions))
+        .child(detail_body(body))
 }

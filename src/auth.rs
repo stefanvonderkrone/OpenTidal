@@ -54,25 +54,17 @@ pub const DEFAULT_SCOPE: &str =
 
 /// The auth state. A variant carries only the data valid in it: a login in
 /// flight holds its verifier and state, a signed-in state holds a token.
+///
+/// The display name is not here. It belongs to the library, which is what a
+/// restart reads before any network call, so one stored name serves the
+/// sidebar, the Account page, and the profile fetch.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub enum Auth {
     #[default]
     SignedOut,
     Authorizing { state: String, verifier: String },
-    SignedIn { token: Token, name: String },
+    SignedIn { token: Token },
     Failed { message: String },
-}
-
-
-
-impl Auth {
-    /// The displayed name, or `None` while signed out.
-    pub fn name(&self) -> Option<&str> {
-        match self {
-            Auth::SignedIn { name, .. } => Some(name),
-            _ => None,
-        }
-    }
 }
 
 /// A random PKCE code verifier: 32 bytes, base64url, no padding.
@@ -312,15 +304,6 @@ mod tests {
         let t = parse_token(refreshed, "r").unwrap();
         assert_eq!(t.refresh_token, "r");
         assert_eq!(t.access_token, "b");
-    }
-
-    /// The auth state exposes its name and token only while signed in.
-    #[test]
-    fn auth_name_only_when_signed_in() {
-        let a = Auth::default();
-        assert_eq!(a.name(), None);
-        let a = Auth::SignedIn { token: Token { access_token: "a".into(), refresh_token: "r".into(), expires_in: 1 }, name: "Ada".into() };
-        assert_eq!(a.name(), Some("Ada"));
     }
 
     /// The memory store round-trips a token.

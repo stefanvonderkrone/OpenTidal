@@ -28,7 +28,7 @@ const HEART: Icon = Icon { name: "heart", view: 24.0, body: "<path d=\"M12 21s-6
 
 type Scene = (&'static str, fn(&mut App));
 
-const SCENES: [Scene; 5] = [
+const SCENES: [Scene; 6] = [
     ("default", |_| {}),
     ("accent-blue", |a| a.core.accent = 0),
     ("accent-pink", |a| a.core.accent = 2),
@@ -38,6 +38,21 @@ const SCENES: [Scene; 5] = [
         a.auth = auth::Auth::SignedIn {
             token: auth::Token { access_token: "fake".to_string(), refresh_token: "fake".to_string(), expires_in: 0 },
         };
+    }),
+    // Signs in as a user the database can key on, so a driven scene proves the
+    // write reaches the disk. The token is a JWT because the key comes from its
+    // `uid` claim.
+    ("signed-in-stored", |a| {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"uid":173210380,"exp":4102444800}"#);
+        let token = auth::Token {
+            access_token: format!("h.{payload}.sig"),
+            refresh_token: "fake-refresh".to_string(),
+            expires_in: 0,
+        };
+        a.store.save(&token);
+        a.setup(std::sync::Arc::new(|| ()));
+        a.core.lib.set_name("Stored User".to_string());
     }),
 ];
 

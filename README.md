@@ -61,8 +61,12 @@ TIDAL_CLIENT_ID=... \
 TIDAL_CLIENT_SECRET=... \
 TIDAL_REDIRECT_URI=http://127.0.0.1:8080/callback \
 TIDAL_SCOPE="user.read collection.read" \
-cargo run
+scripts/run.sh
 ```
+
+Run `scripts/run.sh`, not `cargo run`. It builds, ad-hoc signs the binary, and
+runs it. The signature gives the dev binary a stable identity, so the macOS
+keychain does not ask for the token on every launch.
 
 Sign in from Settings → Account. The browser opens the Tidal login, the app
 reads the callback on the redirect port, and the refresh token lands in the

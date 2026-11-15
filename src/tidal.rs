@@ -96,22 +96,28 @@ impl HttpService {
 }
 
 impl MusicService for HttpService {
-    /// The user id comes from the token's `uid` claim, not from `/users/me`,
-    /// which returns 404 for many third-party clients. The name comes from the
-    /// token when it carries one, else from `/users/{id}`.
+    /// The user id comes from the token's `uid` claim. The name comes from the
+    /// token when it carries one, else from `/users/me` (the third-party client
+    /// cannot read `/users/{id}`).
     fn current_user(&self, token: &str) -> Result<User, ServiceError> {
         let claims = crate::auth::decode_claims(token)
             .ok_or_else(|| ServiceError::Decode("token is not a JWT".to_string()))?;
         let id = claims.user_id().ok_or_else(|| ServiceError::Decode("token has no uid claim".to_string()))?;
         let mut name = claims.display_name().unwrap_or_else(|| "You".to_string());
         if name == "You" {
-            if let Ok(doc) = self.get_doc(token, &format!("/users/{id}")) {
-                if let Some(data) = doc.data {
-                    let profile = name_from(&data.attributes);
-                    if profile != "You" {
-                        name = profile;
+            match self.get_doc(token, "/users/me") {
+                Ok(doc) => {
+                    if let Some(data) = doc.data {
+                        let profile = name_from(&data.attributes);
+                        if profile != "You" {
+                            name = profile;
+                        }
                     }
                 }
+                // Surface an expired token so the caller refreshes and retries;
+                // any other failure keeps the best-effort fallback name.
+                Err(ServiceError::Unauthorized) => return Err(ServiceError::Unauthorized),
+                Err(_) => {}
             }
         }
         Ok(User { id: UserId(id), name })

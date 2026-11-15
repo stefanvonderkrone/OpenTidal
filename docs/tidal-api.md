@@ -49,8 +49,11 @@ Read these against a real account on 2026-11-15.
 
 - The media type is `application/vnd.api+json`. `application/vnd.tidal.v1+json`
   404s on the collection endpoints.
-- `/users/me` 404s for third-party clients. The user id comes from the access
-  token's JWT `sub` claim; the name from the token or `/users/{id}`.
+- `/users/me` returns the profile for third-party clients; `/users/{id}`
+  returns nothing. The user id comes from the access token's JWT `uid` claim
+  (a number, not the OIDC string `sub`). The name comes from `/users/me`; the
+  token carries no name claim, and the profile has `username` (and optionally
+  `firstName`/`lastName`) but not always a display name.
 - Liked tracks: `GET /userCollectionTracks/me/relationships/items?include=items`.
   `data` is the membership (track `id` + `addedAt`), `included` is the track
   resources, and `links.next` carries the `page[cursor]` for the next page.

@@ -36,7 +36,7 @@ pub struct App {
     pub auth_flow: Latest<(u64, Result<Token, String>)>,
     /// The profile fetch after sign-in, drained by `poll`. Carries the session
     /// it was started under and the possibly-refreshed token to persist.
-    pub profile: Latest<(u64, Result<(Token, User), String>)>,
+    pub profile: Latest<(u64, Result<(Token, User), ServiceError>)>,
 }
 
 /// A dummy token for the deterministic sign-in, so the fake path exercises the
@@ -110,10 +110,9 @@ impl App {
     fn fetch_profile(&mut self, token: Token) {
         let service = self.service.clone();
         let config = self.oauth.clone();
-        let store = self.store.clone();
         let session = self.session;
         self.profile.request(token, move |t| {
-            (session, resolve_user(&service, &config, &store, t))
+            (session, resolve_user(&service, &config, t))
         });
     }
 
@@ -144,7 +143,12 @@ impl App {
                             *name = user.name;
                         }
                     }
-                    Err(message) => self.auth = Auth::Failed { message },
+                    Err(e) => {
+                        if matches!(&e, ServiceError::InvalidGrant(_)) {
+                            let _ = self.store.clear();
+                        }
+                        self.auth = Auth::Failed { message: format!("{e:?}") };
+                    }
                 }
             }
         }
@@ -164,53 +168,46 @@ impl App {
 
 /// Resolve the current user for a token, refreshing it first when it is expired
 /// or when the service rejects it. Returns the token actually used, so the
-/// caller can persist a renewed one. A refresh that the auth endpoint rejects
-/// outright (for example `invalid_grant`) drops the stored token, so the next
-/// launch starts clean instead of failing the same way.
+/// caller can persist a renewed one. A refresh the endpoint rejects outright
+/// (for example `invalid_grant`) surfaces as [`ServiceError::InvalidGrant`],
+/// which the caller maps to clearing the stored token.
 fn resolve_user(
     service: &Arc<dyn MusicService>,
     config: &OAuthConfig,
-    store: &Arc<dyn TokenStore>,
     token: Token,
-) -> Result<(Token, User), String> {
+) -> Result<(Token, User), ServiceError> {
     let token = if auth::token_expired(&token) {
-        refresh(config, store, &token)?
+        refresh(config, &token)?
     } else {
         token
     };
     match service.current_user(&token.access_token) {
         Ok(user) => Ok((token, user)),
         Err(ServiceError::Unauthorized) => {
-            let fresh = refresh(config, store, &token)?;
-            let user = service.current_user(&fresh.access_token).map_err(|e| format!("{e:?}"))?;
+            let fresh = refresh(config, &token)?;
+            let user = service.current_user(&fresh.access_token)?;
             Ok((fresh, user))
         }
-        Err(e) => Err(format!("{e:?}")),
+        Err(e) => Err(e),
     }
 }
 
-/// Refresh a token, clearing the store when the endpoint rejects the refresh
-/// outright. A network or transport failure keeps the token, so a transient
-/// outage does not throw away a working session.
-fn refresh(config: &OAuthConfig, store: &Arc<dyn TokenStore>, token: &Token) -> Result<Token, String> {
+/// Refresh a token. A refresh the endpoint rejects outright surfaces as
+/// [`ServiceError::InvalidGrant`]; the caller decides whether to clear the
+/// store, so this worker never writes to it.
+fn refresh(config: &OAuthConfig, token: &Token) -> Result<Token, ServiceError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ServiceError::Http(e.to_string()))?;
     match tidal::refresh_token(&client, config, &token.refresh_token) {
         Ok(fresh) => {
             eprintln!("opentidal: refreshed the access token");
             Ok(fresh)
         }
         Err(e) => {
-            let dead = matches!(&e, ServiceError::Auth(_));
-            if dead {
-                let _ = store.clear();
-                eprintln!("opentidal: refresh rejected, session cleared: {e:?}");
-            } else {
-                eprintln!("opentidal: refresh failed: {e:?}");
-            }
-            Err(format!("{e:?}"))
+            eprintln!("opentidal: refresh failed: {e:?}");
+            Err(e)
         }
     }
 }

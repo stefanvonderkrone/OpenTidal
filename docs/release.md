@@ -46,7 +46,8 @@ file instead. The file is the operator's and stays out of the repo.
 
 - Live mode: `OPENTIDAL_LIVE=1` (env), or `"live": true` (config file).
 - Credentials: `TIDAL_CLIENT_ID`, `TIDAL_CLIENT_SECRET`, `TIDAL_REDIRECT_URI`,
-  `TIDAL_SCOPE` (env), or the same names in the config file. The env var wins
+  `TIDAL_SCOPE` (env), or the lowercase keys `client_id`, `client_secret`,
+  `redirect_uri`, `scope` in the config file. The env var wins
   when both are set. `TIDAL_SCOPE` defaults to every read scope when left unset.
 - Config file: name it with `OPENTIDAL_CONFIG`, or leave it at the default path
   `~/Library/Application Support/OpenTidal/config.json` (macOS) /

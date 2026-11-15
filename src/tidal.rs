@@ -29,6 +29,8 @@ pub struct User {
 pub enum ServiceError {
     /// The auth endpoints rejected the exchange or refresh.
     Auth(String),
+    /// The refresh token was revoked; the stored token must be cleared.
+    InvalidGrant(String),
     /// The token was rejected as expired or invalid; refresh and retry.
     Unauthorized,
     /// The transport or the API returned a non-success status.
@@ -149,9 +151,34 @@ fn token_from_response(resp: reqwest::blocking::Response, fallback_refresh: &str
     let status = resp.status();
     let body = resp.text().map_err(|e| ServiceError::Http(e.to_string()))?;
     if !status.is_success() {
-        return Err(ServiceError::Auth(format!("{status}: {body}")));
+        return Err(token_error(status, &body));
     }
     crate::auth::parse_token(&body, fallback_refresh).map_err(ServiceError::Decode)
+}
+
+/// The `error` field of a token-endpoint error body, when the body is JSON with
+/// one. Any other shape (or no body at all) reads as no OAuth error.
+fn oauth_error(body: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct OAuthError {
+        #[serde(default)]
+        error: Option<String>,
+    }
+    serde_json::from_str::<OAuthError>(body).ok().and_then(|e| e.error)
+}
+
+/// Classify a non-success token-endpoint status. Only a `400` or `401` whose
+/// body names `invalid_grant` is permanent; every other failure is transient
+/// and maps to [`ServiceError::Auth`] so the stored token is kept.
+fn token_error(status: reqwest::StatusCode, body: &str) -> ServiceError {
+    let invalid_grant = (status == reqwest::StatusCode::BAD_REQUEST
+        || status == reqwest::StatusCode::UNAUTHORIZED)
+        && oauth_error(body).as_deref() == Some("invalid_grant");
+    if invalid_grant {
+        ServiceError::InvalidGrant(format!("{status}: {body}"))
+    } else {
+        ServiceError::Auth(format!("{status}: {body}"))
+    }
 }
 
 /// Exchange a refresh token for a fresh access token (refresh grant). The old
@@ -187,6 +214,11 @@ pub fn bind_loopback(redirect_uri: &str) -> Result<std::net::TcpListener, String
 /// How long the loopback listener waits for the browser's callback before it
 /// gives up, so closing the browser cannot leave sign-in pending forever.
 const SIGN_IN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long one accepted callback connection may stay idle on read or write
+/// before the exchange gives up, so a connection that opens but sends nothing
+/// cannot block the worker forever.
+const CALLBACK_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The loopback half of the sign-in: accept one callback on the already-bound
 /// listener, check the state, exchange the code, and answer the browser.
@@ -226,6 +258,8 @@ fn accept_with_timeout(listener: &std::net::TcpListener) -> Result<std::net::Tcp
         match listener.accept() {
             Ok((stream, _)) => {
                 let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(CALLBACK_IO_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(CALLBACK_IO_TIMEOUT));
                 return Ok(stream);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -388,5 +422,67 @@ mod tests {
         let cb = parse_callback("GET /callback?code=a%2Bb&state=%2F%3D HTTP/1.1").unwrap();
         assert_eq!(cb.code.as_deref(), Some("a+b"));
         assert_eq!(cb.state.as_deref(), Some("/="));
+    }
+
+    /// A transient failure keeps the token; only a `400`/`401` naming
+    /// `invalid_grant` is permanent.
+    #[test]
+    fn token_error_distinguishes_invalid_grant() {
+        use reqwest::StatusCode;
+        assert!(matches!(
+            token_error(StatusCode::from_u16(503).unwrap(), "unavailable"),
+            ServiceError::Auth(_)
+        ));
+        assert!(matches!(
+            token_error(StatusCode::BAD_REQUEST, r#"{"error":"invalid_grant"}"#),
+            ServiceError::InvalidGrant(_)
+        ));
+        assert!(matches!(
+            token_error(StatusCode::UNAUTHORIZED, r#"{"error":"invalid_grant"}"#),
+            ServiceError::InvalidGrant(_)
+        ));
+        assert!(matches!(
+            token_error(StatusCode::BAD_REQUEST, r#"{"error":"invalid_client"}"#),
+            ServiceError::Auth(_)
+        ));
+    }
+
+    /// An accepted connection carries read and write timeouts, so a client that
+    /// connects and stays silent cannot block the worker.
+    #[test]
+    fn accepted_stream_has_io_timeouts() {
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let _conn = TcpStream::connect(addr).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        let stream = accept_with_timeout(&listener).unwrap();
+        assert!(stream.read_timeout().unwrap().is_some());
+        assert!(stream.write_timeout().unwrap().is_some());
+        client.join().unwrap();
+    }
+
+    /// A `401` from `/users/me` surfaces as [`ServiceError::Unauthorized`], so
+    /// the caller refreshes and retries rather than keeping the fallback name.
+    #[test]
+    fn current_user_propagates_unauthorized() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf);
+            let _ = conn.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+        });
+        let svc = HttpService::new(&format!("http://127.0.0.1:{}/v2", addr.port()));
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"uid":"42"}"#);
+        let token = format!("h.{payload}.sig");
+        assert_eq!(svc.current_user(&token), Err(ServiceError::Unauthorized));
+        server.join().unwrap();
     }
 }

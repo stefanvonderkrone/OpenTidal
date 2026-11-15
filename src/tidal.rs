@@ -103,7 +103,6 @@ impl MusicService for HttpService {
         let claims = crate::auth::decode_claims(token)
             .ok_or_else(|| ServiceError::Decode("token is not a JWT".to_string()))?;
         let id = claims.user_id().ok_or_else(|| ServiceError::Decode("token has no uid claim".to_string()))?;
-        eprintln!("opentidal: current_user uid={id}");
         let mut name = claims.display_name().unwrap_or_else(|| "You".to_string());
         if name == "You" {
             if let Ok(doc) = self.get_doc(token, &format!("/users/{id}")) {

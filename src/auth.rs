@@ -46,11 +46,11 @@ impl OAuthConfig {
     }
 }
 
-/// Every read scope Tidal offers. OpenTidal is read-only, so no write or
-/// playback scope is requested. `r_usr` grants read access to all end-user
-/// data.
+/// Every read scope Tidal offers to a third-party client. OpenTidal is
+/// read-only, so no write or playback scope is requested. `r_usr` is omitted:
+/// Tidal rejects it for third-party clients.
 pub const DEFAULT_SCOPE: &str =
-    "user.read collection.read playlists.read entitlements.read recommendations.read search.read r_usr";
+    "user.read collection.read playlists.read entitlements.read recommendations.read search.read";
 
 /// The auth state. A variant carries only the data valid in it: a login in
 /// flight holds its verifier and state, a signed-in state holds a token.

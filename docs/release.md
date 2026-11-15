@@ -59,7 +59,7 @@ file instead. The file is the operator's and stays out of the repo.
     "client_id": "<client id>",
     "client_secret": "<client secret>",
     "redirect_uri": "http://127.0.0.1:8080/callback",
-    "scope": "user.read collection.read playlists.read entitlements.read recommendations.read search.read r_usr"
+    "scope": "user.read collection.read playlists.read entitlements.read recommendations.read search.read"
   }
   ```
 - The client id and secret never enter the repo. The user signs in once through

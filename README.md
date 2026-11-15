@@ -10,8 +10,10 @@ now-playing bar.
 
 The user's data is real and mutable now: like tracks, save albums, follow
 artists, download albums, and create, rename, reorder and delete playlists and
-collections. All of it lives in memory and every operation is proven to keep
-the library valid.
+collections. Every operation is proven to keep the library valid. The library
+persists in `~/Library/Application Support/OpenTidal/opentidal.db`, keyed by the
+Tidal user id from the access token, so a restart shows it before any network
+call. `docs/user-state.md` is the design.
 
 Sign in to Tidal now works through the `MusicService` port in `src/tidal.rs`.
 The OAuth authorization-code flow with PKCE lives in `src/auth.rs`, and the
@@ -31,10 +33,15 @@ The toolchain is pinned in `rust-toolchain.toml`.
 
 ## Verify
 
-The app verifies headless. No display or GPU window is needed.
+The app verifies headless. No display or GPU window is needed. Run the one
+command that gates a commit:
 
 ```sh
-cargo test                       # the invariant proofs
+scripts/preflight.sh              # tests, clippy, the repo rules
+```
+
+```sh
+cargo test                       # the invariant proofs and the store tests
 scripts/control-opentidal doctor # one readiness check
 ```
 

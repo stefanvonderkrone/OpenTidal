@@ -16,8 +16,9 @@ the state space the invariant proof explores.
 
 ## Library
 
-The single local user's mutable data. It starts empty and changes only through
-the operations in `src/library.rs`.
+The mutable data of a Tidal account. It starts empty and changes only through
+the operations in `src/library.rs`. The app signs in one account at a time, and
+the database keeps a row set per account id.
 
 - **like** — save a track. Liked tracks appear on the Liked Songs screen.
 - **save** — save an album. Saved albums appear on the Albums screen.
@@ -29,6 +30,18 @@ the operations in `src/library.rs`.
 - **collection** — a folder of user playlists. The user can create, rename,
   delete, and add or remove playlists.
 - **history** — the recently played tracks, most recent first.
+
+## Store
+
+The on-disk half, in `src/store.rs`. One SQLite file, one row set per account.
+
+- **store** — the SQLite database at
+  `~/Library/Application Support/OpenTidal/opentidal.db`.
+- **slot** — a position in the fixed playlist array. A slot is empty after a
+  delete, and a create reuses the first empty one. Routes are never persisted,
+  so a slot means the same playlist across a restart.
+- **save** — write one account's whole library in one transaction. Read
+  `save` as the verb only where the album sense is clear from context.
 
 ## State
 
@@ -59,3 +72,5 @@ today; the catalogue and library stay local until the later PRs move them.
   `SignedOut`, `Authorizing`, `SignedIn`, and `Failed`, from `src/auth.rs`.
 - **token** — an OAuth access token and its refresh token. The refresh token
   persists in the macOS keychain.
+- **user id** — Tidal's account id, from the `uid` claim of the access token.
+  It is the database key. It does not change on a refresh or a fresh sign-in.

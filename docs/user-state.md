@@ -164,15 +164,25 @@ deliberate: the `user_id` column costs nothing now and the door stays open.
 | A refresh writes no rows | Count rows before and after a refresh, `user_version` unchanged |
 | File is private | `stat -f '%Lp'` returns `600` |
 | Schema is sound | `PRAGMA integrity_check` returns `ok`, and no row has an orphan `user_id` |
-| Token is not in the file | `strings opentidal.db | grep` finds no token |
+| Token is not in the file | `strings opentidal.db` shows no token |
+| The key holds offline | `uid` read from the keychain alone, no network, before any fetch |
+
+## Confirmed live
+
+Read against a real account on 2026-11-15.
+
+- `uid` was `173210380` on the first sign-in, after a sign-out and a fresh
+  sign-in, and after a token refresh. The key holds across all three, so a
+  refresh needs no row move.
+- The access token lives about four hours. A doctored `exp` claim sends the app
+  down the refresh path, so the refresh is testable without the wait.
+- After sign-out the keychain holds the `signed-out` sentinel, and a start reads
+  it as no token.
 
 ## Open questions
 
-1. Does `uid` stay the same across a refresh and across a fresh sign-in with
-   the same account? Check one live login. If it changes, the key is wrong and
-   the design stops here.
-2. Should a failed `Library::check` drop the row, or refuse the session and
+1. Should a failed `Library::check` drop the row, or refuse the session and
    show a repair screen? Dropping is silent and safe. Refusing is loud and
    honest.
-3. Does the app persist the navigation stack? If yes, routes must store
+2. Does the app persist the navigation stack? If yes, routes must store
    `playlist.id` and not a slot.

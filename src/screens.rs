@@ -619,15 +619,10 @@ pub fn settings_page(p: SettingsPage, app: &App, t: tok::Theme) -> El {
 fn account_page(app: &App, t: tok::Theme) -> El {
     match &app.auth {
         crate::auth::Auth::SignedIn { name, .. } => {
-            let sign_out = el().key("sign-out").label("Sign out")
-                .h(40.0).px(space::S3).radius(radius::MD).center_y().focusable(true)
-                .fill(t.text)
-                .on_press(|a: &mut App| a.sign_out())
-                .child(text("Sign out").key("label").font(type_::BODY).color(t.bg));
             page("Account", "Your profile", t,
                 col().gap(space::S3)
                     .child(settings_row("acct-name".into(), "Name", name, t))
-                    .child(sign_out))
+                    .child(sign_out_button(t)))
         }
         crate::auth::Auth::Authorizing { .. } => {
             page("Account", "Your profile", t,
@@ -639,7 +634,8 @@ fn account_page(app: &App, t: tok::Theme) -> El {
             page("Account", "Your profile", t,
                 col().gap(space::S3)
                     .child(text(message).key("auth-error").font(type_::BODY).color(t.text_secondary))
-                    .child(sign_in))
+                    .child(sign_in)
+                    .child(sign_out_button(t)))
         }
         crate::auth::Auth::SignedOut => {
             let name = app.core.lib.name.clone();
@@ -680,6 +676,14 @@ fn sign_in_button(t: tok::Theme) -> El {
         .fill(t.text)
         .on_press(|a: &mut App| a.start_sign_in())
         .child(text("Sign in with Tidal").key("label").font(type_::BODY).color(t.bg))
+}
+
+fn sign_out_button(t: tok::Theme) -> El {
+    el().key("sign-out").label("Sign out")
+        .h(40.0).px(space::S3).radius(radius::MD).center_y().focusable(true)
+        .fill(t.text)
+        .on_press(|a: &mut App| a.sign_out())
+        .child(text("Sign out").key("label").font(type_::BODY).color(t.bg))
 }
 
 // --- Detail screens ------------------------------------------------------

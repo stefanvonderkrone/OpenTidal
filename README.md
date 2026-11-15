@@ -60,9 +60,11 @@ OPENTIDAL_LIVE=1 \
 TIDAL_CLIENT_ID=... \
 TIDAL_CLIENT_SECRET=... \
 TIDAL_REDIRECT_URI=http://127.0.0.1:8080/callback \
-TIDAL_SCOPE="user.read collection.read playlists.read entitlements.read recommendations.read search.read" \
 scripts/run.sh
 ```
+
+Leave `TIDAL_SCOPE` unset to request every read scope the app needs. Set it
+only to narrow the request.
 
 Run `scripts/run.sh`, not `cargo run`. It builds, ad-hoc signs the binary, and
 runs it. The signature gives the dev binary a stable identity, so the macOS

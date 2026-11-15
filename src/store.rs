@@ -46,10 +46,13 @@ impl Store {
             fs::create_dir_all(parent)?;
         }
         // Create privately before SQLite can create a journal with this mode.
+        // `truncate(false)` is required: this is a database, not a scratch file,
+        // so an existing file must keep its contents.
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .mode(0o600)
             .open(path)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
@@ -59,6 +62,7 @@ impl Store {
     }
 
     /// An in-memory database, for tests.
+    #[cfg(test)]
     pub fn in_memory() -> Result<Store, StoreError> {
         Self::configure(Connection::open_in_memory()?)
     }
@@ -294,6 +298,7 @@ impl Store {
     }
 
     /// The schema version this build writes.
+    #[cfg(test)]
     pub fn schema_version(&self) -> Result<u32, StoreError> {
         Ok(self
             .conn
@@ -641,8 +646,7 @@ mod tests {
 
     /// Configuration preserves a current schema and rejects a schema from a newer build.
     #[test]
-    fn schema_version_controls_migration() {
-        let store = Store::in_memory().unwrap();
+    fn schema_version_controls_migration() {        let store = Store::in_memory().unwrap();
         let store = Store::configure(store.conn).unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         let foreign_keys: bool = store
@@ -663,5 +667,29 @@ mod tests {
             Store::configure(store.conn),
             Err(StoreError::Sql(_))
         ));
+    }
+
+    /// A restart reads back what the previous run wrote: a second connection to
+    /// the same file sees the library, and the file is private.
+    #[test]
+    fn a_restart_reads_the_written_library() {
+        let dir = std::env::temp_dir().join(format!("opentidal-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("opentidal.db");
+        let lib = populated("Ada", 7);
+
+        {
+            let mut first = Store::open(&path).unwrap();
+            first.save("173210380", &lib).unwrap();
+        }
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the database is not private");
+
+        let second = Store::open(&path).unwrap();
+        assert_eq!(second.load("173210380").unwrap(), Some(lib));
+        assert_eq!(second.schema_version().unwrap(), SCHEMA_VERSION);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -299,12 +299,16 @@ pub fn handle_key(s: &mut State, key: &str) -> bool {
 /// The named scenes `main.rs` passes to `AppSpec`, each applied to
 /// `State::default()`. Test-only: `main.rs` keeps its own `App`-level scenes.
 #[cfg(test)]
-pub const SCENES: [(&str, fn(&mut State)); 4] = [
+pub const SCENES: [Scene; 4] = [
     ("default", |_| {}),
     ("accent-blue", |s| s.accent = 0),
     ("accent-pink", |s| s.accent = 2),
     ("paused", |s| s.playing = false),
 ];
+
+/// A named scene: a label and the change it makes to a fresh state.
+#[cfg(test)]
+pub type Scene = (&'static str, fn(&mut State));
 
 /// Every initial state the app can start from: each scene applied to `default`.
 #[cfg(test)]

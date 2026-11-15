@@ -475,12 +475,10 @@ mod tests {
     /// a checker that actually detects violations.
     #[test]
     fn check_detects_violations() {
-        let mut l = Library::default();
-        l.liked = crate::catalog::track_mask() + 1;
+        let l = Library { liked: crate::catalog::track_mask() + 1, ..Default::default() };
         assert_eq!(l.check(), Err(Violation::LikedOutOfRange));
 
-        let mut l = Library::default();
-        l.history = vec![TrackId(200)];
+        let l = Library { history: vec![TrackId(200)], ..Default::default() };
         assert_eq!(l.check(), Err(Violation::HistoryOutOfRange));
 
         let mut l = Library::default();

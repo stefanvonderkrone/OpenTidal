@@ -216,7 +216,11 @@ impl TokenStore for KeychainStore {
         }
     }
     fn clear(&self) {
-        let _ = self.entry.delete_credential();
+        // Overwrite, not delete, so the item keeps its access-control list. A
+        // delete makes the next sign-in create a fresh item, and macOS prompts
+        // again for an unsigned binary. The sentinel is not JSON, so `load`
+        // reads it as no token.
+        let _ = self.entry.set_password("signed-out");
     }
 }
 

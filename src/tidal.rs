@@ -33,8 +33,6 @@ pub enum ServiceError {
     Http(String),
     /// The response body did not match the expected shape.
     Decode(String),
-    /// The resource does not exist.
-    NotFound,
 }
 
 /// The read-only music port. Every method takes the access token, so the fake
@@ -207,8 +205,8 @@ fn parse_callback(request: &str) -> Option<Callback> {
     Some(cb)
 }
 
-/// The JSON:API document envelope. Tidal wraps every resource in `data` with
-/// `id`, `type` and `attributes`.
+/// The JSON:API document envelope. Tidal wraps every resource in `data`;
+/// here only its `attributes` are read, so the other members are ignored.
 #[derive(Deserialize)]
 struct Document {
     data: Option<Resource>,
@@ -216,7 +214,6 @@ struct Document {
 
 #[derive(Deserialize)]
 struct Resource {
-    id: String,
     attributes: Option<Value>,
 }
 

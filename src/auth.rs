@@ -111,7 +111,7 @@ fn authorize_url(config: &OAuthConfig, verifier: &str, state: &str) -> String {
     url.to_string()
 }
 
-/// The token endpoint body, parsed with the refresh token carried over when the
+/// A token endpoint body, parsed with the refresh token carried over when the
 /// response omits it (the refresh flow returns no new refresh token).
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -131,6 +131,39 @@ pub fn parse_token(json: &str, fallback_refresh: &str) -> Result<Token, String> 
         refresh_token: tr.refresh_token.unwrap_or_else(|| fallback_refresh.to_string()),
         expires_in: tr.expires_in,
     })
+}
+
+/// The claims of a Tidal access token, which is a JWT. The `sub` claim is the
+/// user id; the name fields vary, so read them in order.
+#[derive(Default, Deserialize)]
+pub struct JwtClaims {
+    #[serde(default)]
+    pub sub: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+}
+
+impl JwtClaims {
+    /// A display name from the token, in order of preference.
+    pub fn display_name(&self) -> Option<String> {
+        [&self.username, &self.name, &self.email]
+            .into_iter()
+            .flatten()
+            .map(|s| s.trim().to_string())
+            .find(|s| !s.is_empty())
+    }
+}
+
+/// Decode the payload of a JWT access token. Returns `None` when the token is
+/// not a JWT or its payload is not the expected shape.
+pub fn decode_claims(token: &str) -> Option<JwtClaims> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Where the refresh token persists between runs.
@@ -259,5 +292,16 @@ mod tests {
         assert_eq!(store.load(), Some(token));
         store.clear();
         assert_eq!(store.load(), None);
+    }
+
+    /// The JWT decoder reads `sub` and the name from the token payload.
+    #[test]
+    fn decode_claims_reads_sub_and_name() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"sub":"123","username":"ada"}"#);
+        let token = format!("h.{payload}.sig");
+        let claims = decode_claims(&token).unwrap();
+        assert_eq!(claims.sub.as_deref(), Some("123"));
+        assert_eq!(claims.display_name().as_deref(), Some("ada"));
     }
 }

@@ -89,10 +89,25 @@ impl HttpService {
 }
 
 impl MusicService for HttpService {
+    /// The user id comes from the token's `sub` claim, not from `/users/me`,
+    /// which returns 404 for many third-party clients. The name comes from the
+    /// token when it carries one, else from `/users/{id}`.
     fn current_user(&self, token: &str) -> Result<User, ServiceError> {
-        let doc = self.get_doc(token, "/users/me")?;
-        let data = doc.data.ok_or(ServiceError::NotFound)?;
-        Ok(User { id: UserId(data.id), name: name_from(&data.attributes) })
+        let claims = crate::auth::decode_claims(token)
+            .ok_or_else(|| ServiceError::Decode("token is not a JWT".to_string()))?;
+        let id = claims.sub.clone().ok_or_else(|| ServiceError::Decode("token has no sub claim".to_string()))?;
+        let mut name = claims.display_name().unwrap_or_else(|| "You".to_string());
+        if name == "You" {
+            if let Ok(doc) = self.get_doc(token, &format!("/users/{id}")) {
+                if let Some(data) = doc.data {
+                    let profile = name_from(&data.attributes);
+                    if profile != "You" {
+                        name = profile;
+                    }
+                }
+            }
+        }
+        Ok(User { id: UserId(id), name })
     }
 }
 

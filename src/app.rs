@@ -33,11 +33,18 @@ pub struct App {
     /// The sign-in dance (loopback + exchange), drained by `poll`. Carries the
     /// session it was started under, so a result that lands after a sign-out or
     /// a newer sign-in is dropped.
-    pub auth_flow: Latest<(u64, Result<Token, String>)>,
+    pub auth_flow: Latest<AuthFlow>,
     /// The profile fetch after sign-in, drained by `poll`. Carries the session
     /// it was started under and the possibly-refreshed token to persist.
-    pub profile: Latest<(u64, Result<(Token, User), ServiceError>)>,
+    pub profile: Latest<ProfileFetch>,
 }
+
+/// A finished sign-in exchange, tagged with the session it ran under.
+type AuthFlow = (u64, Result<Token, String>);
+
+/// A finished profile fetch, tagged with its session, carrying the token to
+/// persist.
+type ProfileFetch = (u64, Result<(Token, User), ServiceError>);
 
 /// A dummy token for the deterministic sign-in, so the fake path exercises the
 /// same `SignedIn` state without a network.
@@ -119,36 +126,36 @@ impl App {
     /// Drain any landed auth or profile result. Returns true when state changed.
     pub fn drain(&mut self) -> bool {
         let mut changed = false;
-        if let Some((session, result)) = self.auth_flow.take() {
-            if session == self.session {
-                changed = true;
-                match result {
-                    Ok(token) => {
-                        self.store.save(&token);
-                        self.auth = Auth::SignedIn { token: token.clone(), name: String::new() };
-                        self.fetch_profile(token);
-                    }
-                    Err(message) => self.auth = Auth::Failed { message },
+        if let Some((session, result)) = self.auth_flow.take()
+            && session == self.session
+        {
+            changed = true;
+            match result {
+                Ok(token) => {
+                    self.store.save(&token);
+                    self.auth = Auth::SignedIn { token: token.clone(), name: String::new() };
+                    self.fetch_profile(token);
                 }
+                Err(message) => self.auth = Auth::Failed { message },
             }
         }
-        if let Some((session, result)) = self.profile.take() {
-            if session == self.session {
-                changed = true;
-                match result {
-                    Ok((token, user)) => {
-                        self.store.save(&token);
-                        if let Auth::SignedIn { name, token: held, .. } = &mut self.auth {
-                            *held = token;
-                            *name = user.name;
-                        }
+        if let Some((session, result)) = self.profile.take()
+            && session == self.session
+        {
+            changed = true;
+            match result {
+                Ok((token, user)) => {
+                    self.store.save(&token);
+                    if let Auth::SignedIn { name, token: held, .. } = &mut self.auth {
+                        *held = token;
+                        *name = user.name;
                     }
-                    Err(e) => {
-                        if matches!(&e, ServiceError::InvalidGrant(_)) {
-                            let _ = self.store.clear();
-                        }
-                        self.auth = Auth::Failed { message: format!("{e:?}") };
+                }
+                Err(e) => {
+                    if matches!(&e, ServiceError::InvalidGrant(_)) {
+                        let _ = self.store.clear();
                     }
+                    self.auth = Auth::Failed { message: format!("{e:?}") };
                 }
             }
         }
@@ -290,10 +297,10 @@ fn file_config() -> FileConfig {
 /// The config file path: `OPENTIDAL_CONFIG` when set, else the per-user default
 /// (`~/Library/Application Support/OpenTidal/config.json` on macOS).
 fn config_path() -> Option<std::path::PathBuf> {
-    if let Ok(path) = std::env::var("OPENTIDAL_CONFIG") {
-        if !path.is_empty() {
-            return Some(std::path::PathBuf::from(path));
-        }
+    if let Ok(path) = std::env::var("OPENTIDAL_CONFIG")
+        && !path.is_empty()
+    {
+        return Some(std::path::PathBuf::from(path));
     }
     let home = std::env::var("HOME").ok()?;
     let sub = if cfg!(target_os = "macos") {

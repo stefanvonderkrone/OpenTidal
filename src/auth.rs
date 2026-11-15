@@ -54,19 +54,16 @@ pub const DEFAULT_SCOPE: &str =
 
 /// The auth state. A variant carries only the data valid in it: a login in
 /// flight holds its verifier and state, a signed-in state holds a token.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub enum Auth {
+    #[default]
     SignedOut,
     Authorizing { state: String, verifier: String },
     SignedIn { token: Token, name: String },
     Failed { message: String },
 }
 
-impl Default for Auth {
-    fn default() -> Self {
-        Auth::SignedOut
-    }
-}
+
 
 impl Auth {
     /// The displayed name, or `None` while signed out.
@@ -141,21 +138,17 @@ pub fn parse_token(json: &str, fallback_refresh: &str) -> Result<Token, String> 
 }
 
 /// The claims of a Tidal access token, which is a JWT. The `uid` claim is the
-/// user id (Tidal's tokens carry `uid`, not the OIDC `sub`); the name fields
-/// vary, so read them in order. `exp` is the absolute expiry, in seconds since
-/// the Unix epoch.
+/// user id (Tidal's tokens carry `uid`, not the OIDC `sub`). `exp` is the
+/// absolute expiry, in seconds since the Unix epoch.
+///
+/// The token carries no display name, so the profile name comes from
+/// `/users/me` in [`crate::tidal`].
 #[derive(Default, Deserialize)]
 pub struct JwtClaims {
     #[serde(default)]
     pub uid: Option<serde_json::Value>,
     #[serde(default)]
     pub sub: Option<String>,
-    #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub email: Option<String>,
     #[serde(default)]
     pub exp: Option<u64>,
 }
@@ -171,15 +164,6 @@ impl JwtClaims {
             _ => None,
         });
         uid.or_else(|| self.sub.clone()).filter(|s| !s.is_empty())
-    }
-
-    /// A display name from the token, in order of preference.
-    pub fn display_name(&self) -> Option<String> {
-        [&self.username, &self.name, &self.email]
-            .into_iter()
-            .flatten()
-            .map(|s| s.trim().to_string())
-            .find(|s| !s.is_empty())
     }
 }
 
@@ -351,15 +335,15 @@ mod tests {
         assert_eq!(store.load(), None);
     }
 
-    /// The JWT decoder reads `sub` and the name from the token payload.
+    /// The JWT decoder reads `sub` and `uid` from the token payload.
     #[test]
-    fn decode_claims_reads_sub_and_name() {
+    fn decode_claims_reads_sub_and_uid() {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-        let payload = URL_SAFE_NO_PAD.encode(br#"{"sub":"123","username":"ada"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"sub":"123","uid":"456"}"#);
         let token = format!("h.{payload}.sig");
         let claims = decode_claims(&token).unwrap();
         assert_eq!(claims.sub.as_deref(), Some("123"));
-        assert_eq!(claims.display_name().as_deref(), Some("ada"));
+        assert_eq!(claims.user_id().as_deref(), Some("456"));
     }
 
     /// Tidal tokens carry the user id in `uid`; `user_id` prefers it over `sub`

@@ -354,10 +354,10 @@ fn name_from(attributes: &Option<Value>) -> String {
         return parts.join(" ");
     }
     for key in ["name", "username"] {
-        if let Some(s) = attrs.get(key).and_then(Value::as_str) {
-            if !s.is_empty() {
-                return s.to_string();
-            }
+        if let Some(s) = attrs.get(key).and_then(Value::as_str)
+            && !s.is_empty()
+        {
+            return s.to_string();
         }
     }
     "You".to_string()

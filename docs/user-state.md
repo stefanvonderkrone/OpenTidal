@@ -111,8 +111,13 @@ do not clear anything.
 
 ## Writes
 
-- Sign-in: write the `user` row, then the keychain. If the keychain write
-  fails, there is no session and the row is inert.
+- Sign-in: write the keychain, then the `user` row. The code writes the token
+  first, because the token is what makes a session real. A row without a token
+  is inert, and a token without a row loads as a new account.
+- Sign-out: clear the keychain, then drop the in-memory library and close the
+  database. The rows stay on disk, so the same account finds them on its next
+  sign-in. A kept library in memory would show one account's data while another
+  is signed in.
 - Refresh: keychain only. No file write. This is the gain over a rotating key.
 - Profile fetch: update `user.name`.
 - Library change: write through in the same operation that changes the state.
@@ -128,12 +133,12 @@ While the app is read-only, the library is a mirror of Tidal, not a truth.
 Every row came from Tidal. Tidal still holds it. This settles recovery: a
 broken row needs no repair, because the next sync returns it.
 
-The Tidal sync drops and logs a leaf that fails `Library::check`. The container
-stays visible with the leaves it has. The next sync restores the leaf.
-
-The disk store has a stricter boundary. `Store::load` returns an error for an
-invalid stored library. It never drops rows or repairs data. The app's recovery
-path must handle that error when it connects the store to start.
+Both paths treat a bad leaf the same way. `Store::load`, the sync, and any
+future reader drop the leaf that fails `Library::check` and log a count. The
+container stays visible with the leaves it has, and the next sync restores what
+went. Only a file that cannot be read at all is an error, and then the database
+stays closed for writing, so a save cannot overwrite what the app could not
+read.
 
 The rule ends the day the app writes to Tidal. From then on a local-only row
 exists, a drop loses data the server never had, and recovery needs a real
@@ -189,12 +194,14 @@ The rules:
    `idx` order and their playlist references in `position` order.
 3. Do not derive `Serialize` on `Library`. Map rows into a fresh `Library`
    field by field. Validate catalogue indices before a bit shift or cast.
-4. Run `Library::check` on the loaded value. Return `StoreError::Sql` if the
-   check fails. Reject a missing playlist reference with its table and slot.
-   Load never panics on bad data.
+4. Run `Library::check` on the loaded value, and assert it in a debug build. A
+   row that would fail the check is dropped at the boundary, before it enters
+   the library, so the loaded value always satisfies the invariant.
 5. The caps in `library.rs` are real: `MAX_PLAYLISTS`, `HISTORY_CAP`,
-   `PLAYLIST_TRACK_CAP`, `MAX_COLLECTIONS`, `COLLECTION_PLAYLIST_CAP`. A file
-   with more rows than a cap fails load. The store never silently truncates it.
+   `PLAYLIST_TRACK_CAP`, `MAX_COLLECTIONS`, `COLLECTION_PLAYLIST_CAP`. Load
+   keeps the first cap-many rows in `position` order and counts the rest as
+   dropped. Keeping the first matches a mirror: the newest rows are the ones
+   the last sync wrote first.
 6. Read the library in one transaction so a concurrent save cannot mix two
    versions. Save replaces one user's rows in one transaction.
 
@@ -215,7 +222,11 @@ deliberate: the `user_id` column costs nothing now and the door stays open.
 | --- | --- |
 | A library survives a round trip | Property test: random ops, save, load, equal, `check` clean |
 | Load cannot break the invariant | The same test asserts `Library::check` on the loaded value |
-| The store rejects a broken leaf | Seed an unknown track id, assert load returns an error with the table and value |
+| An unknown item costs only that item | Seed an unknown track id, assert load drops it, keeps the rest, and reports a count |
+| A container survives a dropped leaf | One bad track in a playlist, assert the playlist keeps its name and good tracks |
+| A second account starts empty | Sign in, sign out, sign in with another id, assert no rows carried over |
+| A broken file is never overwritten | Write junk to the path, assert no database opens and the bytes stay |
+| A restart shows the library | Save, reopen the file, assert the library and the name come back |
 | Playlist slots survive deletion | Delete slot zero, save and load, assert slot one and its collection reference stay intact |
 | Users do not share slots | Save two populated libraries with the same slots, assert each loads unchanged |
 | A failed save loses nothing | Abort a child insert with a trigger, assert the previous library still loads |

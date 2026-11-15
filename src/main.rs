@@ -62,7 +62,10 @@ fn nav_item(route: Route, selected: bool, t: tok::Theme, accent: Color) -> El {
         .fill(if selected { t.hover } else { Color::TRANSPARENT })
         .hover(t.hover)
         .focusable(true)
-        .on_press(move |a: &mut App| state::open_section(&mut a.core, route))
+        .on_press(move |a: &mut App| {
+            a.rename.clear();
+            state::open_section(&mut a.core, route)
+        })
         .child(
             text(name)
                 .key("label")
@@ -133,7 +136,10 @@ fn back_button(t: tok::Theme) -> El {
         .center_y()
         .hover(t.hover)
         .focusable(true)
-        .on_press(|a: &mut App| state::back(&mut a.core))
+        .on_press(|a: &mut App| {
+            a.rename.clear();
+            state::back(&mut a.core)
+        })
         .child(text("Back").key("label").font(type_::BODY).color(t.text))
 }
 
@@ -146,7 +152,10 @@ fn search_button(t: tok::Theme) -> El {
         .center_y()
         .hover(t.hover)
         .focusable(true)
-        .on_press(|a: &mut App| state::open_section(&mut a.core, Route::Search))
+        .on_press(|a: &mut App| {
+            a.rename.clear();
+            state::open_section(&mut a.core, Route::Search)
+        })
         .child(text("Search").key("label").font(type_::BODY).color(t.text_secondary))
 }
 
@@ -159,7 +168,10 @@ fn settings_button(t: tok::Theme) -> El {
         .center_y()
         .hover(t.hover)
         .focusable(true)
-        .on_press(|a: &mut App| state::open_section(&mut a.core, Route::Settings))
+        .on_press(|a: &mut App| {
+            a.rename.clear();
+            state::open_section(&mut a.core, Route::Settings)
+        })
         .child(text("Settings").key("label").font(type_::BODY).color(t.text_secondary))
 }
 

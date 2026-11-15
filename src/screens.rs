@@ -24,7 +24,10 @@ fn card(key: &str, seed: usize, title: &str, subtitle: &str, route: Route, t: to
     col().key(key)
         .w(168.0)
         .gap(space::S2)
-        .on_press(move |a: &mut App| state::open_detail(&mut a.core, route))
+        .on_press(move |a: &mut App| {
+            a.rename.clear();
+            state::open_detail(&mut a.core, route)
+        })
         .child(
             el().key("cover")
                 .size(168.0, 168.0)
@@ -46,7 +49,10 @@ fn artist_card(a: Artist, t: tok::Theme) -> El {
     col().key(format!("artist-{}", a.id.0))
         .w(120.0)
         .gap(space::S2)
-        .on_press(move |app: &mut App| state::open_detail(&mut app.core, Route::Artist(id)))
+        .on_press(move |app: &mut App| {
+            app.rename.clear();
+            state::open_detail(&mut app.core, Route::Artist(id))
+        })
         .child(
             el().key("cover")
                 .size(120.0, 120.0)
@@ -571,7 +577,10 @@ pub fn settings(t: tok::Theme) -> El {
         rows = rows.child(
             row().key(format!("set-{i}")).h(44.0).px(space::S3).radius(radius::MD).center_y().justify_between().hover(t.hover)
                 .focusable(true)
-                .on_press(move |a: &mut App| state::open_detail(&mut a.core, Route::SettingsPage(p)))
+                .on_press(move |a: &mut App| {
+                    a.rename.clear();
+                    state::open_detail(&mut a.core, Route::SettingsPage(p))
+                })
                 .child(text(p.label()).key("label").font(type_::BODY).color(t.text))
                 .child(text(">").key("chevron").font(type_::BODY).color(t.text_secondary)),
         );

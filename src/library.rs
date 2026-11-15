@@ -493,4 +493,21 @@ mod tests {
         l.playlists[id.0 as usize].as_mut().unwrap().tracks.push(TrackId(200));
         assert_eq!(l.check(), Err(Violation::PlaylistTrackOutOfRange));
     }
+
+    /// Renaming actually changes the name. The invariant does not constrain
+    /// names, so this is the only coverage of the three rename operations.
+    #[test]
+    fn rename_changes_the_name() {
+        let mut l = Library::default();
+        let id = l.create_playlist("Old".to_string()).unwrap();
+        assert!(l.rename_playlist(id, "New".to_string()));
+        assert_eq!(l.playlist(id).unwrap().name, "New");
+
+        l.create_collection("OldC".to_string());
+        assert!(l.rename_collection(0, "NewC".to_string()));
+        assert_eq!(l.collections[0].name, "NewC");
+
+        l.set_name("Me".to_string());
+        assert_eq!(l.name, "Me");
+    }
 }

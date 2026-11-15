@@ -105,8 +105,9 @@ Assumptions and bounds:
   state space stays finite. The nav proof is exhaustive up to depth 3; deeper is
   unrepresentable in the shell because `open_detail` dedups and `open_section`
   resets to depth one.
-- The exhaustive library proof uses a fixed id set and fixed names; the random
-  walk covers the full-size shapes.
+- The exhaustive library proof uses a fixed id set and fixed names. The random
+  walk runs under the same reduced `cfg(test)` bounds, so production-capacity
+  behaviour is not exercised.
 - Events outside the set in `successors()` are not covered until they are added
   there.
 - This checks the app's own state, not the vendored `rune` framework.

@@ -31,5 +31,5 @@ The journeys:
 | `collection` | A collection holds a playlist and removes it. |
 
 Rename (playlist, collection, and profile) uses a text field, which the
-headless driver does not type into; the operations are proven by the unit and
-invariant tests instead (`library::tests`, `state::tests`).
+headless driver does not type into. A unit test covers the operations
+(`library::tests::rename_changes_the_name`).

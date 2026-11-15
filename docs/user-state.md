@@ -121,6 +121,38 @@ do not clear anything.
 The only point where the two stores can disagree is sign-in, and a stale row
 there does nothing. A start with a row and no token reads as signed out.
 
+## The mirror rule
+
+While the app is read-only, the library is a mirror of Tidal, not a truth.
+Every row came from Tidal. Tidal still holds it. This settles recovery: a
+broken row needs no repair, because the next sync returns it.
+
+So load never repairs, holds, or asks. It maps rows in, and a leaf that fails
+`Library::check` is dropped and logged. The container stays visible with the
+leaves it has. The next sync restores the leaf.
+
+The rule ends the day the app writes to Tidal. From then on a local-only row
+exists, a drop loses data the server never had, and recovery needs a real
+answer.
+
+## Sync
+
+A sync is the only thing that creates rows in bulk, and the only thing that
+deletes them. It obeys three rules.
+
+1. Merge, never replace. The collection read is paged. Page 4 of 7 can fail,
+   and a replace has already deleted everything. A merge makes an unread page
+   a no-op.
+2. Delete only after a complete read. The sync carries a `complete` flag, set
+   when the last page arrives. No delete pass runs on a partial read.
+3. Guard the delete pass. A server fault that returns an empty collection must
+   not wipe the library. A pass that would remove more than ten percent of a
+   table is refused and logged.
+
+The offline window is the one cost. A broken leaf stays missing until the
+first sync after the network returns. That is what a mirror means: the local
+copy is as good as the last successful read.
+
 ## Load and the invariant
 
 `src/library.rs` ids are slot indices into fixed arrays, and `src/state.rs`
@@ -159,6 +191,10 @@ deliberate: the `user_id` column costs nothing now and the door stays open.
 | --- | --- |
 | A library survives a round trip | Property test: random ops, save, load, equal, `check` clean |
 | Load cannot break the invariant | The same test asserts `Library::check` on the loaded value |
+| A broken leaf does not stop a start | Seed a row with an unknown track id, assert the app opens and the row is gone |
+| A partial sync loses nothing | Fail the read after page 2, assert every row still present |
+| A partial sync deletes nothing | Same test, assert the delete pass did not run |
+| An empty read does not wipe the library | Return zero items with `complete` set, assert the pass is refused |
 | No data loss at sign-in | Kill matrix: exit between the row write and the keychain write, and the reverse |
 | Start needs no network | Run with the network off, name and playlist visible |
 | A refresh writes no rows | Count rows before and after a refresh, `user_version` unchanged |
@@ -181,8 +217,7 @@ Read against a real account on 2026-11-15.
 
 ## Open questions
 
-1. Should a failed `Library::check` drop the row, or refuse the session and
-   show a repair screen? Dropping is silent and safe. Refusing is loud and
-   honest.
-2. Does the app persist the navigation stack? If yes, routes must store
-   `playlist.id` and not a slot.
+1. Does a sync run at start, or only when the user opens a library screen?
+   At start it fills the offline gap sooner. On demand it costs less on a
+   launch that never shows the library.
+2. Is ten percent the right guard on the delete pass?

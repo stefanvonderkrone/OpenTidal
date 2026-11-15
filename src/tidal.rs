@@ -98,30 +98,25 @@ impl HttpService {
 }
 
 impl MusicService for HttpService {
-    /// The user id comes from the token's `uid` claim. The name comes from the
-    /// token when it carries one, else from `/users/me` (the third-party client
-    /// cannot read `/users/{id}`).
+    /// The user id comes from the token's `uid` claim. The name always comes
+    /// from `/users/me` (the third-party client cannot read `/users/{id}`, and
+    /// Tidal tokens carry no name claim), so an expired or revoked token is
+    /// rejected even when its JWT happened to hold a name.
     fn current_user(&self, token: &str) -> Result<User, ServiceError> {
         let claims = crate::auth::decode_claims(token)
             .ok_or_else(|| ServiceError::Decode("token is not a JWT".to_string()))?;
         let id = claims.user_id().ok_or_else(|| ServiceError::Decode("token has no uid claim".to_string()))?;
-        let mut name = claims.display_name().unwrap_or_else(|| "You".to_string());
-        if name == "You" {
-            match self.get_doc(token, "/users/me") {
-                Ok(doc) => {
-                    if let Some(data) = doc.data {
-                        let profile = name_from(&data.attributes);
-                        if profile != "You" {
-                            name = profile;
-                        }
-                    }
-                }
-                // Surface an expired token so the caller refreshes and retries;
-                // any other failure keeps the best-effort fallback name.
-                Err(ServiceError::Unauthorized) => return Err(ServiceError::Unauthorized),
-                Err(_) => {}
-            }
-        }
+        let name = match self.get_doc(token, "/users/me") {
+            Ok(doc) => doc
+                .data
+                .as_ref()
+                .map(|data| name_from(&data.attributes))
+                .unwrap_or_else(|| "You".to_string()),
+            // Surface an expired token so the caller refreshes and retries;
+            // any other failure keeps the best-effort fallback name.
+            Err(ServiceError::Unauthorized) => return Err(ServiceError::Unauthorized),
+            Err(_) => "You".to_string(),
+        };
         Ok(User { id: UserId(id), name })
     }
 }
@@ -483,6 +478,34 @@ mod tests {
         let payload = URL_SAFE_NO_PAD.encode(br#"{"uid":"42"}"#);
         let token = format!("h.{payload}.sig");
         assert_eq!(svc.current_user(&token), Err(ServiceError::Unauthorized));
+        server.join().unwrap();
+    }
+
+    /// The name always comes from `/users/me`, never from a name claim the JWT
+    /// happens to carry, so a revoked token is still rejected rather than shown
+    /// from the token alone.
+    #[test]
+    fn current_user_ignores_jwt_name_and_fetches_profile() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf);
+            let body = r#"{"data":{"type":"users","attributes":{"username":"server-name"}}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.api+json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = conn.write_all(resp.as_bytes());
+        });
+        let svc = HttpService::new(&format!("http://127.0.0.1:{}/v2", addr.port()));
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"uid":"42","username":"jwt-name"}"#);
+        let token = format!("h.{payload}.sig");
+        assert_eq!(svc.current_user(&token).unwrap().name, "server-name");
         server.join().unwrap();
     }
 }

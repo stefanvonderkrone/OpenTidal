@@ -43,6 +43,22 @@ refresh token persists in the macOS keychain.
 
 Each later PR depends on the one before.
 
+## Confirmed live
+
+Read these against a real account on 2026-11-15.
+
+- The media type is `application/vnd.api+json`. `application/vnd.tidal.v1+json`
+  404s on the collection endpoints.
+- `/users/me` 404s for third-party clients. The user id comes from the access
+  token's JWT `sub` claim; the name from the token or `/users/{id}`.
+- Liked tracks: `GET /userCollectionTracks/me/relationships/items?include=items`.
+  `data` is the membership (track `id` + `addedAt`), `included` is the track
+  resources, and `links.next` carries the `page[cursor]` for the next page.
+- The same `/userCollectionAlbums|Artists|Playlists/me/relationships/items`
+  shape holds the rest of the library.
+- Track titles live in `included[].attributes.title`; duration is ISO 8601
+  (`PT3M26S`). Artist and album names need `include=artists,albums`.
+
 ## Throughput checkpoint
 
 Blocking first steps. The boundary, types, and auth machine must exist before

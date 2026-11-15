@@ -134,7 +134,8 @@ pub fn parse_token(json: &str, fallback_refresh: &str) -> Result<Token, String> 
 }
 
 /// The claims of a Tidal access token, which is a JWT. The `sub` claim is the
-/// user id; the name fields vary, so read them in order.
+/// user id; the name fields vary, so read them in order. `exp` is the absolute
+/// expiry, in seconds since the Unix epoch.
 #[derive(Default, Deserialize)]
 pub struct JwtClaims {
     #[serde(default)]
@@ -145,6 +146,8 @@ pub struct JwtClaims {
     pub name: Option<String>,
     #[serde(default)]
     pub email: Option<String>,
+    #[serde(default)]
+    pub exp: Option<u64>,
 }
 
 impl JwtClaims {
@@ -166,11 +169,37 @@ pub fn decode_claims(token: &str) -> Option<JwtClaims> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Refresh this far before the `exp` time, so a request that races the expiry
+/// still uses a token the API accepts.
+const EXPIRY_SKEW: u64 = 60;
+
+/// Whether a token's access token has passed its JWT `exp` time (within
+/// [`EXPIRY_SKEW`]). A token that is not a JWT, or one with no `exp` claim, is
+/// treated as valid, so the fake and any unknown shape do not trip this check.
+pub fn token_expired(token: &Token) -> bool {
+    let Some(claims) = decode_claims(&token.access_token) else {
+        return false;
+    };
+    let Some(exp) = claims.exp else {
+        return false;
+    };
+    now_secs().saturating_add(EXPIRY_SKEW) >= exp
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Where the refresh token persists between runs.
 pub trait TokenStore: Send + Sync {
     fn load(&self) -> Option<Token>;
     fn save(&self, token: &Token);
-    fn clear(&self);
+    /// Clear the stored token. Fails when the underlying write is rejected, so
+    /// the caller can tell that a persistent session was not cleared.
+    fn clear(&self) -> Result<(), String>;
 }
 
 /// An in-memory store for tests and non-macOS platforms.
@@ -186,8 +215,9 @@ impl TokenStore for MemoryStore {
     fn save(&self, token: &Token) {
         *self.token.lock().unwrap() = Some(token.clone());
     }
-    fn clear(&self) {
+    fn clear(&self) -> Result<(), String> {
         *self.token.lock().unwrap() = None;
+        Ok(())
     }
 }
 
@@ -215,12 +245,13 @@ impl TokenStore for KeychainStore {
             let _ = self.entry.set_password(&json);
         }
     }
-    fn clear(&self) {
+    fn clear(&self) -> Result<(), String> {
         // Overwrite, not delete, so the item keeps its access-control list. A
         // delete makes the next sign-in create a fresh item, and macOS prompts
         // again for an unsigned binary. The sentinel is not JSON, so `load`
-        // reads it as no token.
-        let _ = self.entry.set_password("signed-out");
+        // reads it as no token. A rejected write is surfaced, so the caller
+        // does not claim sign-out when the token still persists.
+        self.entry.set_password("signed-out").map_err(|e| e.to_string())
     }
 }
 
@@ -294,7 +325,7 @@ mod tests {
         let token = Token { access_token: "a".into(), refresh_token: "r".into(), expires_in: 1 };
         store.save(&token);
         assert_eq!(store.load(), Some(token));
-        store.clear();
+        store.clear().unwrap();
         assert_eq!(store.load(), None);
     }
 
@@ -307,5 +338,23 @@ mod tests {
         let claims = decode_claims(&token).unwrap();
         assert_eq!(claims.sub.as_deref(), Some("123"));
         assert_eq!(claims.display_name().as_deref(), Some("ada"));
+    }
+
+    /// Expiry comes from the JWT `exp` claim; a token without one is valid.
+    #[test]
+    fn expiry_comes_from_the_exp_claim() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let past = now_secs() - 10;
+        let payload = URL_SAFE_NO_PAD.encode(format!(r#"{{"sub":"1","exp":{past}}}"#));
+        let expired = Token { access_token: format!("h.{payload}.sig"), refresh_token: "r".into(), expires_in: 1 };
+        assert!(token_expired(&expired));
+
+        let future = now_secs() + 600;
+        let payload = URL_SAFE_NO_PAD.encode(format!(r#"{{"sub":"1","exp":{future}}}"#));
+        let valid = Token { access_token: format!("h.{payload}.sig"), refresh_token: "r".into(), expires_in: 1 };
+        assert!(!token_expired(&valid));
+
+        let no_exp = Token { access_token: "h.".to_string(), refresh_token: "r".into(), expires_in: 1 };
+        assert!(!token_expired(&no_exp));
     }
 }

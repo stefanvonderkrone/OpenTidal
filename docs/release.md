@@ -38,11 +38,34 @@ token without prompting, across updates.
   Switching the store to `security-framework` is the follow-up when launch reads
   matter.
 
-## 4. Credentials
+## 4. Credentials and live mode
 
-- The Tidal client id and secret stay in env vars, never in the repo.
-- A release ships without credentials. The user signs in once through the
-  browser, and the refresh token lands in the keychain.
+The dev build reads live mode and credentials from env vars. A shipped `.app`
+launched by double-click has no environment, so it reads them from a config
+file instead. The file is the operator's and stays out of the repo.
+
+- Live mode: `OPENTIDAL_LIVE=1` (env), or `"live": true` (config file).
+- Credentials: `TIDAL_CLIENT_ID`, `TIDAL_CLIENT_SECRET`, `TIDAL_REDIRECT_URI`,
+  `TIDAL_SCOPE` (env), or the same names in the config file. The env var wins
+  when both are set.
+- Config file: name it with `OPENTIDAL_CONFIG`, or leave it at the default path
+  `~/Library/Application Support/OpenTidal/config.json` (macOS) /
+  `~/.config/opentidal/config.json` elsewhere. The file holds the client secret
+  in plaintext, so set `chmod 600` and keep it out of the repo:
+
+  ```json
+  {
+    "live": true,
+    "client_id": "<client id>",
+    "client_secret": "<client secret>",
+    "redirect_uri": "http://127.0.0.1:8080/callback",
+    "scope": "user.read collection.read"
+  }
+  ```
+- The client id and secret never enter the repo. The user signs in once through
+  the browser, and the refresh token lands in the keychain. On later launches
+  the app restores the session and refreshes an expired access token
+  automatically, so the user signs in only when the refresh token is revoked.
 
 ## 5. Verify before shipping
 

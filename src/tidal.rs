@@ -29,6 +29,8 @@ pub struct User {
 pub enum ServiceError {
     /// The auth endpoints rejected the exchange or refresh.
     Auth(String),
+    /// The token was rejected as expired or invalid; refresh and retry.
+    Unauthorized,
     /// The transport or the API returned a non-success status.
     Http(String),
     /// The response body did not match the expected shape.
@@ -79,6 +81,9 @@ impl HttpService {
             .send()
             .map_err(|e| ServiceError::Http(e.to_string()))?;
         let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(ServiceError::Unauthorized);
+        }
         if !status.is_success() {
             return Err(ServiceError::Http(format!("{status} for {path}")));
         }
@@ -127,33 +132,111 @@ pub fn exchange_code(
         ])
         .send()
         .map_err(|e| ServiceError::Http(e.to_string()))?;
-    token_from_response(resp)
+    token_from_response(resp, "")
 }
 
-fn token_from_response(resp: reqwest::blocking::Response) -> Result<Token, ServiceError> {
+fn token_from_response(resp: reqwest::blocking::Response, fallback_refresh: &str) -> Result<Token, ServiceError> {
     let status = resp.status();
     let body = resp.text().map_err(|e| ServiceError::Http(e.to_string()))?;
     if !status.is_success() {
         return Err(ServiceError::Auth(format!("{status}: {body}")));
     }
-    crate::auth::parse_token(&body, "").map_err(ServiceError::Decode)
+    crate::auth::parse_token(&body, fallback_refresh).map_err(ServiceError::Decode)
 }
 
-/// The loopback half of the sign-in: bind the redirect port, read the one
-/// callback, check the state, and exchange the code. Blocking, so it runs on a
-/// `Latest` worker thread while the browser is open.
-pub fn run_loopback(config: OAuthConfig, state: String, verifier: String) -> Result<Token, String> {
-    use std::io::Read;
-    let port = loopback_port(&config.redirect_uri)?;
+/// Exchange a refresh token for a fresh access token (refresh grant). The old
+/// refresh token fills in when the response omits one.
+pub fn refresh_token(
+    client: &reqwest::blocking::Client,
+    config: &OAuthConfig,
+    refresh_token: &str,
+) -> Result<Token, ServiceError> {
+    let resp = client
+        .post(&config.token_url)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", config.client_id.as_str()),
+            ("refresh_token", refresh_token),
+        ])
+        .send()
+        .map_err(|e| ServiceError::Http(e.to_string()))?;
+    token_from_response(resp, refresh_token)
+}
+
+/// Bind the loopback port from the redirect URI and return the listener, ready
+/// to accept, before the browser is asked to redirect to it. Binding first
+/// removes the race where the browser redirects to a port no one listens on.
+pub fn bind_loopback(redirect_uri: &str) -> Result<std::net::TcpListener, String> {
+    let port = loopback_port(redirect_uri)?;
     let addr = format!("127.0.0.1:{port}");
-    let listener = std::net::TcpListener::bind(&addr).map_err(|e| {
+    std::net::TcpListener::bind(&addr).map_err(|e| {
         format!("cannot listen on {addr}: {e}. Check the port is free and the URI matches the dashboard")
-    })?;
-    let (mut stream, _) = listener.accept().map_err(|e| e.to_string())?;
+    })
+}
+
+/// How long the loopback listener waits for the browser's callback before it
+/// gives up, so closing the browser cannot leave sign-in pending forever.
+const SIGN_IN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The loopback half of the sign-in: accept one callback on the already-bound
+/// listener, check the state, exchange the code, and answer the browser.
+/// Blocking, so it runs on a `Latest` worker thread while the browser is open.
+pub fn run_loopback(
+    config: OAuthConfig,
+    state: String,
+    verifier: String,
+    listener: std::net::TcpListener,
+) -> Result<Token, String> {
+    use std::io::{Read, Write};
+    let mut stream = accept_with_timeout(&listener)?;
     let mut buf = [0u8; 4096];
     let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
-    let request = String::from_utf8_lossy(&buf[..n]);
-    let Some(callback) = parse_callback(&request) else {
+    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+    let result = exchange_from_callback(&request, &config, &state, &verifier);
+    // Answer the browser on every path so it is not left waiting.
+    let (status, body) = match &result {
+        Ok(_) => ("200 OK", "You can close this tab and return to OpenTidal."),
+        Err(e) => ("400 Bad Request", e.as_str()),
+    };
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.flush();
+    result
+}
+
+/// Accept one connection within [`SIGN_IN_TIMEOUT`], or fail so the caller can
+/// leave the `Authorizing` state instead of blocking forever.
+fn accept_with_timeout(listener: &std::net::TcpListener) -> Result<std::net::TcpStream, String> {
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let deadline = std::time::Instant::now() + SIGN_IN_TIMEOUT;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let _ = stream.set_nonblocking(false);
+                return Ok(stream);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err("sign-in timed out: close the browser and try again".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// Parse and validate one callback, then exchange its code for a token.
+fn exchange_from_callback(
+    request: &str,
+    config: &OAuthConfig,
+    state: &str,
+    verifier: &str,
+) -> Result<Token, String> {
+    let Some(callback) = parse_callback(request) else {
         return Err("the browser did not return a code or error".to_string());
     };
     if let Some(error) = callback.error {
@@ -161,11 +244,11 @@ pub fn run_loopback(config: OAuthConfig, state: String, verifier: String) -> Res
         return Err(format!("Tidal rejected the login: {error} ({desc})"));
     }
     let code = callback.code.ok_or("no code in the redirect")?;
-    if callback.state.as_deref() != Some(state.as_str()) {
+    if callback.state.as_deref() != Some(state) {
         return Err("state mismatch".to_string());
     }
     let client = reqwest::blocking::Client::new();
-    exchange_code(&client, &config, &code, &verifier).map_err(|e| format!("{e:?}"))
+    exchange_code(&client, config, &code, verifier).map_err(|e| format!("{e:?}"))
 }
 
 /// The port from the redirect URI. The listener binds `127.0.0.1` regardless of
@@ -185,20 +268,20 @@ struct Callback {
 
 /// Pull the OAuth params out of the callback request line
 /// (`GET /callback?code=..&state=.. HTTP/1.1`), or the error Tidal sent instead.
+/// Values are percent-decoded, so `code=a%2Bb` reads as `a+b`.
 fn parse_callback(request: &str) -> Option<Callback> {
     let line = request.lines().next()?;
     let mut parts = line.split_whitespace();
     let _method = parts.next()?;
     let target = parts.next()?;
-    let query = target.split('?').nth(1)?;
+    let url = reqwest::Url::parse(&format!("http://localhost{target}")).ok()?;
     let mut cb = Callback { code: None, state: None, error: None, error_description: None };
-    for pair in query.split('&') {
-        let (key, value) = pair.split_once('=')?;
-        match key {
-            "code" => cb.code = Some(value.to_string()),
-            "state" => cb.state = Some(value.to_string()),
-            "error" => cb.error = Some(value.to_string()),
-            "error_description" => cb.error_description = Some(value.to_string()),
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => cb.code = Some(value.into_owned()),
+            "state" => cb.state = Some(value.into_owned()),
+            "error" => cb.error = Some(value.into_owned()),
+            "error_description" => cb.error_description = Some(value.into_owned()),
             _ => {}
         }
     }
@@ -287,5 +370,13 @@ mod tests {
         let err = parse_callback("GET /callback?error=access_denied&error_description=nope&state=st HTTP/1.1").unwrap();
         assert_eq!(err.error.as_deref(), Some("access_denied"));
         assert_eq!(err.error_description.as_deref(), Some("nope"));
+    }
+
+    /// Percent-encoded callback values are decoded before use.
+    #[test]
+    fn callback_parser_decodes_values() {
+        let cb = parse_callback("GET /callback?code=a%2Bb&state=%2F%3D HTTP/1.1").unwrap();
+        assert_eq!(cb.code.as_deref(), Some("a+b"));
+        assert_eq!(cb.state.as_deref(), Some("/="));
     }
 }

@@ -60,7 +60,7 @@ OPENTIDAL_LIVE=1 \
 TIDAL_CLIENT_ID=... \
 TIDAL_CLIENT_SECRET=... \
 TIDAL_REDIRECT_URI=http://127.0.0.1:8080/callback \
-TIDAL_SCOPE=collection.read \
+TIDAL_SCOPE="user.read collection.read" \
 cargo run
 ```
 

@@ -60,6 +60,8 @@ impl App {
             return;
         }
         let (url, verifier, state) = auth::begin(&self.oauth);
+        eprintln!("opentidal: sign in, redirect_uri={}", self.oauth.redirect_uri);
+        eprintln!("opentidal: opening {url}");
         self.auth = Auth::Authorizing { state: state.clone(), verifier: verifier.clone() };
         self.open_browser(&url);
         let config = self.oauth.clone();

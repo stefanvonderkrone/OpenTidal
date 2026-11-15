@@ -131,48 +131,65 @@ fn token_from_response(resp: reqwest::blocking::Response) -> Result<Token, Servi
 /// `Latest` worker thread while the browser is open.
 pub fn run_loopback(config: OAuthConfig, state: String, verifier: String) -> Result<Token, String> {
     use std::io::Read;
-    let addr = loopback_addr(&config.redirect_uri)?;
-    let listener = std::net::TcpListener::bind(&addr).map_err(|e| e.to_string())?;
+    let port = loopback_port(&config.redirect_uri)?;
+    let addr = format!("127.0.0.1:{port}");
+    let listener = std::net::TcpListener::bind(&addr).map_err(|e| {
+        format!("cannot listen on {addr}: {e}. Check the port is free and the URI matches the dashboard")
+    })?;
     let (mut stream, _) = listener.accept().map_err(|e| e.to_string())?;
     let mut buf = [0u8; 4096];
     let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
     let request = String::from_utf8_lossy(&buf[..n]);
-    let Some((code, got_state)) = parse_callback(&request) else {
-        return Err("no code in the redirect".to_string());
+    let Some(callback) = parse_callback(&request) else {
+        return Err("the browser did not return a code or error".to_string());
     };
-    if got_state != state {
+    if let Some(error) = callback.error {
+        let desc = callback.error_description.as_deref().unwrap_or("");
+        return Err(format!("Tidal rejected the login: {error} ({desc})"));
+    }
+    let code = callback.code.ok_or("no code in the redirect")?;
+    if callback.state.as_deref() != Some(state.as_str()) {
         return Err("state mismatch".to_string());
     }
     let client = reqwest::blocking::Client::new();
     exchange_code(&client, &config, &code, &verifier).map_err(|e| format!("{e:?}"))
 }
 
-fn loopback_addr(redirect_uri: &str) -> Result<String, String> {
+/// The port from the redirect URI. The listener binds `127.0.0.1` regardless of
+/// whether the URI names `localhost` or the loopback IP, so a `localhost` URI
+/// cannot bind `::1` and miss the browser's IPv4 connection.
+fn loopback_port(redirect_uri: &str) -> Result<u16, String> {
     let url = reqwest::Url::parse(redirect_uri).map_err(|e| e.to_string())?;
-    let host = url.host_str().ok_or("redirect_uri has no host")?;
-    let port = url.port().ok_or("redirect_uri has no port")?;
-    Ok(format!("{host}:{port}"))
+    url.port().ok_or_else(|| "redirect_uri has no port".to_string())
 }
 
-/// Pull `code` and `state` out of the callback request line
-/// (`GET /callback?code=..&state=.. HTTP/1.1`).
-fn parse_callback(request: &str) -> Option<(String, String)> {
+struct Callback {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+/// Pull the OAuth params out of the callback request line
+/// (`GET /callback?code=..&state=.. HTTP/1.1`), or the error Tidal sent instead.
+fn parse_callback(request: &str) -> Option<Callback> {
     let line = request.lines().next()?;
     let mut parts = line.split_whitespace();
     let _method = parts.next()?;
     let target = parts.next()?;
     let query = target.split('?').nth(1)?;
-    let mut code = None;
-    let mut state = None;
+    let mut cb = Callback { code: None, state: None, error: None, error_description: None };
     for pair in query.split('&') {
         let (key, value) = pair.split_once('=')?;
         match key {
-            "code" => code = Some(value.to_string()),
-            "state" => state = Some(value.to_string()),
+            "code" => cb.code = Some(value.to_string()),
+            "state" => cb.state = Some(value.to_string()),
+            "error" => cb.error = Some(value.to_string()),
+            "error_description" => cb.error_description = Some(value.to_string()),
             _ => {}
         }
     }
-    Some((code?, state?))
+    Some(cb)
 }
 
 /// The JSON:API document envelope. Tidal wraps every resource in `data` with
@@ -237,5 +254,26 @@ mod tests {
         let attrs = serde_json::json!({ "username": "ada" });
         assert_eq!(name_from(&Some(attrs)), "ada");
         assert_eq!(name_from(&None), "You");
+    }
+
+    /// The loopback port comes from the URI, and a URI without a port fails.
+    #[test]
+    fn loopback_port_is_read_from_the_uri() {
+        assert_eq!(loopback_port("http://127.0.0.1:8080/callback").unwrap(), 8080);
+        assert_eq!(loopback_port("http://localhost:8080/callback").unwrap(), 8080);
+        assert!(loopback_port("http://127.0.0.1/callback").is_err());
+    }
+
+    /// The callback parser reads a code, and a rejection with its reason.
+    #[test]
+    fn callback_parser_reads_code_and_error() {
+        let ok = parse_callback("GET /callback?code=abc&state=st HTTP/1.1").unwrap();
+        assert_eq!(ok.code.as_deref(), Some("abc"));
+        assert_eq!(ok.state.as_deref(), Some("st"));
+        assert_eq!(ok.error, None);
+
+        let err = parse_callback("GET /callback?error=access_denied&error_description=nope&state=st HTTP/1.1").unwrap();
+        assert_eq!(err.error.as_deref(), Some("access_denied"));
+        assert_eq!(err.error_description.as_deref(), Some("nope"));
     }
 }

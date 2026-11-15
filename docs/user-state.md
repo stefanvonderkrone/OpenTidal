@@ -137,6 +137,14 @@ answer.
 
 ## Sync
 
+A sync runs on demand, when a library screen opens. Start reads disk only, so
+a launch stays free of network work. The cost of that choice: a user who never
+opens a library screen never syncs, and a broken leaf waits until one does.
+
+How it lands: paint the rows from disk first, then update in place as pages
+arrive. The app must never show a spinner over a list it already has, or the
+sync makes the app slower than the file alone.
+
 A sync is the only thing that creates rows in bulk, and the only thing that
 deletes them. It obeys three rules.
 
@@ -152,6 +160,11 @@ deletes them. It obeys three rules.
 The offline window is the one cost. A broken leaf stays missing until the
 first sync after the network returns. That is what a mirror means: the local
 copy is as good as the last successful read.
+
+The delete pass runs through the state operations, never through the store
+directly. `Route::UserPlaylist` holds a slot, so a playlist that a route names
+can be the target of a delete. `state.rs:272` `delete_playlist` already repairs
+the route. Raw SQL would break the invariant on the bulk path.
 
 ## Load and the invariant
 
@@ -197,6 +210,7 @@ deliberate: the `user_id` column costs nothing now and the door stays open.
 | An empty read does not wipe the library | Return zero items with `complete` set, assert the pass is refused |
 | No data loss at sign-in | Kill matrix: exit between the row write and the keychain write, and the reverse |
 | Start needs no network | Run with the network off, name and playlist visible |
+| A library screen needs no network | Open Liked Songs offline, assert the disk rows paint and no spinner shows |
 | A refresh writes no rows | Count rows before and after a refresh, `user_version` unchanged |
 | File is private | `stat -f '%Lp'` returns `600` |
 | Schema is sound | `PRAGMA integrity_check` returns `ok`, and no row has an orphan `user_id` |
@@ -217,7 +231,4 @@ Read against a real account on 2026-11-15.
 
 ## Open questions
 
-1. Does a sync run at start, or only when the user opens a library screen?
-   At start it fills the offline gap sooner. On demand it costs less on a
-   launch that never shows the library.
-2. Is ten percent the right guard on the delete pass?
+1. Is ten percent the right guard on the delete pass?

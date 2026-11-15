@@ -47,7 +47,7 @@ file instead. The file is the operator's and stays out of the repo.
 - Live mode: `OPENTIDAL_LIVE=1` (env), or `"live": true` (config file).
 - Credentials: `TIDAL_CLIENT_ID`, `TIDAL_CLIENT_SECRET`, `TIDAL_REDIRECT_URI`,
   `TIDAL_SCOPE` (env), or the same names in the config file. The env var wins
-  when both are set.
+  when both are set. `TIDAL_SCOPE` defaults to every read scope when left unset.
 - Config file: name it with `OPENTIDAL_CONFIG`, or leave it at the default path
   `~/Library/Application Support/OpenTidal/config.json` (macOS) /
   `~/.config/opentidal/config.json` elsewhere. The file holds the client secret
@@ -59,7 +59,7 @@ file instead. The file is the operator's and stays out of the repo.
     "client_id": "<client id>",
     "client_secret": "<client secret>",
     "redirect_uri": "http://127.0.0.1:8080/callback",
-    "scope": "user.read collection.read"
+    "scope": "user.read collection.read playlists.read entitlements.read recommendations.read search.read r_usr"
   }
   ```
 - The client id and secret never enter the repo. The user signs in once through

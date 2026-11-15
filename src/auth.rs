@@ -32,8 +32,9 @@ pub struct OAuthConfig {
 
 impl OAuthConfig {
     /// The production Tidal endpoints. Credentials are filled from env by the
-    /// caller.
+    /// caller. An empty scope falls back to [`DEFAULT_SCOPE`].
     pub fn tidal(client_id: String, client_secret: String, redirect_uri: String, scope: String) -> Self {
+        let scope = if scope.trim().is_empty() { DEFAULT_SCOPE.to_string() } else { scope };
         OAuthConfig {
             client_id,
             client_secret,
@@ -44,6 +45,12 @@ impl OAuthConfig {
         }
     }
 }
+
+/// Every read scope Tidal offers. OpenTidal is read-only, so no write or
+/// playback scope is requested. `r_usr` grants read access to all end-user
+/// data.
+pub const DEFAULT_SCOPE: &str =
+    "user.read collection.read playlists.read entitlements.read recommendations.read search.read r_usr";
 
 /// The auth state. A variant carries only the data valid in it: a login in
 /// flight holds its verifier and state, a signed-in state holds a token.

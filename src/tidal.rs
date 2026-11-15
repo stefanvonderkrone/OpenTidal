@@ -77,7 +77,7 @@ impl HttpService {
             .client
             .get(&url)
             .bearer_auth(token)
-            .header("accept", "application/vnd.tidal.v1+json")
+            .header("accept", "application/vnd.api+json")
             .send()
             .map_err(|e| ServiceError::Http(e.to_string()))?;
         let status = resp.status();

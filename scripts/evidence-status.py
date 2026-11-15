@@ -7,7 +7,9 @@ The design note's evidence table is the promise that the work is verified. A row
 that names a test that no longer exists, or was renamed, makes the whole table
 worthless. So a rename has to update the table in the same change.
 
-A Status cell is either `test: <name>`, `live: <date>`, or `pending: <what>`.
+A Status cell is either `test: <name>`, `live: <date>`, or `pending: <what>`. A
+`pending:` cell must not name a snake_case identifier, because every one of those
+is held to the test list and a column name would fail the gate.
 Every backticked name in the cell is checked, whichever kind it is: a `live:` row
 that names a test is naming the test that also covers part of the claim, and a
 rename must update it. This runs `cargo test -- --list`, so it agrees with the

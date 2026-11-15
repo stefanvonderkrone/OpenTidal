@@ -123,9 +123,13 @@ do not clear anything.
   is signed in.
 - Refresh: keychain only. No file write. This is the gain over a rotating key.
 - Profile fetch: update `user.name`.
-- Library change: write through in the same operation that changes the state.
-- Sign-out: keychain sentinel. Keep the rows, so the next sign-in finds the
-  library again.
+- Library change: one comparison per frame, not a write per operation. The app
+  keeps the library as last written, and `drain` writes when the two differ. This
+  replaces the earlier "write through in the same operation", which would have
+  needed a persistence call at each of the 22 screen actions. Three things make
+  the per-frame write safe. `view` asks for one more frame while the library is
+  dirty, because a window at rest draws none. The window's quit hooks flush. And
+  a failed write stops the wake, so a full disk cannot spin the loop.
 
 The only point where the two stores can disagree is sign-in, and a stale row
 there does nothing. A start with a row and no token reads as signed out.
@@ -246,6 +250,8 @@ names work this branch does not build.
 | A restart shows the library | Write, reopen the file, assert the library and the name come back | test: `a_restart_reads_the_written_library`, `a_restart_shows_the_saved_library` |
 | A quit writes what is outstanding | Change the library, quit, reopen, assert the change is there | test: `a_quit_writes_what_is_outstanding` |
 | A dirty library asks for a frame | A change wakes the loop, a clean library does not | test: `only_a_dirty_library_asks_for_a_frame` |
+| A dirty library with nothing to write it to asks for no frame | No session, or a failed write, wakes nothing | test: `a_dirty_library_with_no_session_asks_for_no_frame` |
+| A dead refresh token closes the library | Push an `InvalidGrant` result, assert no library and no token | test: `a_dead_refresh_token_closes_the_library` |
 | Playlist slots survive deletion | Delete slot zero, write and load, assert slot one and its reference stay | test: `slot_hole_survives` |
 | A collection gap does not misplace a reference | Move a collection's index, assert the reference follows it | test: `a_collection_gap_does_not_misplace_a_reference` |
 | Users do not share slots | Two populated libraries with the same slots, assert each loads unchanged | test: `users_are_isolated` |

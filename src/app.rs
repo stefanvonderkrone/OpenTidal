@@ -34,6 +34,9 @@ pub struct App {
     /// The library as last written to disk, so a frame can tell whether the
     /// in-memory library changed.
     on_disk: Library,
+    /// Set after a write fails, so a dirty library does not wake the loop on
+    /// every frame. The next edit clears it through a successful write.
+    write_failed: bool,
     /// Wakes the event loop so `poll` runs after a change. A windowed app stops
     /// drawing frames at rest, so without this a click in the last frame before
     /// idle would sit unsaved until the next input.
@@ -172,8 +175,16 @@ impl App {
             return;
         };
         match open.store.write(&open.user_id, &self.core.lib) {
-            Ok(()) => self.on_disk = self.core.lib.clone(),
-            Err(error) => eprintln!("opentidal: cannot save the library: {error:?}"),
+            Ok(()) => {
+                self.on_disk = self.core.lib.clone();
+                self.write_failed = false;
+            }
+            Err(error) => {
+                // Keep the library dirty so a later edit tries again, but stop
+                // waking for this failure.
+                self.write_failed = true;
+                eprintln!("opentidal: cannot save the library: {error:?}");
+            }
         }
     }
 
@@ -304,11 +315,21 @@ impl App {
         changed
     }
 
-    /// Ask for one more frame when the library changed. The store write happens
-    /// in that frame's `drain`. A window at rest draws no frames, so a change in
-    /// the frame that puts it to rest would otherwise wait for the next input.
+    /// Ask for one more frame when the library changed and there is somewhere to
+    /// write it. The write happens in that frame's `drain`.
+    ///
+    /// Two guards, both load-bearing. No open library means no write will happen,
+    /// so waking would leave the library dirty and wake again on every frame, which
+    /// spins the CPU. A failed write keeps the library dirty, so a retry sets a
+    /// flag that stops the wake until the next edit.
     pub fn wake_if_dirty(&self) {
+        if self.library.is_none() {
+            return;
+        }
+        // `drain` clears the flag when a write succeeds, so a failure alone stops
+        // the wake. The next `drain` retries, because the library is still dirty.
         if self.core.lib != self.on_disk
+            && !self.write_failed
             && let Some(waker) = &self.waker
         {
             waker();
@@ -319,6 +340,7 @@ impl App {
     pub fn quit(&mut self) {
         self.flush_library();
     }
+
 
     #[cfg(target_os = "macos")]
     fn open_browser(&self, url: &str) {
@@ -411,6 +433,7 @@ impl Default for App {
             tokens,
             library: None,
             on_disk: Library::default(),
+            write_failed: false,
             waker: None,
             live,
             session: 0,
@@ -557,6 +580,62 @@ mod tests {
         assert_eq!(second.core.lib.playlist(id).unwrap().tracks, vec![TrackId(3)]);
         assert!(second.library.is_some());
 
+    }
+
+    /// A rejected refresh token closes the library as well as the token. Leaving
+    /// it open let a later sign-in inherit the rows and save them under its own id.
+    #[test]
+    fn a_dead_refresh_token_closes_the_library() {
+        let dir = TempDir::new("invalid-grant");
+        let path = dir.path();
+
+        let mut app = app_without_a_session();
+        app.open_library("173210380", &path);
+        app.core.lib.set_name("Ada".to_string());
+        app.core.lib.toggle_like(TrackId(1));
+        app.auth = Auth::SignedIn { token: fake_token() };
+        assert!(app.library.is_some());
+
+        // The work runs on a worker thread, so the drain has to wait for the
+        // result to land. The result must carry the current session, or the drain
+        // discards it as stale.
+        let session = app.session;
+        let dead = ServiceError::InvalidGrant("refresh token revoked".to_string());
+        app.profile.request((), move |_| (session, Err(dead)));
+        for _ in 0..1_000 {
+            if app.drain() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        assert!(app.library.is_none(), "a dead token left the library writable");
+        assert_eq!(app.core.lib, Library::default(), "the library stayed in memory");
+        assert_eq!(app.tokens.load(), None, "the dead token stayed stored");
+    }
+
+    /// A dirty library with nothing to write it to asks for no frame. Otherwise
+    /// the app would wake, fail to save, stay dirty, and wake again forever, which
+    /// is a spinning CPU on a machine with no session or a full disk.
+    #[test]
+    fn a_dirty_library_with_no_session_asks_for_no_frame() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut app = app_without_a_session();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        app.waker = Some(Arc::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        app.core.lib.toggle_like(TrackId(3));
+        app.wake_if_dirty();
+        assert_eq!(count.load(Ordering::SeqCst), 0, "a library with no store woke the loop");
+
+        app.flush_library();
+        app.wake_if_dirty();
+        assert_eq!(count.load(Ordering::SeqCst), 0, "a failed write kept waking the loop");
     }
 
     /// A stored token that names no account signs out instead of signing in.

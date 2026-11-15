@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn the_database_is_excluded_from_backups() {
         let dir = std::env::temp_dir().join(format!("opentidal-backup-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let guard = TempDirGuard(dir.clone());
         let path = dir.join("opentidal.db");
         Store::open(&path).unwrap();
 
@@ -462,8 +462,17 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).contains("com.apple.backupd"),
             "the database directory is not excluded from backups"
         );
+        drop(guard);
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    /// A temporary directory that removes itself, so a failing test leaves no
+    /// database behind.
+    struct TempDirGuard(std::path::PathBuf);
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// The library from a load that dropped nothing, which is every load the

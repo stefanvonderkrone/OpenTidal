@@ -617,33 +617,69 @@ pub fn settings_page(p: SettingsPage, app: &App, t: tok::Theme) -> El {
 }
 
 fn account_page(app: &App, t: tok::Theme) -> El {
-    let name = app.core.lib.name.clone();
-    let field = text_input(&app.rename, type_::BODY)
-        .key("name-box")
-        .w_full()
-        .px(space::S3)
-        .py(space::S2)
-        .radius(radius::MD)
-        .fill(t.hover)
-        .single_line()
-        .on_edit(|a: &mut App| &mut a.rename)
-        .placeholder("Your name", t.text_secondary);
-    let save_btn = el().key("save-name").label("Save name")
+    match &app.auth {
+        crate::auth::Auth::SignedIn { name, .. } => {
+            let sign_out = el().key("sign-out").label("Sign out")
+                .h(40.0).px(space::S3).radius(radius::MD).center_y().focusable(true)
+                .fill(t.text)
+                .on_press(|a: &mut App| a.sign_out())
+                .child(text("Sign out").key("label").font(type_::BODY).color(t.bg));
+            page("Account", "Your profile", t,
+                col().gap(space::S3)
+                    .child(settings_row("acct-name".into(), "Name", name, t))
+                    .child(sign_out))
+        }
+        crate::auth::Auth::Authorizing { .. } => {
+            page("Account", "Your profile", t,
+                col().gap(space::S3)
+                    .child(text("Authorizing…").key("auth-state").font(type_::BODY).color(t.text_secondary)))
+        }
+        crate::auth::Auth::Failed { message } => {
+            let sign_in = sign_in_button(t);
+            page("Account", "Your profile", t,
+                col().gap(space::S3)
+                    .child(text(message).key("auth-error").font(type_::BODY).color(t.text_secondary))
+                    .child(sign_in))
+        }
+        crate::auth::Auth::SignedOut => {
+            let name = app.core.lib.name.clone();
+            let field = text_input(&app.rename, type_::BODY)
+                .key("name-box")
+                .w_full()
+                .px(space::S3)
+                .py(space::S2)
+                .radius(radius::MD)
+                .fill(t.hover)
+                .single_line()
+                .on_edit(|a: &mut App| &mut a.rename)
+                .placeholder("Your name", t.text_secondary);
+            let save_btn = el().key("save-name").label("Save name")
+                .h(40.0).px(space::S3).radius(radius::MD).center_y().focusable(true)
+                .fill(t.text)
+                .on_press(|a: &mut App| {
+                    let name = a.rename.text.trim().to_string();
+                    if !name.is_empty() {
+                        a.core.lib.set_name(name);
+                        a.rename.clear();
+                    }
+                })
+                .child(text("Save name").key("label").font(type_::BODY).color(t.bg));
+            page("Account", "Your profile", t,
+                col().gap(space::S3)
+                    .child(settings_row("acct-name".into(), "Name", &name, t))
+                    .child(sign_in_button(t))
+                    .child(field)
+                    .child(save_btn))
+        }
+    }
+}
+
+fn sign_in_button(t: tok::Theme) -> El {
+    el().key("sign-in").label("Sign in with Tidal")
         .h(40.0).px(space::S3).radius(radius::MD).center_y().focusable(true)
         .fill(t.text)
-        .on_press(|a: &mut App| {
-            let name = a.rename.text.trim().to_string();
-            if !name.is_empty() {
-                a.core.lib.set_name(name);
-                a.rename.clear();
-            }
-        })
-        .child(text("Save name").key("label").font(type_::BODY).color(t.bg));
-    page("Account", "Your profile", t,
-        col().gap(space::S3)
-            .child(settings_row("acct-name".into(), "Name", &name, t))
-            .child(field)
-            .child(save_btn))
+        .on_press(|a: &mut App| a.start_sign_in())
+        .child(text("Sign in with Tidal").key("label").font(type_::BODY).color(t.bg))
 }
 
 // --- Detail screens ------------------------------------------------------

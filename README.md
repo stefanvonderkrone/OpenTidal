@@ -11,8 +11,15 @@ now-playing bar.
 The user's data is real and mutable now: like tracks, save albums, follow
 artists, download albums, and create, rename, reorder and delete playlists and
 collections. All of it lives in memory and every operation is proven to keep
-the library valid. The catalogue is still placeholder content, so there is no
-network, no playback, and no Tidal account. Those are later work.
+the library valid.
+
+Sign in to Tidal now works through the `MusicService` port in `src/tidal.rs`.
+The OAuth authorization-code flow with PKCE lives in `src/auth.rs`, and the
+signed-in user's name shows in the sidebar. The deterministic fake service
+backs the headless proof; set `OPENTIDAL_LIVE=1` (and the `TIDAL_*` env vars)
+to use the real client and the macOS keychain. The catalogue is still
+placeholder content, so there is no real catalogue, playback, or library sync
+yet. Those are later work.
 
 ## Build and run
 
@@ -44,6 +51,23 @@ invariant proofs run in `cargo test`.
 
 See `.agents/skills/verify-opentidal/SKILL.md` for the full harness.
 
+## Live mode
+
+The real Tidal client is opt-in. Run with a registered app's credentials:
+
+```sh
+OPENTIDAL_LIVE=1 \
+TIDAL_CLIENT_ID=... \
+TIDAL_CLIENT_SECRET=... \
+TIDAL_REDIRECT_URI=http://127.0.0.1:8080/callback \
+TIDAL_SCOPE=collection.read \
+cargo run
+```
+
+Sign in from Settings → Account. The browser opens the Tidal login, the app
+reads the callback on the redirect port, and the refresh token lands in the
+macOS keychain. Keep the credentials out of the repo; they are env only.
+
 ## Structure
 
 `src/state.rs` owns the `Route` model, the navigation stack, and the state
@@ -64,3 +88,9 @@ edit buffers (search and rename), which keeps the proof bounded.
 
 `src/screens.rs` builds every screen from shared card, shelf, grid, and track
 row helpers, reading and mutating real state.
+
+`src/tidal.rs` is the `MusicService` port: the remote `User` type, a
+deterministic `FakeService`, and a thin blocking `reqwest` `HttpService`.
+
+`src/auth.rs` is the OAuth authorization-code flow with PKCE, the auth state
+machine, and the token store (macOS keychain).

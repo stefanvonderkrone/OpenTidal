@@ -3,10 +3,12 @@
 //! `cargo run -- --snap out.png --scene default` renders headless.
 
 mod app;
+mod auth;
 mod catalog;
 mod library;
 mod screens;
 mod state;
+mod tidal;
 
 use rune::tok::{self, radius, space, type_};
 use rune::{AppSpec, Color, Cx, El, Icon, Key, ScrollSpec, col, el, icon, row, text};
@@ -25,11 +27,17 @@ const HEART: Icon = Icon { name: "heart", view: 24.0, body: "<path d=\"M12 21s-6
 
 type Scene = (&'static str, fn(&mut App));
 
-const SCENES: [Scene; 4] = [
+const SCENES: [Scene; 5] = [
     ("default", |_| {}),
     ("accent-blue", |a| a.core.accent = 0),
     ("accent-pink", |a| a.core.accent = 2),
     ("paused", |a| a.core.playing = false),
+    ("signed-in", |a| {
+        a.auth = auth::Auth::SignedIn {
+            token: auth::Token { access_token: "fake".to_string(), refresh_token: "fake".to_string(), expires_in: 0 },
+            name: "Fake User".to_string(),
+        };
+    }),
 ];
 
 fn view(app: &App, _cx: &mut Cx<App>) -> El {
@@ -44,7 +52,7 @@ fn view(app: &App, _cx: &mut Cx<App>) -> El {
         .fill(t.bg)
         .child(
             row().key("body").grow(1.0).min_h(0.0)
-                .child(sidebar(s, t, accent))
+                .child(sidebar(app, t, accent))
                 .child(main_col(app, t, accent)),
         )
         .child(now_playing(s, t, accent))
@@ -74,7 +82,8 @@ fn nav_item(route: Route, selected: bool, t: tok::Theme, accent: Color) -> El {
         )
 }
 
-fn sidebar(s: &State, t: tok::Theme, accent: Color) -> El {
+fn sidebar(app: &App, t: tok::Theme, accent: Color) -> El {
+    let s = &app.core;
     let sidebar = col().key("sidebar")
         .w(if s.collapsed { 64.0 } else { 240.0 })
         .h_full()
@@ -113,7 +122,8 @@ fn sidebar(s: &State, t: tok::Theme, accent: Color) -> El {
         }
     }
 
-    let user = text(&s.lib.name)
+    let name = app.auth.name().map(str::to_string).unwrap_or_else(|| s.lib.name.clone());
+    let user = text(&name)
         .key("user-name")
         .font(type_::LABEL)
         .color(t.text_secondary)
@@ -331,6 +341,8 @@ fn volume(t: tok::Theme, accent: Color) -> El {
 fn main() {
     rune::run(AppSpec::<App> {
         scenes: &SCENES,
+        setup: Some(|app, waker| app.setup(waker)),
+        poll: Some(|app, _t, _tx| app.drain()),
         on_key: Some(|app, ev, _tx| {
             if let Key::Text(k) = &ev.key {
                 return state::handle_key(&mut app.core, k.as_str());

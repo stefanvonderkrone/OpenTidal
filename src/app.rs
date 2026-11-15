@@ -173,7 +173,9 @@ fn resolve_user(
     store: &Arc<dyn TokenStore>,
     token: Token,
 ) -> Result<(Token, User), String> {
-    let token = if auth::token_expired(&token) {
+    let expired = auth::token_expired(&token);
+    eprintln!("opentidal: resolve_user expired={expired}");
+    let token = if expired {
         refresh(config, store, &token)?
     } else {
         token

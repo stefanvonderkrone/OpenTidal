@@ -93,7 +93,11 @@ impl App {
         let Some(path) = db_path() else {
             return;
         };
-        let db = match Store::open(&path) {
+        self.open_library(user_id, &path);
+    }
+    /// The testable half of [`App::restore_library`], with the path supplied.
+    fn open_library(&mut self, user_id: &str, path: &std::path::Path) {
+        let db = match Store::open(path) {
             Ok(db) => db,
             Err(error) => {
                 eprintln!("opentidal: cannot open {}: {error:?}", path.display());
@@ -408,5 +412,121 @@ fn keychain_store() -> Arc<dyn TokenStore> {
     #[cfg(not(target_os = "macos"))]
     {
         Arc::new(auth::MemoryStore::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::TrackId;
+
+    fn db_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("opentidal-app-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// An app with the user id a live session would carry, so a save has a key.
+    fn signed_in(user_id: &str) -> App {
+        App { user_id: Some(user_id.to_string()), ..Default::default() }
+    }
+
+    /// A library written by one run is the library the next run shows, with no
+    /// network step in between.
+    #[test]
+    fn a_restart_shows_the_saved_library() {
+        let dir = db_dir("restart");
+        let path = dir.join("opentidal.db");
+
+        let mut first = signed_in("173210380");
+        first.open_library("173210380", &path);
+        first.core.lib.set_name("Ada".to_string());
+        let id = first.core.lib.create_playlist("Road trip".to_string()).unwrap();
+        first.core.lib.add_track(id, TrackId(3));
+        first.flush_library();
+
+        let mut second = App::default();
+        second.open_library("173210380", &path);
+        assert_eq!(second.core.lib.name, "Ada");
+        assert_eq!(second.core.lib.playlist(id).unwrap().name, "Road trip");
+        assert_eq!(second.core.lib.playlist(id).unwrap().tracks, vec![TrackId(3)]);
+        assert!(second.db.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unreadable file leaves the session without a writable database, so
+    /// the next save cannot replace a library the app failed to read.
+    #[test]
+    fn a_broken_file_is_never_overwritten() {
+        let dir = db_dir("broken");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("opentidal.db");
+        std::fs::write(&path, b"not a database").unwrap();
+
+        let mut app = App::default();
+        app.open_library("173210380", &path);
+        assert!(app.db.is_none(), "a broken database was opened for writing");
+
+        app.core.lib.set_name("Ada".to_string());
+        app.flush_library();
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a database");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A library that cannot be loaded leaves the database closed for writing,
+    /// and the file keeps its bytes. A save over it would destroy the rows the
+    /// app failed to read.
+    #[test]
+    fn an_unreadable_library_is_never_overwritten() {
+        let dir = db_dir("unreadable");
+        let path = dir.join("opentidal.db");
+
+        let mut seeded = signed_in("173210380");
+        seeded.open_library("173210380", &path);
+        seeded.core.lib.set_name("Ada".to_string());
+        seeded.core.lib.toggle_like(TrackId(0));
+        seeded.flush_library();
+        drop(seeded);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE \"like\" SET track_id = 999 WHERE user_id = '173210380'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut app = App::default();
+        app.open_library("173210380", &path);
+        assert!(app.db.is_none(), "an unreadable library was opened for writing");
+
+        let before = std::fs::read(&path).unwrap();
+        app.core.lib.set_name("Changed".to_string());
+        app.flush_library();
+        assert_eq!(std::fs::read(&path).unwrap(), before, "the file was rewritten");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fake token carries no `uid` claim, so the headless build never
+    /// touches a database file.
+    #[test]
+    fn the_fake_token_names_no_user() {
+        assert_eq!(session_user_id(&fake_token()), None);
+    }
+
+    /// The user id comes from the token claim, which is what keys the rows.
+    #[test]
+    fn the_user_id_comes_from_the_token() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"uid":173210380}"#);
+        let token = Token {
+            access_token: format!("h.{payload}.sig"),
+            refresh_token: "r".to_string(),
+            expires_in: 1,
+        };
+        assert_eq!(session_user_id(&token).as_deref(), Some("173210380"));
     }
 }

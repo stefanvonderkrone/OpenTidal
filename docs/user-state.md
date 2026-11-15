@@ -4,13 +4,8 @@ The signed-in user and their library survive a restart in one SQLite file.
 A fresh install has no session. Sign-in writes the token to the keychain and
 the user row to the file. A restart shows the name before any network call.
 
-Rule this design keeps: the keychain holds the secret and nothing else. The
-file holds no token, so a copy of the file grants no access to Tidal.
-
-## How to read this
-
-One section is one decision. Each section states the rule the code must obey
-and the evidence that checks it. Open questions sit at the end.
+The keychain holds the secret and nothing else. The file holds no token, so a
+copy of the file grants no access to Tidal.
 
 ## Key
 
@@ -26,10 +21,10 @@ let uid = decode_claims(&token.access_token)?.user_id()?;
 The key needs no hash and no network call. It does not change on refresh, so
 a refresh never touches the file.
 
-Rejected: a hash of the access token. The access token rotates on every
+A hash of the access token does not work. The access token rotates on every
 refresh, so the key would move and every refresh would have to move the user
 row. A crash between the keychain write and the row move loses the user. The
-hash also buys no security, because the token it hashes already sits in the
+hash also gives no security, because the token it hashes already sits in the
 keychain.
 
 ## Store
@@ -153,13 +148,18 @@ deletes them. It obeys three rules.
    a no-op.
 2. Delete only after a complete read. The sync carries a `complete` flag, set
    when the last page arrives. No delete pass runs on a partial read.
-3. Guard the delete pass. A server fault that returns an empty collection must
-   not wipe the library. A pass that would remove more than ten percent of a
-   table is refused and logged.
+3. Delete only from the tables Tidal owns. Those are `like`, `save`, `follow`,
+   `playlist`, `playlist_track`, `collection`, and `collection_playlist`. The
+   `download` and `history` tables are local, so the sync never deletes a row
+   there.
+
+Rule 3 removes the need for a size guard. A wrong delete from a mirrored table
+costs one sync, because the server returns the row again. The two tables where
+a wrong delete would lose real work are the two the sync cannot touch.
 
 The offline window is the one cost. A broken leaf stays missing until the
-first sync after the network returns. That is what a mirror means: the local
-copy is as good as the last successful read.
+first sync after the network returns. The local copy is as good as the last
+successful read.
 
 The delete pass runs through the state operations, never through the store
 directly. `Route::UserPlaylist` holds a slot, so a playlist that a route names
@@ -195,7 +195,7 @@ deliberate: the `user_id` column costs nothing now and the door stays open.
 - The token decides the active user. Never query without a `user_id`.
 - Rows for another account stay on disk and are inert. They come back on the
   next sign-in with that account.
-- Settings > Account needs a **remove account data** action. A second person's
+- Settings > Account needs a `remove account data` action. A second person's
   listening history on this machine must be deletable.
 
 ## Evidence
@@ -207,7 +207,7 @@ deliberate: the `user_id` column costs nothing now and the door stays open.
 | A broken leaf does not stop a start | Seed a row with an unknown track id, assert the app opens and the row is gone |
 | A partial sync loses nothing | Fail the read after page 2, assert every row still present |
 | A partial sync deletes nothing | Same test, assert the delete pass did not run |
-| An empty read does not wipe the library | Return zero items with `complete` set, assert the pass is refused |
+| The sync never touches local tables | Seed a `download` and a `history` row, run a sync, assert both rows remain |
 | No data loss at sign-in | Kill matrix: exit between the row write and the keychain write, and the reverse |
 | Start needs no network | Run with the network off, name and playlist visible |
 | A library screen needs no network | Open Liked Songs offline, assert the disk rows paint and no spinner shows |
@@ -228,7 +228,3 @@ Read against a real account on 2026-11-15.
   down the refresh path, so the refresh is testable without the wait.
 - After sign-out the keychain holds the `signed-out` sentinel, and a start reads
   it as no token.
-
-## Open questions
-
-1. Is ten percent the right guard on the delete pass?

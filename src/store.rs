@@ -466,9 +466,12 @@ mod tests {
     }
 
     /// A temporary directory that removes itself, so a failing test leaves no
-    /// database behind.
+    /// database behind. Only the macOS test uses it, so on another platform it is
+    /// dead code, which clippy rejects under `-D warnings`.
+    #[cfg(target_os = "macos")]
     struct TempDirGuard(std::path::PathBuf);
 
+    #[cfg(target_os = "macos")]
     impl Drop for TempDirGuard {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);

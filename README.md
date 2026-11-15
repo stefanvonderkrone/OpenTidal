@@ -40,6 +40,11 @@ command that gates a commit:
 scripts/preflight.sh              # tests, clippy, the repo rules
 ```
 
+That same script runs in CI. `.github/workflows/preflight.yml` calls it on every
+pull request and on every push to `main`, on a macOS runner, because the keychain
+and Time Machine paths only compile there. A command added to the script needs no
+workflow edit.
+
 ```sh
 cargo test                       # the invariant proofs and the store tests
 scripts/control-opentidal doctor # one readiness check

@@ -19,6 +19,7 @@ on this crate with warnings as errors, and checks the rules marked below.
 | One name per thing. `Store::write` writes the library, **save** means an album, the keychain is `tokens`. | `GLOSSARY.md`, and review. A second meaning has been introduced twice. |
 | A test named in the evidence table must exist. | `scripts/preflight.sh` runs `scripts/evidence-status.py`, which fails on a name with no test. |
 | A session that can write holds one `OpenLibrary`, never a loose id beside a handle. | The type. `open_library` is the only constructor. |
+| The gate that guards a commit also guards the push. Never copy its commands into a workflow. | `.github/workflows/preflight.yml` runs `scripts/preflight.sh` on every pull request and on every push to `main`, so a command added to the script runs in CI with no other edit. |
 
 ## Not yet enforced
 
@@ -27,8 +28,9 @@ These are judgment calls. They are here so the next agent knows the intent.
 - **One idea per sentence in prose, no em dashes.** No linter runs over the
   markdown yet.
 - **A commit subject in sentence case, imperative mood.** No commit-msg hook
-  yet. A hook would need `core.hooksPath` set, and that is a per-clone step, so
-  a CI check on the PR is the better gate once CI exists.
+  yet. A hook would need `core.hooksPath` set, and that is a per-clone step.
+  `.github/workflows/preflight.yml` runs the tests and the rules on every pull
+  request, but it does not read commit subjects, so this one is still review only.
 - **No `unwrap()` outside tests.** `clippy` does not check this by default.
   Adding `clippy::unwrap_used` to the preflight would enforce it, but the
   existing tests would need auditing first.

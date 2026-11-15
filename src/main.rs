@@ -34,9 +34,9 @@ const SCENES: [Scene; 5] = [
     ("accent-pink", |a| a.core.accent = 2),
     ("paused", |a| a.core.playing = false),
     ("signed-in", |a| {
+        a.core.lib.set_name("Fake User".to_string());
         a.auth = auth::Auth::SignedIn {
             token: auth::Token { access_token: "fake".to_string(), refresh_token: "fake".to_string(), expires_in: 0 },
-            name: "Fake User".to_string(),
         };
     }),
 ];
@@ -123,7 +123,7 @@ fn sidebar(app: &App, t: tok::Theme, accent: Color) -> El {
         }
     }
 
-    let name = app.auth.name().map(str::to_string).unwrap_or_else(|| s.lib.name.clone());
+    let name = s.lib.name.clone();
     let user = text(&name)
         .key("user-name")
         .font(type_::LABEL)

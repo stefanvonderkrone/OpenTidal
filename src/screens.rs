@@ -618,10 +618,11 @@ pub fn settings_page(p: SettingsPage, app: &App, t: tok::Theme) -> El {
 
 fn account_page(app: &App, t: tok::Theme) -> El {
     match &app.auth {
-        crate::auth::Auth::SignedIn { name, .. } => {
+        crate::auth::Auth::SignedIn { .. } => {
+            let name = app.core.lib.name.clone();
             page("Account", "Your profile", t,
                 col().gap(space::S3)
-                    .child(settings_row("acct-name".into(), "Name", name, t))
+                    .child(settings_row("acct-name".into(), "Name", &name, t))
                     .child(sign_out_button(t)))
         }
         crate::auth::Auth::Authorizing { .. } => {

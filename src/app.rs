@@ -12,7 +12,9 @@ use std::sync::Arc;
 use rune::{Latest, TextEdit, Waker};
 use serde::Deserialize;
 use crate::auth::{self, Auth, OAuthConfig, Token, TokenStore};
+use crate::library::Library;
 use crate::state::State;
+use crate::store::Store;
 use crate::tidal::{self, MusicService, ServiceError, User};
 
 pub struct App {
@@ -24,6 +26,15 @@ pub struct App {
     pub service: Arc<dyn MusicService>,
     pub oauth: OAuthConfig,
     pub store: Arc<dyn TokenStore>,
+    /// The library database, open only while the token names a user. The
+    /// deterministic fake signs in with a token that is not a JWT, so no user
+    /// id is known and nothing is written in the headless build.
+    pub db: Option<Store>,
+    /// The user id from the token's `uid` claim, when a session is established.
+    pub user_id: Option<String>,
+    /// The library as last written to disk, so a frame can tell whether the
+    /// in-memory library changed.
+    saved: Library,
     /// Whether the live client is on, from `OPENTIDAL_LIVE` or the config file.
     pub live: bool,
     /// A counter bumped on sign-out and new sign-ins. In-flight profile results
@@ -64,8 +75,63 @@ impl App {
             && let Some(token) = self.store.load()
         {
             eprintln!("opentidal: restoring a stored session");
-            self.auth = Auth::SignedIn { token: token.clone(), name: String::new() };
+            self.user_id = session_user_id(&token);
+            if let Some(user_id) = self.user_id.clone() {
+                self.restore_library(&user_id);
+            }
+            self.auth = Auth::SignedIn { token: token.clone() };
             self.fetch_profile(token);
+        }
+    }
+
+    /// Open the database and load this user's library into the core state. The
+    /// library stays as it is, and the store stays closed for writing, when the
+    /// file cannot be read. Overwriting an unreadable library with the default
+    /// would destroy it, and the next sync is the only thing that can rebuild
+    /// it.
+    fn restore_library(&mut self, user_id: &str) {
+        let Some(path) = db_path() else {
+            return;
+        };
+        let db = match Store::open(&path) {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!("opentidal: cannot open {}: {error:?}", path.display());
+                return;
+            }
+        };
+        match db.load(user_id) {
+            Ok(Some(lib)) => {
+                self.core.lib = lib;
+                self.saved = self.core.lib.clone();
+                self.db = Some(db);
+            }
+            Ok(None) => {
+                self.saved = self.core.lib.clone();
+                self.db = Some(db);
+            }
+            Err(error) => {
+                eprintln!("opentidal: cannot load the library, leaving it unwritten: {error:?}");
+            }
+        }
+    }
+
+    /// Write the library when it differs from what is on disk. One comparison
+    /// covers every operation in the UI, so a new screen action needs no
+    /// persistence call of its own.
+    fn flush_library(&mut self) {
+        if self.core.lib == self.saved {
+            return;
+        }
+        let Some(user_id) = self.user_id.clone() else {
+            return;
+        };
+        let Some(db) = self.db.as_mut() else {
+            return;
+        };
+        match db.save(&user_id, &self.core.lib) {
+            Ok(()) => self.saved = self.core.lib.clone(),
+            Err(error) => eprintln!("opentidal: cannot save the library: {error:?}"),
         }
     }
 
@@ -75,7 +141,8 @@ impl App {
     /// redirect never reaches an unopened port.
     pub fn start_sign_in(&mut self) {
         if !self.live {
-            self.auth = Auth::SignedIn { token: fake_token(), name: "Fake User".to_string() };
+            self.core.lib.set_name("Fake User".to_string());
+            self.auth = Auth::SignedIn { token: fake_token() };
             return;
         }
         let (url, verifier, state) = auth::begin(&self.oauth);
@@ -133,7 +200,11 @@ impl App {
             match result {
                 Ok(token) => {
                     self.store.save(&token);
-                    self.auth = Auth::SignedIn { token: token.clone(), name: String::new() };
+                    self.user_id = session_user_id(&token);
+                    if let Some(user_id) = self.user_id.clone() {
+                        self.restore_library(&user_id);
+                    }
+                    self.auth = Auth::SignedIn { token: token.clone() };
                     self.fetch_profile(token);
                 }
                 Err(message) => self.auth = Auth::Failed { message },
@@ -146,10 +217,10 @@ impl App {
             match result {
                 Ok((token, user)) => {
                     self.store.save(&token);
-                    if let Auth::SignedIn { name, token: held, .. } = &mut self.auth {
+                    if let Auth::SignedIn { token: held } = &mut self.auth {
                         *held = token;
-                        *name = user.name;
                     }
+                    self.core.lib.set_name(user.name);
                 }
                 Err(e) => {
                     if matches!(&e, ServiceError::InvalidGrant(_)) {
@@ -159,6 +230,7 @@ impl App {
                 }
             }
         }
+        self.flush_library();
         changed
     }
 
@@ -251,12 +323,28 @@ impl Default for App {
             service,
             oauth,
             store,
+            db: None,
+            user_id: None,
+            saved: Library::default(),
             live,
             session: 0,
             auth_flow: Latest::default(),
             profile: Latest::default(),
         }
     }
+}
+
+/// The Tidal user id from a token's `uid` claim, or `None` when the token is
+/// not a JWT. The deterministic fake token has no claim, so the headless build
+/// never touches the database.
+fn session_user_id(token: &Token) -> Option<String> {
+    auth::decode_claims(&token.access_token)?.user_id()
+}
+
+/// The library database path, beside the config file, so the app owns one
+/// directory per user.
+fn db_path() -> Option<std::path::PathBuf> {
+    Some(config_path()?.with_file_name("opentidal.db"))
 }
 
 /// An env var, or the matching field of the config file when the var is unset.

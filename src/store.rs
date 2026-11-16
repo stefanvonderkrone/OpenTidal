@@ -67,9 +67,50 @@ impl Store {
             .mode(0o600)
             .open(path)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        exclude_from_backup(path)?;
         let conn = Connection::open(path)?;
+        // Exclusive first, then WAL. Set the other way round, the `journal_mode` pragma
+        // is the statement that blocks, and it reports "database is locked" from inside
+        // the open rather than the clear message below.
+        //
+        // Not in tests: `locking_mode` is a property of the file, so a second open in
+        // the same process waits even without the hold below. A test reopens the same
+        // file to stand in for a restart, and refusing that would make every restart
+        // test a test of the lock.
+        // The debug binary and the release build are real apps, so the lock applies
+        // there. `cfg!(test)` is true only inside `cargo test`, which is the one build
+        // that reopens a file to stand in for a restart.
+        let testing = cfg!(test);
+        if !testing {
+            conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+        } else {
+            // A test that reopens the same file must not hang on the default timeout
+            // while it waits for a lock that never comes.
+            conn.busy_timeout(std::time::Duration::from_millis(200))?;
+        }
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // One writer per database for the life of the process.
+        //
+        // `write` replaces every row for an account, so two instances would take turns
+        // overwriting each other: the second one's playlist vanishes when the first
+        // writes its own view, and both writes report success. A revision check would
+        // notice that after the fact; this refuses the second instance outright, which
+        // is the only answer that cannot lose an edit.
+        //
+        // `locking_mode=EXCLUSIVE` stops SQLite taking shared locks, so the write lock
+        // is held until the connection closes. It must be set before the hold, because
+        // changing it later does not release a lock already taken.
+        // Take it now, so a second instance fails at open rather than at its first
+        // write, when the user has already made edits it would lose.
+        if !testing {
+            conn.execute_batch("BEGIN EXCLUSIVE; COMMIT;").map_err(|e| {
+                StoreError::Io(format!(
+                    "another OpenTidal has this library open, so this one must not write it: {e}"
+                ))
+            })?;
+        }
+        // After the pragma, because WAL mode is what creates the `-wal` and `-shm`
+        // sidecars, and `xattr` cannot mark a file that does not exist yet.
+        exclude_from_backup(path)?;
         Self::configure(conn)
     }
 
@@ -159,8 +200,15 @@ impl Store {
             collections: Vec::new(),
         };
         {
+            // The valid range is filtered before the limit, not after. An invalid slot
+            // arriving first would otherwise take one of the limited rows, and a valid
+            // playlist past the limit would be dropped here and deleted by the next
+            // write. The `index` check below stays, for the value the database holds
+            // that this filter cannot express.
             let mut stmt = tx.prepare(
-                "SELECT slot, name FROM playlist WHERE user_id = ?1 ORDER BY slot LIMIT ?2",
+                "SELECT slot, name FROM playlist
+                 WHERE user_id = ?1 AND slot >= 0 AND slot < ?2
+                 ORDER BY slot LIMIT ?2",
             )?;
             let mut rows = stmt.query(params![user_id, MAX_PLAYLISTS as i64])?;
             while let Some(row) = rows.next()? {
@@ -205,7 +253,15 @@ impl Store {
         }
         {
             let mut stmt = tx.prepare(
-                "SELECT idx, name FROM collection WHERE user_id = ?1 ORDER BY idx LIMIT ?2",
+                // A negative index is filtered before the limit, not after: it sorts
+                // first, would take one of the limited rows, and a valid collection past
+                // the limit would be dropped here and deleted by the next write.
+                //
+                // Only the sign is filtered. The index is not bounded by the count: it is
+                // what a child row names, so a gap must not shift it.
+                "SELECT idx, name FROM collection
+                 WHERE user_id = ?1 AND idx >= 0
+                 ORDER BY idx LIMIT ?2",
             )?;
             let mut rows = stmt.query(params![user_id, MAX_COLLECTIONS as i64])?;
             while let Some(row) = rows.next()? {
@@ -253,11 +309,23 @@ impl Store {
             }
         }
         {
+            // No `LIMIT`, because the cap counts entries the loader accepted, not rows
+            // it read. A row that names nothing, or repeats one, is dropped here, so a
+            // limit on rows would hide a valid entry past it and the next write would
+            // delete that entry. Reading stops as soon as the cap is reached, so the
+            // work is bounded by the number of stored rows either way.
             let mut stmt = tx.prepare(
-                "SELECT track_id FROM history WHERE user_id = ?1 ORDER BY position LIMIT ?2",
+                "SELECT track_id FROM history WHERE user_id = ?1 ORDER BY position",
             )?;
-            let mut rows = stmt.query(params![user_id, HISTORY_CAP as i64])?;
+            let mut rows = stmt.query([user_id])?;
+            let mut past_the_cap = 0usize;
             while let Some(row) = rows.next()? {
+                if lib.history.len() >= HISTORY_CAP {
+                    // Every row past the cap is one the loader will not keep, whether or
+                    // not it is valid. Counted here, so the number matches the rows.
+                    past_the_cap += 1;
+                    continue;
+                }
                 let Ok(track) = index(row.get(0)?, catalog::TRACKS.len()) else {
                     dropped += 1;
                     continue;
@@ -269,7 +337,7 @@ impl Store {
                 }
                 lib.history.push(track);
             }
-            dropped += count_beyond(&tx, "history", user_id, HISTORY_CAP)?;
+            dropped += past_the_cap;
         }
         tx.commit()?;
         // The boundary has already dropped every row that could break this. A
@@ -351,6 +419,36 @@ impl Store {
         Ok(())
     }
 
+    /// Make every write fail from now on, so a test can stand where a full disk
+    /// leaves the app: the handle is open and the write is refused.
+    /// Drop the trigger `abort_writes_for_test` added, so a test can let the
+    /// writes through again and watch the retry land.
+    #[cfg(test)]
+    pub fn allow_writes_again_for_test(&self) {
+        self.conn.execute_batch("DROP TRIGGER IF EXISTS abort_user;").unwrap();
+    }
+
+    /// Take the writer lock that `open` takes outside tests, so a test can prove a
+    /// second instance is refused. The lock is the real one; only its timing differs,
+    /// because `open` skips it in a test build for the restart tests.
+    #[cfg(test)]
+    pub fn take_writer_lock(&self) -> Result<(), StoreError> {
+        self.conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+        self.conn
+            .execute_batch("BEGIN EXCLUSIVE; COMMIT;")
+            .map_err(|e| StoreError::Io(format!("another writer holds the library: {e}")))
+    }
+
+    #[cfg(test)]
+    pub fn abort_writes_for_test(&self) {
+        self.conn
+            .execute_batch(
+                "CREATE TRIGGER abort_user BEFORE INSERT ON user
+                 BEGIN SELECT RAISE(ABORT, 'test: writes are failing'); END;",
+            )
+            .unwrap();
+    }
+
     /// The schema version this build writes.
     #[cfg(test)]
     pub fn schema_version(&self) -> Result<u32, StoreError> {
@@ -364,29 +462,58 @@ impl Store {
 /// Tidal, and the file holds a name and a listening history, so a backup copies
 /// a privacy risk for no gain.
 ///
-/// This excludes the directory, not the file. In WAL mode SQLite keeps recent
-/// rows in `opentidal.db-wal`, and an exclusion on the database alone would leave
-/// them in the backup. It sets the extended attribute `tmutil addexclusion` sets,
-/// rather than running `tmutil`, which takes eleven seconds here and this runs on
-/// the startup path.
+/// In WAL mode recent rows live in `opentidal.db-wal`, which SQLite creates during
+/// a write and deletes on the last close. A file that does not exist cannot carry
+/// a flag, so the flag goes on the directory the app owns, and Apple skips an
+/// excluded folder with everything in it.
+///
+/// Only the app's own directory. `OPENTIDAL_DB` can point at a file in a shared
+/// directory, and excluding that folder would drop unrelated files from the
+/// backup, so there the database file alone is excluded.
+///
+/// This sets the extended attribute `tmutil addexclusion` sets, rather than
+/// running `tmutil`, which takes eleven seconds here and this runs on the
+/// startup path.
 #[cfg(target_os = "macos")]
 fn exclude_from_backup(path: &Path) -> Result<(), StoreError> {
-    let Some(dir) = path.parent() else { return Ok(()) };
+    let target = match path.parent() {
+        Some(dir) if is_app_directory(dir) => dir.to_owned(),
+        _ => path.to_owned(),
+    };
     let _ = std::process::Command::new("xattr")
         .args([
             "-w",
             "com.apple.metadata:com_apple_backup_excludeItem",
             "com.apple.backupd",
-            &dir.to_string_lossy(),
+            &target.to_string_lossy(),
         ])
         .status();
     // A sandbox that hides `xattr` must not stop the app opening its database.
     Ok(())
 }
 
+/// Nothing to exclude on a platform without Time Machine. The call site in
+/// `Store::open` is unconditional, so this must exist for every target or the
+/// crate fails to build off macOS.
 #[cfg(not(target_os = "macos"))]
 fn exclude_from_backup(_path: &Path) -> Result<(), StoreError> {
     Ok(())
+}
+
+/// Whether this is the directory the app keeps its own files in, so excluding the
+/// whole folder touches nothing another program wrote.
+#[cfg(target_os = "macos")]
+pub(crate) fn is_app_directory(dir: &Path) -> bool {
+    // The directory has to end the way this app's own directory ends, not merely be
+    // named `OpenTidal`. Without the parent, excluding a directory by name would leave
+    // every file in another program's `Application Support/OpenTidal` out of the
+    // backup too. The suffix comes from the real path function, so moving the app's
+    // files fails the test that checks this, rather than silently stopping the
+    // exclusion.
+    let Some(suffix) = crate::app::app_directory_suffix() else {
+        return false;
+    };
+    dir.ends_with(&suffix)
 }
 
 /// A catalogue index, rejected when it names nothing the catalogue ships.
@@ -445,33 +572,94 @@ mod tests {
     fn the_database_is_excluded_from_backups() {
         let dir = std::env::temp_dir().join(format!("opentidal-backup-{}", std::process::id()));
         let guard = TempDirGuard(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file the app does not own, in the directory it writes to. This is what
+        // `OPENTIDAL_DB` pointing at a shared directory looks like, and it must
+        // stay in the backup.
+        let neighbour = dir.join("notes.txt");
+        std::fs::write(&neighbour, "keep me").unwrap();
         let path = dir.join("opentidal.db");
-        Store::open(&path).unwrap();
+        let store = Store::open(&path).unwrap();
 
-        // The directory is what is excluded, so the WAL and SHM files beside the
-        // database stay out of the backup too.
+        let excluded = |p: &std::path::Path| {
+            let out = std::process::Command::new("xattr")
+                .args(["-p", "com.apple.metadata:com_apple_backup_excludeItem", &p.to_string_lossy()])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).contains("com.apple.backupd")
+        };
+
+        // A temp directory is not the app's own, so only the file is excluded.
+        assert!(excluded(&path), "the database is not excluded from backups");
+        assert!(
+            !excluded(&neighbour),
+            "an unrelated file in the same directory was dropped from backups"
+        );
+        assert!(
+            !excluded(&dir),
+            "a shared directory was excluded, which drops every neighbour from the backup"
+        );
+        drop(store);
+        drop(guard);
+    }
+
+    /// The app's own directory is excluded, so the `-wal` file and the rest of the
+    /// app's rows stay out of a backup even though SQLite creates `-wal` only
+    /// during a write, long after this flag is set.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_apps_own_directory_is_excluded_from_backups() {
+        let dir = std::env::temp_dir().join(format!("opentidal-owned-{}", std::process::id()));
+        let guard = TempDirGuard(dir.clone());
+        let owned = dir.join("Library").join("Application Support").join("OpenTidal");
+        std::fs::create_dir_all(&owned).unwrap();
+        let path = owned.join("opentidal.db");
+        let store = Store::open(&path).unwrap();
+
         let out = std::process::Command::new("xattr")
-            .args([
-                "-p",
-                "com.apple.metadata:com_apple_backup_excludeItem",
-                &dir.to_string_lossy(),
-            ])
+            .args(["-p", "com.apple.metadata:com_apple_backup_excludeItem", &owned.to_string_lossy()])
             .output()
             .unwrap();
         assert!(
             String::from_utf8_lossy(&out.stdout).contains("com.apple.backupd"),
-            "the database directory is not excluded from backups"
+            "the app's own directory is not excluded, so the -wal file would be backed up"
         );
+        drop(store);
         drop(guard);
     }
 
+    /// The lock itself, with the statements `open` runs outside a test build. `open`
+    /// skips them in `cargo test`, because the restart tests reopen one file and a lock
+    /// would read as a bug in the restart. So the lock is proved here, on the real
+    /// pragma and the real `BEGIN EXCLUSIVE`, rather than only by hand.
+    #[test]
+    fn a_second_connection_is_refused_the_library() {
+        let dir = TempDirGuard(std::env::temp_dir().join(format!(
+            "opentidal-lock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("lib.db");
+        let first = Store::open(&path).unwrap();
+        first.take_writer_lock().unwrap();
+
+        // `locking_mode` is a property of the file, so a second connection to the same
+        // file cannot take the write lock while the first holds it.
+        let second = rusqlite::Connection::open(&path).unwrap();
+        second.busy_timeout(std::time::Duration::from_millis(100)).unwrap();
+        let took = second.execute_batch("BEGIN EXCLUSIVE; COMMIT;");
+        assert!(
+            took.is_err(),
+            "a second connection took the write lock while the first held it, so two instances would replace each other's rows"
+        );
+    }
+
     /// A temporary directory that removes itself, so a failing test leaves no
-    /// database behind. Only the macOS test uses it, so on another platform it is
-    /// dead code, which clippy rejects under `-D warnings`.
-    #[cfg(target_os = "macos")]
+    /// database behind. The lock test uses it on every platform, because the writer
+    /// lock is not a macOS-only behaviour.
     struct TempDirGuard(std::path::PathBuf);
 
-    #[cfg(target_os = "macos")]
     impl Drop for TempDirGuard {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
@@ -524,6 +712,93 @@ mod tests {
         let loaded = loaded_lib(&store, "a").unwrap();
         assert_eq!(loaded, lib);
         assert_eq!(loaded.check(), Ok(()));
+    }
+
+    /// A row with an invalid slot must not consume one of the limited rows. With
+    /// `MAX_PLAYLISTS` at 2, slots -1, 0 and 1 arrive ordered as -1, 0, 1, so a limit
+    /// applied before the check reads -1 and 0, drops -1, and loses valid playlist 1
+    /// with its tracks. The next write then deletes that playlist from disk.
+    #[test]
+    fn an_invalid_slot_does_not_hide_a_valid_one() {
+        let store = Store::in_memory().unwrap();
+        store.conn.execute(
+            "INSERT INTO user(id, name, updated_at) VALUES ('u', 'U', 0)",
+            [],
+        ).unwrap();
+        // Every slot the limit could reach, including an invalid one first.
+        for slot in -1..=(MAX_PLAYLISTS as i64) {
+            store.conn.execute(
+                "INSERT INTO playlist(user_id, slot, name) VALUES ('u', ?1, ?2)",
+                params![slot, format!("p{slot}")],
+            ).unwrap();
+        }
+        let loaded = store.load("u").unwrap().unwrap();
+        assert_eq!(
+            loaded.lib.playlists.iter().flatten().count(),
+            MAX_PLAYLISTS,
+            "an invalid slot used up one of the limited rows"
+        );
+        for (slot, playlist) in loaded.lib.playlists.iter().enumerate() {
+            assert!(
+                playlist.is_some(),
+                "slot {slot} was lost, and the next write would delete it from disk"
+            );
+        }
+    }
+
+    /// History has the same shape as the other two limited queries after all. The limit
+    /// is rows read, and a row that names nothing is dropped after it, so an invalid row
+    /// inside the limit hides a valid one past it, and the next write deletes that entry.
+    ///
+    /// The first version of this test used a duplicate as the second row, and a
+    /// duplicate hides nothing: it reads two rows, one valid, and both assertions hold.
+    /// It has to be an invalid row followed by distinct valid ones.
+    #[test]
+    fn an_unknown_history_row_does_not_hide_a_valid_one() {
+        let store = Store::in_memory().unwrap();
+        store.conn.execute(
+            "INSERT INTO user(id, name, updated_at) VALUES ('u', 'U', 0)",
+            [],
+        ).unwrap();
+        // Row 0 names nothing the catalogue has, so it is dropped after the limit; rows
+        // 1 and 2 are distinct and valid, and both must survive.
+        for (position, track) in [(0i64, 9_999i64), (1, 0), (2, 1)] {
+            store.conn.execute(
+                "INSERT INTO history(user_id, position, track_id) VALUES ('u', ?1, ?2)",
+                params![position, track],
+            ).unwrap();
+        }
+        let loaded = store.load("u").unwrap().unwrap();
+        assert_eq!(
+            loaded.lib.history,
+            vec![crate::catalog::TrackId(0), crate::catalog::TrackId(1)],
+            "an invalid row used up one of the limited history rows, so the last entry was lost"
+        );
+    }
+
+    /// The collection loader must not let an invalid index use up one of the limited
+    /// rows. It is the same mistake the playlist loader had: a `LIMIT` applied before
+    /// the index check reads a negative row first, drops it, and stops one short, so
+    /// the last valid collection is absent and the next write deletes it.
+    #[test]
+    fn an_invalid_collection_index_does_not_hide_a_valid_one() {
+        let store = Store::in_memory().unwrap();
+        store.conn.execute(
+            "INSERT INTO user(id, name, updated_at) VALUES ('u', 'U', 0)",
+            [],
+        ).unwrap();
+        for idx in -1..=(MAX_COLLECTIONS as i64) {
+            store.conn.execute(
+                "INSERT INTO collection(user_id, idx, name) VALUES ('u', ?1, ?2)",
+                params![idx, format!("c{idx}")],
+            ).unwrap();
+        }
+        let loaded = store.load("u").unwrap().unwrap();
+        assert_eq!(
+            loaded.lib.collections.len(),
+            MAX_COLLECTIONS,
+            "an invalid index used up one of the limited collection rows"
+        );
     }
 
     /// Interleaved round trips preserve each library in a deterministic random walk.

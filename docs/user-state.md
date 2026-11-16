@@ -39,8 +39,15 @@ directory.
 - Mode `0600`. The file holds a name and a listening history.
 - `PRAGMA user_version` carries the schema version. Every migration bumps it.
 - `PRAGMA foreign_keys = ON`, `journal_mode = WAL`, `synchronous = FULL`.
-- Add the file to the Time Machine exclusion list. The data comes back from
-  Tidal, so a backup copies a privacy risk for no gain.
+- Add the file to the Time Machine exclusion list. This is a tradeoff, not a
+  free choice. The likes, saves, follows and playlists come back from Tidal once
+  the sync exists, so a backup of them copies a privacy risk for no gain. Two
+  tables do not come back: `download` and `history` are local, and the sync never
+  writes them (see the sync section). Excluding the file means a disk loss takes
+  them with it, and nothing restores them. The exclusion is kept because the file
+  holds the name and the listening history together, and one flag cannot cover
+  part of a file. Splitting the local tables into a second file would be the way
+  to have both, and is not in this branch.
 
 ## Schema
 
@@ -110,17 +117,34 @@ The start path runs in this order. It never blocks on the network.
 The refresh in step 5 can fail. A `401` or `400` from the token endpoint means
 the refresh token is dead. Then sign out and keep the rows. A network error
 means the session is unknown. Stay signed in, retry on the next request, and
-do not clear anything.
+do not clear anything. The Account screen names the failed fetch beside the
+name it could not refresh, and the next fetch that lands clears it.
+
+The code follows this: `drain` ends the session only for `InvalidGrant`. Every
+other error, `Http` and `Decode` included, keeps `SignedIn`, because the disk
+already holds the name and the library and a sign-in button over a working
+session would drop them. A fresh token that the API rejects anyway is reported
+as a dead grant, so a session that cannot work ends instead of being retried
+forever.
+
+The retry is the next launch, not a background poll: nothing starts another
+fetch during a session. So the Account screen's offline message stays until the
+next start, which is the next thing that tries.
 
 ## Writes
 
 - Sign-in: write the keychain, then the `user` row. The code writes the token
   first, because the token is what makes a session real. A row without a token
   is inert, and a token without a row loads as a new account.
-- Sign-out: clear the keychain, then drop the in-memory library and close the
-  database. The rows stay on disk, so the same account finds them on its next
-  sign-in. A kept library in memory would show one account's data while another
-  is signed in.
+- Sign-out: write what is outstanding, then clear the keychain, then drop the
+  in-memory library and close the database. The rows stay on disk, so the same
+  account finds them on its next sign-in. A kept library in memory would show one
+  account's data while another is signed in.
+  When the write fails, sign-out does not happen. The session stays `SignedIn`,
+  the library stays in memory with its unwritten edits, and the Account screen
+  says why. Clearing the keychain there would drop the only copy of those edits.
+  `sign_out_keeps_unwritten_edits` holds this. A session with no open library
+  always signs out, because it has nowhere to write and nothing to lose.
 - Refresh: keychain only. No file write. This is the gain over a rotating key.
 - Profile fetch: update `user.name`.
 - Library change: one comparison per frame, not a write per operation. The app
@@ -134,16 +158,29 @@ do not clear anything.
 The only point where the two stores can disagree is sign-in, and a stale row
 there does nothing. A start with a row and no token reads as signed out.
 
+One instance owns a library. `Store::open` takes the write lock for the life of
+the handle, so a second copy of the app is refused the database rather than
+taking turns with the first. `write` replaces every row for an account, so
+without it the second instance's playlist would vanish under the first
+instance's next write, and both writes would report success. The second copy
+says the library could not be opened, and the Account screen shows that.
+
 ## The mirror rule
 
 While the app is read-only, the library is a mirror of Tidal, not a truth.
-Every row came from Tidal. Tidal still holds it. This settles recovery: a
-broken row needs no repair, because the next sync returns it.
+Every row came from Tidal. Tidal still holds it.
+
+**That recovery is planned, not built.** The sync is not in this branch: the
+catalogue it needs does not exist yet, and the evidence table marks every sync
+check `pending: sync PR`. So today a row dropped by `Store::load` stays gone
+until a sync exists. The rule below says what the drop does now and what the
+sync will make true later; do not read it as a working recovery path.
 
 Both paths treat a bad leaf the same way. `Store::load`, the sync, and any
 future reader drop the leaf that fails `Library::check` and log a count. The
-container stays visible with the leaves it has, and the next sync restores what
-went. Only a file that cannot be read at all is an error, and then the database
+container stays visible with the leaves it has. Once the sync exists it restores
+what went; until then the drop is final, which is why it is logged. Only a file
+that cannot be read at all is an error, and then the database
 stays closed for writing, so a save cannot overwrite what the app could not
 read.
 
@@ -227,14 +264,22 @@ deliberate: the `user_id` column costs nothing now and the door stays open.
 - The token decides the active user. Never query without a `user_id`.
 - Rows for another account stay on disk and are inert. They come back on the
   next sign-in with that account.
+- Opening a different account drops edits the last write could not land, and logs
+  it. Writing them under the new account would be the worse failure, and keeping
+  the old library on screen would show one person's rows to another.
+- Opening the account that is already open keeps them, because a re-sign-in with
+  a refreshed token is the common path and nothing has to be detached.
 - Settings > Account needs a `remove account data` action. A second person's
   listening history on this machine must be deletable.
 
 ## Evidence
 
 Each row names its status. `test:` names a real test and `scripts/evidence-status.py`
-fails when the name does not exist. `live:` names a check done by hand. `pending:`
-names work this branch does not build.
+fails when the name does not exist. `live:` names a check done by hand, and names a
+test that also covers it as `name`(), with the parentheses. The parentheses matter:
+without them a renamed test there would pass unchecked, and another pragma or column
+name would be read as a test. `pending:` names work this branch does not build, so
+nothing there is a test.
 
 | Claim | Check | Status |
 | --- | --- | --- |
@@ -246,12 +291,30 @@ names work this branch does not build.
 | A second account starts empty | Sign out of one account, open another, assert no rows carried over | test: `a_second_account_does_not_inherit_the_first` |
 | A new account has a row at once | Open a new account, reopen the file, assert the row is there | test: `a_new_account_is_written_at_once` |
 | A token with no account signs out | Store a token with no `uid`, start, assert signed out and cleared | test: `a_token_without_an_account_signs_out` |
+| A signed-in account with no open library says so | Fail the open, assert the message and an unwritable flush | test: `an_account_that_cannot_write_says_so` |
+| A network error keeps the session | Land an `Http` profile error, assert `SignedIn`, the disk name, and the stored token | test: `a_network_error_keeps_the_session_signed_in` |
+| A rejected fresh token ends the session | Classify a post-refresh `Unauthorized` as a dead grant | test: `a_fresh_token_that_is_rejected_ends_the_session` |
+| A scope is assigned nowhere but `src/auth.rs` | Write an assignment into a doc, a script and an untracked file | `python3 scripts/scope-check.py`, by hand: each fails, and a clean tree passes |
+| A driven scene owns its stores | Run the stored scene over a non-memory store, assert it installs its own and a scratch database path | test: `the_stored_scene_owns_its_store_and_its_database` |
+| A quit whose write fails reports the lost edits | Make every write fail, then quit and assert the report | test: `a_quit_that_cannot_write_reports_the_edits_as_lost` |
+| An invalid index cannot hide a valid collection | Seed a negative index first with one allowed, assert the valid one loads | test: `an_invalid_collection_index_does_not_hide_a_valid_one` |
+| An invalid slot cannot hide a valid playlist | Seed slots -1, 0, 1 with two allowed, assert both valid ones load | test: `an_invalid_slot_does_not_hide_a_valid_one` |
+| One instance owns a library | Hold the writer lock, then take it from a second connection | test: `a_second_connection_is_refused_the_library` |
 | A broken file is never overwritten | Write junk to the path, assert no library opens and the bytes stay | test: `a_broken_file_is_never_overwritten` |
 | A restart shows the library | Write, reopen the file, assert the library and the name come back | test: `a_restart_reads_the_written_library`, `a_restart_shows_the_saved_library` |
 | A quit writes what is outstanding | Change the library, quit, reopen, assert the change is there | test: `a_quit_writes_what_is_outstanding` |
 | A dirty library asks for a frame | A change wakes the loop, a clean library does not | test: `only_a_dirty_library_asks_for_a_frame` |
 | A dirty library with nothing to write it to asks for no frame | No session, or a failed write, wakes nothing | test: `a_dirty_library_with_no_session_asks_for_no_frame` |
 | A dead refresh token closes the library | Push an `InvalidGrant` result, assert no library and no token | test: `a_dead_refresh_token_closes_the_library` |
+| Sign-out leaves no route to a playlist that is gone | Open a playlist screen, sign out, assert the state invariant | test: `signing_out_leaves_no_route_to_a_gone_playlist` |
+| A failed restore detaches the previous account | Fail account B's open, assert account A's library is closed | test: `a_failed_restore_detaches_the_previous_account` |
+| A missing row is written without an edit | Clear the row, flush with no change, assert the row is back | test: `a_missing_row_is_written_without_an_edit` |
+| Sign-out keeps unwritten edits | Fail the write, sign out, assert the library and the playlist stay | test: `sign_out_keeps_unwritten_edits` |
+| The refusal clears once the write lands | Fail, refuse, allow writes, flush, assert no message | test: `the_refusal_clears_when_a_write_lands` |
+| A clean library clears a stale failure | Refuse, revert the edit so nothing is owed, flush, assert no message | test: `a_clean_library_clears_a_stale_failure` |
+| A refusal does not follow the next account | Refuse in one account, open another, assert no message | test: `a_refusal_does_not_follow_the_next_account` |
+| Reopening the same account keeps unwritten edits | Fail the write, edit, open the same account, assert the edit stays | test: `reopening_the_same_account_keeps_unwritten_edits` |
+| A failed write does not silence the next account | Fail one account's write, open another, assert the wake flag is clear | test: `a_failed_write_does_not_silence_the_next_account` |
 | Playlist slots survive deletion | Delete slot zero, write and load, assert slot one and its reference stay | test: `slot_hole_survives` |
 | A collection gap does not misplace a reference | Move a collection's index, assert the reference follows it | test: `a_collection_gap_does_not_misplace_a_reference` |
 | Users do not share slots | Two populated libraries with the same slots, assert each loads unchanged | test: `users_are_isolated` |
@@ -259,17 +322,19 @@ names work this branch does not build.
 | A repeated write makes no duplicates | Write twice, assert one row per bit | test: `write_is_idempotent` |
 | An email is not a display name | A profile whose `username` is an address asserts `You` | test: `an_email_is_not_used_as_a_name` |
 | The key holds offline | `uid` read from the keychain alone, no network, before any fetch | test: `the_user_id_comes_from_the_token`, `the_fake_token_names_no_user` |
-| The file is private | `stat -f '%Lp'` returns `600` | live: 2026-11-15, plus `a_restart_reads_the_written_library` |
-| Schema is sound | `PRAGMA integrity_check` is `ok` and no row has an orphan `user_id` | live: 2026-11-15, plus `replacement_removes_stale_rows` |
+| The file is private | `stat -f '%Lp'` returns `600` | live: 2026-11-15, plus `a_restart_reads_the_written_library`() |
+| Schema is sound | `PRAGMA integrity_check` is `ok` and no row has an orphan `user_id` | live: 2026-11-15, plus `replacement_removes_stale_rows`() |
 | A like reaches the disk from a live session | Like a track, wait for idle, read the row | live: 2026-11-15 |
 | Token is not in the file | `strings opentidal.db` shows no token | live: 2026-11-15, and the schema has no token column |
-| The database is out of the backup | `xattr -p com.apple.metadata:com_apple_backup_excludeItem` shows `com.apple.backupd` | test: `the_database_is_excluded_from_backups` |
+| The database is out of the backup | `xattr -p com.apple.metadata:com_apple_backup_excludeItem` shows `com.apple.backupd` | test: `the_database_is_excluded_from_backups`, `the_apps_own_directory_is_excluded_from_backups` |
+| The excluded directory is the real one | The real config and database path functions feed the matcher | test: `the_default_database_directory_is_the_one_excluded` |
 | No data loss at sign-in | Kill the process between the keychain write and the library write, and the reverse | pending: no kill harness. The keychain-first order makes a token without a row read as a new account, so the loss is a name, not the library |
 | Start needs no network | Launch with the network off, name and playlist visible | pending: no test. Start reads the disk first, then fetches the profile |
 | A library screen needs no network | Open Liked Songs offline, assert the disk rows paint | pending: no test |
 | A refresh writes no rows | Count rows before and after a refresh, `user_version` unchanged | pending: no test. A refresh writes the keychain only |
 | A partial sync loses nothing | Fail the read after page 2, assert every row is still present | pending: sync PR |
 | A partial sync deletes nothing | Same test, assert the delete pass did not run | pending: sync PR |
+| An invalid history row cannot hide a valid entry | Seed an unknown track then two distinct valid ones, assert both load | test: `an_unknown_history_row_does_not_hide_a_valid_one` |
 | The sync never touches local tables | Seed a `download` and a `history` row, sync, assert both remain | pending: sync PR |
 
 ## Confirmed live

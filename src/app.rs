@@ -37,9 +37,22 @@ pub struct App {
     /// Set after a write fails, so a dirty library does not wake the loop on
     /// every frame. The next edit clears it through a successful write.
     write_failed: bool,
+    /// Where this app keeps its database, when it is not the default path. A scene
+    /// or a test sets it, so a run that writes a fabricated library cannot land in
+    /// the real one. `None` means the path the app really uses.
+    pub(crate) db_override: Option<std::path::PathBuf>,
+    /// Why the last profile fetch failed, when the failure did not end the session.
+    /// A transport error keeps the account signed in on what the disk holds, so the
+    /// reason is shown beside the name rather than over a sign-in button.
+    pub profile_error: Option<String>,
+    /// Why the last library write did not land, when sign-out was refused because
+    /// of it. The account screen shows this. It is not `Auth::Failed`, because that
+    /// state offers a sign-in button, and signing in again would drop the same
+    /// edits. Read as the write of a library, never **save** in the album sense.
+    pub(crate) write_error: Option<String>,
     /// Wakes the event loop so `poll` runs after a change. A windowed app stops
     /// drawing frames at rest, so without this a click in the last frame before
-    /// idle would sit unsaved until the next input.
+    /// idle would sit unwritten until the next input.
     waker: Option<Waker>,
     /// Whether the live client is on, from `OPENTIDAL_LIVE` or the config file.
     pub live: bool,
@@ -61,6 +74,10 @@ pub struct App {
 struct OpenLibrary {
     user_id: String,
     store: Store,
+    /// Set when this account has no row on disk yet, because the first write
+    /// failed. The next flush writes the row before anything else, so one
+    /// transient error does not disable saving for the whole session.
+    row_pending: bool,
 }
 
 /// A finished sign-in exchange, tagged with the session it ran under.
@@ -107,7 +124,7 @@ impl App {
     /// would destroy it, and the next sync is the only thing that can rebuild
     /// it.
     fn restore_library(&mut self, user_id: &str) {
-        let Some(path) = db_path() else {
+        let Some(path) = self.db_override.clone().or_else(db_path) else {
             return;
         };
         self.open_library(user_id, &path);
@@ -121,10 +138,33 @@ impl App {
     /// cannot be read. Overwriting an unreadable library with the default would
     /// destroy it, and only a sync could rebuild it.
     fn open_library(&mut self, user_id: &str, path: &std::path::Path) {
+        // Re-opening the account that is already open is the common path: a
+        // re-sign-in with the same token, or a restart restoring the same session.
+        // Detaching first would drop edits the in-memory library still owes to
+        // disk, and a failed flush has no other copy, so this returns early.
+        if self.library.as_ref().is_some_and(|open| open.user_id == user_id) {
+            return;
+        }
+        // A different account detaches first, so one account's rows can never show
+        // under another's id or save under it. An edit that could not be written
+        // is lost here on purpose, and said so in the log: keeping it would write
+        // it under the wrong account, which is the worse failure.
+        if !self.forget_session() {
+            eprintln!(
+                "opentidal: the previous account's last edits were not saved, and are dropped rather than written under {user_id}"
+            );
+        }
+
         let mut store = match Store::open(path) {
             Ok(store) => store,
             Err(error) => {
                 eprintln!("opentidal: cannot open {}: {error:?}", path.display());
+                // The account is signed in and has nowhere to save. Say so where the
+                // user can see it, instead of accepting edits that will be dropped.
+                self.write_error = Some(
+                    "Your library could not be opened, so changes cannot be written. Sign out and back in, or check the disk."
+                        .to_string(),
+                );
                 return;
             }
         };
@@ -146,44 +186,100 @@ impl App {
                 // the profile fetch never returns a name. This cannot go through
                 // `flush_library`, which skips a library equal to the one on
                 // disk, and a new account's library is exactly that.
-                if let Err(error) = store.write(user_id, &self.core.lib) {
-                    eprintln!("opentidal: cannot open a row for a new account: {error:?}");
-                    return;
-                }
-                self.on_disk = self.core.lib.clone();
-                self.library = Some(OpenLibrary { user_id: user_id.to_string(), store });
+                //
+                // A failure keeps the store open and leaves `on_disk` different
+                // from the library, so the next frame retries. Closing the store
+                // here would disable saving for the rest of the session after one
+                // transient error, and the user would lose every edit.
+                let row_pending = match store.write(user_id, &self.core.lib) {
+                    Ok(()) => {
+                        self.on_disk = self.core.lib.clone();
+                        false
+                    }
+                    Err(error) => {
+                        eprintln!("opentidal: cannot open a row for a new account: {error:?}");
+                        true
+                    }
+                };
+                self.library = Some(OpenLibrary {
+                    user_id: user_id.to_string(),
+                    store,
+                    row_pending,
+                });
                 return;
             }
             Err(error) => {
                 eprintln!("opentidal: cannot load the library, leaving it unwritten: {error:?}");
+                self.write_error = Some(
+                    "Your library could not be read, so changes cannot be written. Sign out and back in, or check the disk."
+                        .to_string(),
+                );
                 return;
             }
         }
         self.on_disk = self.core.lib.clone();
-        self.library = Some(OpenLibrary { user_id: user_id.to_string(), store });
+        self.library = Some(OpenLibrary {
+            user_id: user_id.to_string(),
+            store,
+            row_pending: false,
+        });
     }
 
     /// Write the library when it differs from what is on disk. This runs at the
     /// start of every frame, so a click in one frame is on disk by the next.
     /// One comparison covers every operation in the UI, so a new screen action
     /// needs no persistence call of its own.
-    fn flush_library(&mut self) {
-        if self.core.lib == self.on_disk {
-            return;
-        }
+    /// Returns true when nothing is owed to disk: either the write landed, or
+    /// there was nothing to write. A caller that is about to discard the library
+    /// must check this, or a failed write loses the only copy.
+    fn flush_library(&mut self) -> bool {
         let Some(open) = self.library.as_mut() else {
-            return;
+            // Signed in with no open library means the database would not open, so
+            // anything edited now can never be written. Reporting "nothing owed"
+            // would let a caller discard it silently.
+            return !matches!(self.auth, Auth::SignedIn { .. });
         };
+        // An account whose first write failed has no row yet. The library may
+        // still equal `on_disk`, so this has to be checked before that
+        // comparison, or the row is never written.
+        if open.row_pending {
+            match open.store.write(&open.user_id, &self.core.lib) {
+                Ok(()) => {
+                    open.row_pending = false;
+                    self.on_disk = self.core.lib.clone();
+                    self.write_failed = false;
+                    self.write_error = None;
+                }
+                Err(error) => {
+                    self.write_failed = true;
+                    eprintln!("opentidal: cannot open a row for a new account: {error:?}");
+                    return false;
+                }
+            }
+            return true;
+        }
+        if self.core.lib == self.on_disk {
+            // Nothing is owed, so no failure is outstanding. Without this a refused
+            // sign-out's message would sit over a library that is fully written, and
+            // the wake flag would stay set so the next edit never asked for a frame.
+            self.write_failed = false;
+            self.write_error = None;
+            return true;
+        }
         match open.store.write(&open.user_id, &self.core.lib) {
             Ok(()) => {
                 self.on_disk = self.core.lib.clone();
                 self.write_failed = false;
+                // A write landed, so any refusal shown earlier is out of date.
+                self.write_error = None;
+                true
             }
             Err(error) => {
                 // Keep the library dirty so a later edit tries again, but stop
                 // waking for this failure.
                 self.write_failed = true;
-                eprintln!("opentidal: cannot save the library: {error:?}");
+                eprintln!("opentidal: cannot write the library: {error:?}");
+                false
             }
         }
     }
@@ -219,6 +315,22 @@ impl App {
     }
 
     pub fn sign_out(&mut self) {
+        // A session with no open library has nowhere to write and nothing it could
+        // lose, so it always leaves. Refusing here would strand the deterministic
+        // build, and a live account whose database would not open, with no way out.
+        let storeless = self.library.is_none();
+        // Otherwise write first, and keep the session if that fails. Discarding the
+        // library after a failed write throws away the only copy of the user's edits.
+        if !storeless && !self.flush_library() {
+            // Stay signed in and keep the edits. `Auth::Failed` would offer a
+            // sign-in button, and taking it drops the library this just refused
+            // to discard.
+            self.write_error = Some(
+                "Your changes are not written to disk yet. Sign-out waits for them.".to_string(),
+            );
+            return;
+        }
+        self.write_error = None;
         self.session += 1;
         match self.tokens.clear() {
             Ok(()) => {
@@ -238,11 +350,28 @@ impl App {
     /// the next sign-in with that account finds its library. A kept library in
     /// memory would show one account's data while another is signed in, and the
     /// next save would write it under the new id.
-    fn forget_session(&mut self) {
-        self.flush_library();
+    /// Returns true when the library was on disk before it was dropped. A caller
+    /// that must not lose edits checks this result and keeps the session instead.
+    fn forget_session(&mut self) -> bool {
+        let saved = self.flush_library();
         self.library = None;
+        self.write_failed = false;
+        self.profile_error = None;
+        // The message belongs to the account that just closed. It must not follow
+        // the next account onto its own Account screen.
+        self.write_error = None;
         self.core.lib = Library::default();
+        // A playlist screen for the old account names a playlist that no longer
+        // exists, which the state invariant forbids. Drop those routes and keep
+        // the stack non-empty, the same way `state::delete_playlist` does.
+        self.core
+            .stack
+            .retain(|route| !matches!(route, crate::state::Route::UserPlaylist(_)));
+        if self.core.stack.is_empty() {
+            self.core.stack.push(crate::state::Route::Home);
+        }
         self.on_disk = Library::default();
+        saved
     }
 
     /// Adopt a token as the current session: open that account's library, then
@@ -254,6 +383,9 @@ impl App {
             self.auth = Auth::Failed { message: "the token names no account".to_string() };
             return;
         };
+        // A new session starts with no fetch history, so a message about the previous
+        // one's failed fetch must not follow it onto the Account screen.
+        self.profile_error = None;
         self.restore_library(&user_id);
         self.auth = Auth::SignedIn { token: token.clone() };
         self.fetch_profile(token);
@@ -297,6 +429,10 @@ impl App {
                         *held = token;
                     }
                     self.core.lib.set_name(user.name);
+                    // The fetch landed, so the reason an earlier one did not is out
+                    // of date. Leaving it would show "could not reach Tidal" over a
+                    // name that just arrived.
+                    self.profile_error = None;
                 }
                 Err(e) => {
                     // A dead refresh token means no session at all. The rows stay
@@ -305,9 +441,37 @@ impl App {
                     // it and save it under its own id.
                     if matches!(&e, ServiceError::InvalidGrant(_)) {
                         let _ = self.tokens.clear();
-                        self.forget_session();
+                        // The token is dead, so the session cannot continue and the
+                        // library has to go. Say so when its last edits could not be
+                        // written, rather than dropping them in silence.
+                        if !self.forget_session() {
+                            eprintln!(
+                                "opentidal: the dead token ended the session before the library was written, so the last edits are lost"
+                            );
+                        }
+                        self.auth = Auth::Failed { message: format!("{e:?}") };
+                    } else {
+                        // A transport error is not a lost session. The disk holds the
+                        // name and the library, so the launch stays signed in and the
+                        // fetch retries on the next request. Falling back to
+                        // `Auth::Failed` here would put a sign-in button over a session
+                        // that still works, and the button would drop the library.
+                        eprintln!(
+                            "opentidal: the profile fetch failed, staying signed in: {e:?}"
+                        );
+                        // A reader does not need the error detail, which the log keeps
+                        // for a bug report. The message must say which kind of failure
+                        // this is: a network that came back needs nothing from them, a
+                        // session Tidal will not accept needs a new sign-in.
+                        self.profile_error = Some(match &e {
+                            ServiceError::Unauthorized | ServiceError::Auth(_) => {
+                                "Tidal would not accept this session. Sign out and sign in again."
+                                    .to_string()
+                            }
+                            _ => "Could not reach Tidal. Showing what is saved on this Mac."
+                                .to_string(),
+                        });
                     }
-                    self.auth = Auth::Failed { message: format!("{e:?}") };
                 }
             }
         }
@@ -337,8 +501,19 @@ impl App {
     }
 
     /// Write anything outstanding before the app exits.
-    pub fn quit(&mut self) {
-        self.flush_library();
+    ///
+    /// Returns whether the library is on disk. A caller cannot refuse the quit: the
+    /// event loop's only cancel comes from the system, so an app that asks to stay
+    /// open here would be ignored. It reports instead, because a lost edit must not
+    /// leave in silence.
+    pub fn quit(&mut self) -> bool {
+        if self.flush_library() {
+            return true;
+        }
+        eprintln!(
+            "opentidal: the last edits could not be written before quit, so they are lost"
+        );
+        false
     }
 
 
@@ -363,19 +538,55 @@ fn resolve_user(
     config: &OAuthConfig,
     token: Token,
 ) -> Result<(Token, User), ServiceError> {
-    let token = if auth::token_expired(&token) {
-        refresh(config, &token)?
+    resolve_user_with(service, &|t| refresh(config, t), token)
+}
+
+/// `resolve_user`, with the refresh as a parameter. A test needs to count the refreshes
+/// and make them fail on demand, which the network call cannot do without a server.
+/// Production passes the real one, so the logic below is the same code in both.
+fn resolve_user_with(
+    service: &Arc<dyn MusicService>,
+    refresh: &dyn Fn(&Token) -> Result<Token, ServiceError>,
+    token: Token,
+) -> Result<(Token, User), ServiceError> {
+    // Whether this call already refreshed for expiry decides how a rejection reads.
+    // A token that was expired and refreshed, then rejected anyway, is rejected in its
+    // freshest form: refreshing again cannot help, and a transport failure on that
+    // second refresh would surface as "not reachable", keeping the session signed in
+    // on a token the API will not take.
+    let expired = auth::token_expired(&token);
+    let token = if expired {
+        refresh(&token)?
     } else {
         token
     };
     match service.current_user(&token.access_token) {
         Ok(user) => Ok((token, user)),
-        Err(ServiceError::Unauthorized) => {
-            let fresh = refresh(config, &token)?;
-            let user = service.current_user(&fresh.access_token)?;
+        // The one refresh-and-retry for a token that was still current. It is worth
+        // trying once: the API rejects a token whose clock it disagrees with.
+        Err(ServiceError::Unauthorized) if !expired => {
+            let fresh = refresh(&token)?;
+            let user = after_refresh(service.current_user(&fresh.access_token))?;
             Ok((fresh, user))
         }
+        Err(ServiceError::Unauthorized) => {
+            Err(ServiceError::InvalidGrant("a fresh token was rejected".to_string()))
+        }
         Err(e) => Err(e),
+    }
+}
+
+/// Read the answer to a request made with a freshly minted token. A token minted a
+/// moment ago and rejected anyway means this account cannot be reached with it, not
+/// that the network is down, so it is reported as a dead grant. Left as
+/// `Unauthorized` it would read as retryable, and the session would stay signed in
+/// with a token that can never work.
+fn after_refresh(result: Result<User, ServiceError>) -> Result<User, ServiceError> {
+    match result {
+        Err(ServiceError::Unauthorized) => {
+            Err(ServiceError::InvalidGrant("a fresh token was rejected".to_string()))
+        }
+        other => other,
     }
 }
 
@@ -434,6 +645,9 @@ impl Default for App {
             library: None,
             on_disk: Library::default(),
             write_failed: false,
+            write_error: None,
+            db_override: None,
+            profile_error: None,
             waker: None,
             live,
             session: 0,
@@ -459,7 +673,14 @@ fn db_path() -> Option<std::path::PathBuf> {
     {
         return Some(std::path::PathBuf::from(path));
     }
-    Some(config_path()?.with_file_name("opentidal.db"))
+    db_path_beside(config_path()?)
+}
+
+/// The database sits beside the config file, so the app owns one directory per
+/// user. Split out from [`db_path`] so a test can ask the question without
+/// touching the environment.
+pub(crate) fn db_path_beside(config: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    Some(config.with_file_name("opentidal.db"))
 }
 
 /// An env var, or the matching field of the config file when the var is unset.
@@ -505,13 +726,28 @@ fn config_path() -> Option<std::path::PathBuf> {
     {
         return Some(std::path::PathBuf::from(path));
     }
-    let home = std::env::var("HOME").ok()?;
+    config_path_under(&std::path::PathBuf::from(std::env::var("HOME").ok()?))
+}
+
+/// The config path this app would use with no override, which is where its database
+/// sits beside it. A store check compares against this, so a directory that merely
+/// shares the app's name is not treated as the app's own.
+pub(crate) fn app_directory_suffix() -> Option<std::path::PathBuf> {
+    let home = std::path::PathBuf::from("home");
+    let config = config_path_under(&home)?;
+    config.parent().map(|p| p.strip_prefix(&home).ok().map(|r| r.to_path_buf()).unwrap_or_else(|| p.to_path_buf()))
+}
+
+/// The default config path under a given home directory. Split out from
+/// [`config_path`] so a test can ask where the app keeps its files without
+/// touching the environment.
+fn config_path_under(home: &std::path::Path) -> Option<std::path::PathBuf> {
     let sub = if cfg!(target_os = "macos") {
         "Library/Application Support/OpenTidal/config.json"
     } else {
         ".config/opentidal/config.json"
     };
-    Some(std::path::PathBuf::from(home).join(sub))
+    Some(home.join(sub))
 }
 
 /// The macOS keychain store, or an in-memory store on other platforms.
@@ -531,10 +767,65 @@ mod tests {
     use super::*;
     use crate::catalog::TrackId;
 
+    /// The directory this app really keeps its database in is the one the backup
+    /// exclusion matches. Both halves are the real functions, so a change to where
+    /// the app keeps its files fails here instead of silently stopping the
+    /// exclusion of the `-wal` file.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_default_database_directory_is_the_one_excluded() {
+        let config = config_path_under(std::path::Path::new("/Users/example")).unwrap();
+        let default_db = db_path_beside(config).unwrap();
+        let dir = default_db.parent().unwrap();
+        assert!(
+            crate::store::is_app_directory(dir),
+            "the default database directory {} is not the one the exclusion matches",
+            dir.display()
+        );
+        // Another program's directory must not match, or one flag would cover its
+        // files too.
+        assert!(!crate::store::is_app_directory(std::path::Path::new(
+            "/Users/example/Documents"
+        )));
+        // Another program's directory with the same name must not match either, or one
+        // flag would leave its files out of the backup.
+        assert!(!crate::store::is_app_directory(std::path::Path::new(
+            "/Volumes/Work/Other App/OpenTidal"
+        )));
+    }
+
+    /// The deterministic build signs in with no store, which is by design. Sign-out
+    /// must still work there: there is no store, so nothing can be lost, and a
+    /// refusal would leave no way out at all.
+    #[test]
+    fn the_storeless_session_can_still_sign_out() {
+        let mut app = app_without_a_session();
+        app.auth = Auth::SignedIn { token: fake_token() };
+        assert!(app.library.is_none(), "the fixture opened a library");
+
+        app.sign_out();
+
+        assert_eq!(app.auth, Auth::SignedOut, "a session with no store could not sign out");
+        assert!(app.write_error.is_none());
+    }
+
     /// An app on its way to a session. The account id comes from `open_library`,
     /// so nothing here can set one without the database it keys.
+    ///
+    /// The token store and the service are forced to the in-memory and fake ones.
+    /// `App::default()` reads `OPENTIDAL_LIVE` and the user's config file, so
+    /// without this a developer with live mode on would run these tests against the
+    /// real keychain, and a test that clears the token would delete their session.
     fn app_without_a_session() -> App {
-        App::default()
+        let app = App {
+            tokens: Arc::new(auth::MemoryStore::default()),
+            service: Arc::new(tidal::FakeService::default()),
+            live: false,
+            ..App::default()
+        };
+        // A fresh store, so the tests start from no token whatever the config says.
+        app.tokens.clear().unwrap();
+        app
     }
 
     /// A temporary directory that removes itself, so a failing test leaves no
@@ -573,7 +864,9 @@ mod tests {
         first.core.lib.add_track(id, TrackId(3));
         first.flush_library();
 
-        let mut second = App::default();
+        // A second run of the app, built through the same fixture so this test
+        // cannot reach the real keychain when live mode is on.
+        let mut second = app_without_a_session();
         second.open_library("173210380", &path);
         assert_eq!(second.core.lib.name, "Ada");
         assert_eq!(second.core.lib.playlist(id).unwrap().name, "Road trip");
@@ -612,6 +905,476 @@ mod tests {
         assert!(app.library.is_none(), "a dead token left the library writable");
         assert_eq!(app.core.lib, Library::default(), "the library stayed in memory");
         assert_eq!(app.tokens.load(), None, "the dead token stayed stored");
+    }
+
+    /// A driven scene must not touch anything the user owns. The `signed-in-stored`
+    /// scene writes a fabricated token and a fabricated library, so with live mode on
+    /// it used to reach the real keychain and the real database. That happened for
+    /// real: an old binary in live mode replaced a real token.
+    ///
+    /// This asks the question the scene has to answer, with no live run: after the
+    /// scene, is the token store in memory, and does the database path point away
+    /// from the real one?
+    #[test]
+    fn the_stored_scene_owns_its_store_and_its_database() {
+        // A store that is not the memory one, standing in for the real keychain.
+        // It records nothing and touches no file, so removing the scene's own store
+        // makes the test fail instead of damaging the machine.
+        struct NotMemory;
+        impl auth::TokenStore for NotMemory {
+            fn is_memory(&self) -> bool {
+                false
+            }
+            fn load(&self) -> Option<auth::Token> {
+                None
+            }
+            fn save(&self, _token: &auth::Token) {}
+            fn clear(&self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        // The test owns the path and removes it. The scene honours `OPENTIDAL_DB`, so a
+        // test that cleaned up whatever path came back could delete a database it does
+        // not own. It makes its own directory, points the scene at a file inside it, and
+        // removes only that directory.
+        let dir = std::env::temp_dir().join(format!(
+            "opentidal-scene-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("scene.db");
+
+        let mut app = App {
+            tokens: std::sync::Arc::new(NotMemory),
+            library: None,
+            db_override: Some(db.clone()),
+            ..App::default()
+        };
+        crate::signed_in_stored_scene(&mut app);
+
+        assert!(
+            app.tokens.is_memory(),
+            "the scene's token store is the real keychain"
+        );
+        assert_eq!(
+            app.db_override.as_ref(),
+            Some(&db),
+            "the scene ignored the database path it was given"
+        );
+        drop(app);
+        std::fs::remove_file(&db).ok();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!dir.exists(), "the test left its own directory behind");
+    }
+
+    /// A token minted a moment ago and rejected anyway is a dead session, not a
+    /// network error. Left as `Unauthorized` it reads as retryable, and the session
+    /// stays signed in with a token that can never work.
+    #[test]
+    fn a_fresh_token_that_is_rejected_ends_the_session() {
+        let user = User {
+            id: crate::tidal::UserId("173210380".to_string()),
+            name: "Ada".to_string(),
+        };
+        assert!(
+            matches!(
+                after_refresh(Err(ServiceError::Unauthorized)),
+                Err(ServiceError::InvalidGrant(_))
+            ),
+            "a rejected fresh token was left retryable"
+        );
+        // Every other answer is passed through: a network error must stay a network
+        // error, and a good answer must stay good.
+        assert!(matches!(
+            after_refresh(Err(ServiceError::Http("offline".to_string()))),
+            Err(ServiceError::Http(_))
+        ));
+        assert!(matches!(
+            after_refresh(Err(ServiceError::InvalidGrant("revoked".to_string()))),
+            Err(ServiceError::InvalidGrant(_))
+        ));
+        assert_eq!(after_refresh(Ok(user.clone())).unwrap().name, user.name);
+    }
+
+    /// A token refreshed for expiry, then rejected anyway, must not refresh a second
+    /// time. A second refresh that fails on transport surfaces as "not reachable", and
+    /// the session stays signed in on a token the API will not take.
+    #[test]
+    fn an_expiry_refreshed_token_is_not_refreshed_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct AlwaysRejects;
+        impl MusicService for AlwaysRejects {
+            fn current_user(&self, _token: &str) -> Result<User, ServiceError> {
+                Err(ServiceError::Unauthorized)
+            }
+        }
+        let calls = AtomicUsize::new(0);
+        let refresh = |t: &Token| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Token {
+                access_token: format!("fresh-{}", t.access_token),
+                refresh_token: t.refresh_token.clone(),
+                expires_in: 3600,
+            })
+        };
+        let service: Arc<dyn MusicService> = Arc::new(AlwaysRejects);
+        // Expired, so this call refreshes first and then sees the rejection.
+        let expired = Token {
+            access_token: "old".to_string(),
+            refresh_token: "r".to_string(),
+            expires_in: 0,
+        };
+        let result = resolve_user_with(&service, &refresh, expired);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the token was refreshed more than once");
+        assert!(
+            matches!(result, Err(ServiceError::InvalidGrant(_))),
+            "a rejected fresh token was not treated as a dead grant: {result:?}"
+        );
+
+        // A token that is still current keeps its one refresh-and-retry, because the
+        // API may be rejecting a clock disagreement.
+        calls.store(0, Ordering::SeqCst);
+        let current = Token {
+            access_token: "current".to_string(),
+            refresh_token: "r".to_string(),
+            expires_in: 3600,
+        };
+        let result = resolve_user_with(&service, &refresh, current);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the retry refresh did not happen");
+        assert!(matches!(result, Err(ServiceError::InvalidGrant(_))));
+    }
+
+    /// A launch with the network off must stay signed in. The disk has the name
+    /// and the library, so a transport error is a pending fetch, not a lost
+    /// session. Only a rejected refresh token ends a session.
+    #[test]
+    fn a_network_error_keeps_the_session_signed_in() {
+        let dir = TempDir::new("offline");
+        let path = dir.path();
+        let mut app = app_without_a_session();
+        app.open_library("173210380", &path);
+        app.core.lib.set_name("Ada".to_string());
+        app.auth = Auth::SignedIn { token: fake_token() };
+        app.tokens.save(&fake_token());
+
+        let session = app.session;
+        let offline = ServiceError::Http("dns: no route to host".to_string());
+        app.profile.request((), move |_| (session, Err(offline)));
+        for _ in 0..1_000 {
+            if app.drain() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        assert!(
+            matches!(app.auth, Auth::SignedIn { .. }),
+            "a network error ended the session: {:?}",
+            app.auth
+        );
+        assert_eq!(app.core.lib.name, "Ada", "the name from disk was lost");
+        assert!(app.library.is_some(), "the library closed on a network error");
+        assert_eq!(
+            app.tokens.load(),
+            Some(fake_token()),
+            "a network error cleared the stored token"
+        );
+        assert!(
+            app.profile_error.is_some(),
+            "the offline launch says nothing about the fetch it could not make"
+        );
+
+        // A later fetch that lands clears the reason, so a message about a network
+        // that came back does not sit over the name it just refreshed.
+        let session = app.session;
+        let user = crate::tidal::User {
+            id: crate::tidal::UserId("173210380".to_string()),
+            name: "Ada".to_string(),
+        };
+        app.profile.request((), move |_| (session, Ok((fake_token(), user))));
+        for _ in 0..1_000 {
+            if app.drain() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            app.profile_error.is_none(),
+            "a landed fetch left the offline message showing"
+        );
+        assert_eq!(app.core.lib.name, "Ada");
+    }
+
+    /// Sign-out refuses to throw away edits it could not save. The old path
+    /// flushed, ignored the error, and dropped the library, which lost the only
+    /// copy of a playlist the user had just made.
+    #[test]
+    fn sign_out_keeps_unwritten_edits() {
+        let dir = TempDir::new("signout-unwritten");
+        let path = dir.path();
+
+        let mut app = app_without_a_session();
+        app.open_library("173210380", &path);
+        app.auth = Auth::SignedIn { token: fake_token() };
+        // A trigger that aborts every insert makes the write fail for real, with
+        // the handle open, which is the state a full disk leaves.
+        app.library.as_ref().unwrap().store.abort_writes_for_test();
+        app.core.lib.create_playlist("Unsaved".to_string()).unwrap();
+
+        app.sign_out();
+
+        assert!(
+            app.library.is_some(),
+            "sign-out discarded unwritten edits after a failed write"
+        );
+        assert!(
+            app.core.lib.playlist(crate::library::PlaylistId(0)).is_some(),
+            "the unwritten playlist was dropped"
+        );
+        assert_eq!(
+            app.auth,
+            Auth::SignedIn { token: fake_token() },
+            "a failed write left the screen in a state whose button would drop the edits"
+        );
+        assert!(app.write_error.is_some(), "the refusal was not explained to the user");
+    }
+
+    /// A failed write in one account must not suppress the next account's wake.
+    /// The flag outliving the session would leave the new account's edits waiting
+    /// for an input event that never comes.
+    #[test]
+    fn a_failed_write_does_not_silence_the_next_account() {
+        let dir = TempDir::new("next-account");
+        let path = dir.path();
+
+        let mut app = app_without_a_session();
+        app.open_library("account-a", &path);
+        app.library.as_ref().unwrap().store.abort_writes_for_test();
+        app.core.lib.create_playlist("A".to_string()).unwrap();
+        app.flush_library();
+        assert!(app.write_failed, "the fixture did not fail a write");
+
+        app.open_library("account-b", &path);
+        assert!(
+            !app.write_failed,
+            "the previous account's failed write left the new account unable to ask for a frame"
+        );
+    }
+
+    /// Opening the account that is already open must not drop edits the last write
+    /// could not land. A re-sign-in with the same token is the common path, and a
+    /// detach would throw away the only copy.
+    #[test]
+    fn reopening_the_same_account_keeps_unwritten_edits() {
+        let dir = TempDir::new("same-account");
+        let path = dir.path();
+
+        let mut app = app_without_a_session();
+        app.open_library("173210380", &path);
+        app.library.as_ref().unwrap().store.abort_writes_for_test();
+        app.core.lib.create_playlist("Unsaved".to_string()).unwrap();
+
+        // The same account opens again, the way a refreshed token re-establishes
+        // the session.
+        app.open_library("173210380", &path);
+
+        assert!(
+            app.core.lib.playlist(crate::library::PlaylistId(0)).is_some(),
+            "reopening the same account dropped edits that were never written"
+        );
+    }
+
+    /// A signed-in account whose database would not open must not look like it can
+    /// save. The edit would land in memory, the next frame would report nothing
+    /// owed, and the next account switch would drop it in silence.
+    #[test]
+    fn an_account_that_cannot_write_says_so() {
+        let dir = TempDir::new("no-store");
+        // A directory where the database file should be makes `Store::open` fail.
+        let blocked = dir.0.join("blocked.db");
+        std::fs::create_dir_all(&blocked).unwrap();
+
+        let mut app = app_without_a_session();
+        app.open_library("173210380", &blocked);
+        app.auth = Auth::SignedIn { token: fake_token() };
+
+        assert!(app.library.is_none(), "the fixture opened a library");
+        assert!(
+            app.write_error.is_some(),
+            "a signed-in account with no storage shows no reason its edits will not be saved"
+        );
+
+        app.core.lib.create_playlist("Lost".to_string()).unwrap();
+        assert!(
+            !app.flush_library(),
+            "a session with no open library reported that nothing was owed"
+        );
+    }
+
+    /// A refusal belongs to the account that saw it. The next account must open
+    /// its Account screen without the previous account's message on it.
+    #[test]
+    fn a_refusal_does_not_follow_the_next_account() {
+        let dir = TempDir::new("refusal-next");
+        let path = dir.path();
+
+        let mut app = app_without_a_session();
+        app.open_library("account-a", &path);
+        app.auth = Auth::SignedIn { token: fake_token() };
+        app.library.as_ref().unwrap().store.abort_writes_for_test();
+        app.core.lib.create_playlist("A".to_string()).unwrap();
+        app.sign_out();
+        assert!(app.write_error.is_some(), "the fixture did not refuse the sign-out");
+
+        app.open_library("account-b", &path);
+        assert!(
+            app.write_error.is_none(),
+            "account A's refusal is still on screen after account B opened"
+        );
+    }
+
+    /// Nothing owed to disk means no failure is outstanding. A refused sign-out
+    /// followed by a dead token leaves the message set, and the early return would
+    /// keep it on screen over a library that is fully written.
+    #[test]
+    fn a_clean_library_clears_a_stale_failure() {
+        let dir = TempDir::new("clear-stale");
+        let path = dir.path();
+
+        let mut app = app_without_a_session();
+        app.open_library("173210380", &path);
+        app.auth = Auth::SignedIn { token: fake_token() };
+        app.library.as_ref().unwrap().store.abort_writes_for_test();
+        app.core.lib.create_playlist("A".to_string()).unwrap();
+        app.sign_out();
+        assert!(app.write_error.is_some());
+
+        // The edit is gone again, so nothing is owed and no write will ever run.
+        app.core.lib = app.on_disk.clone();
+        app.flush_library();
+
+        assert!(
+            app.write_error.is_none(),
+            "the account screen still reports a failed write over a library that is fully written"
+        );
+        assert!(
+            !app.write_failed,
+            "the wake flag stayed set, so the next edit would not ask for a frame"
+        );
+    }
+
+    /// The refusal message clears once a write lands. Otherwise the Account screen
+    /// keeps saying the changes are not on disk after they are.
+    #[test]
+    fn the_refusal_clears_when_a_write_lands() {
+        let dir = TempDir::new("stale-refusal");
+        let path = dir.path();
+
+        let mut app = app_without_a_session();
+        app.open_library("173210380", &path);
+        app.auth = Auth::SignedIn { token: fake_token() };
+        app.library.as_ref().unwrap().store.abort_writes_for_test();
+        app.core.lib.create_playlist("Unsaved".to_string()).unwrap();
+        app.sign_out();
+        assert!(app.write_error.is_some(), "the fixture did not refuse the sign-out");
+
+        // The disk accepts writes again and the next frame settles the library.
+        Store::open(&path).unwrap().allow_writes_again_for_test();
+        app.flush_library();
+
+        assert!(
+            app.write_error.is_none(),
+            "the account screen still says the changes are not written after they are"
+        );
+    }
+
+    /// An account whose first row write failed still gets its row, without any
+    /// further edit from the user. The write inside `open_library` is made to fail
+    /// by a trigger that lives in the file, so `row_pending` is set by the code
+    /// and not by the test.
+    #[test]
+    fn a_missing_row_is_written_without_an_edit() {
+        let dir = TempDir::new("retry-row");
+        let path = dir.path();
+
+        // The trigger is written into the file, so the account opens against a
+        // database that refuses its first write, the way a full disk would.
+        let seed = Store::open(&path).unwrap();
+        seed.abort_writes_for_test();
+        drop(seed);
+
+        let mut app = app_without_a_session();
+        app.open_library("173210380", &path);
+        assert!(
+            app.library.as_ref().is_some_and(|open| open.row_pending),
+            "a failed first write was not recorded as owed"
+        );
+        assert_eq!(
+            app.core.lib, app.on_disk,
+            "the retry must not depend on the libraries differing"
+        );
+
+        // The disk frees up, and the next frame settles the debt.
+        Store::open(&path).unwrap().allow_writes_again_for_test();
+        app.flush_library();
+
+        let reopened = Store::open(&path).unwrap();
+        assert!(
+            reopened.load("173210380").unwrap().is_some(),
+            "the row was never written, so the account would be new on every launch"
+        );
+        assert!(!app.library.as_ref().unwrap().row_pending, "the retry stayed pending");
+    }
+
+    /// A failed restore must not leave the previous account signed in and
+    /// writable. Otherwise the new account sees the old rows and its saves land
+    /// under the old id, which is the one thing the account key exists to stop.
+    #[test]
+    fn a_failed_restore_detaches_the_previous_account() {
+        let dir = TempDir::new("failed-restore");
+        let path = dir.path();
+
+        let mut app = app_without_a_session();
+        app.open_library("account-a", &path);
+        let a = app.core.lib.create_playlist("A".to_string()).unwrap();
+        assert!(app.library.is_some());
+
+        // A directory where the database should be makes `Store::open` fail.
+        let blocked = dir.0.join("blocked.db");
+        std::fs::create_dir_all(&blocked).unwrap();
+        app.open_library("account-b", &blocked);
+
+        assert!(
+            app.library.is_none(),
+            "account A's library stayed writable after B failed to open"
+        );
+        assert_eq!(app.core.lib, Library::default(), "A's rows stayed on screen");
+        assert_eq!(app.core.lib.playlist(a), None);
+    }
+
+    /// Signing out clears the library, so a route to one of its playlists must go
+    /// too. The state invariant forbids a route to a playlist that no longer
+    /// exists, and a stacked playlist screen would become one.
+    #[test]
+    fn signing_out_leaves_no_route_to_a_gone_playlist() {
+        let dir = TempDir::new("signout-route");
+        let path = dir.path();
+
+        let mut app = app_without_a_session();
+        app.open_library("173210380", &path);
+        let id = app.core.lib.create_playlist("Keep".to_string()).unwrap();
+        crate::state::open_detail(&mut app.core, crate::state::Route::UserPlaylist(id));
+        assert_eq!(app.core.stack.last(), Some(&crate::state::Route::UserPlaylist(id)));
+        assert!(crate::state::invariant(&app.core), "the fixture is already invalid");
+
+        app.forget_session();
+        assert!(
+            crate::state::invariant(&app.core),
+            "a route to a playlist that no longer exists survived sign-out"
+        );
     }
 
     /// A dirty library with nothing to write it to asks for no frame. Otherwise
@@ -742,6 +1505,38 @@ mod tests {
         assert!(first.core.lib.liked == 0, "account B inherited A's likes");
         assert!(first.library.is_some(), "account B has no database");
 
+    }
+
+    /// A quit whose write fails must not report the library as on disk. Nothing can
+    /// refuse a quit, so the failure is a lost edit that has to be reported.
+    #[test]
+    fn a_quit_that_cannot_write_reports_the_edits_as_lost() {
+        let dir = TempDir::new("quit-fail");
+        let path = dir.path();
+        let mut app = app_without_a_session();
+        app.open_library("173210380", &path);
+        app.core.lib.set_name("Ada".to_string());
+        assert!(app.flush_library());
+        app.library.as_ref().unwrap().store.abort_writes_for_test();
+
+        app.core.lib.set_name("Grace".to_string());
+        assert!(
+            !app.quit(),
+            "a quit whose write failed reported the library as on disk"
+        );
+        assert_eq!(
+            app.library
+                .as_ref()
+                .unwrap()
+                .store
+                .load("173210380")
+                .unwrap()
+                .unwrap()
+                .lib
+                .name,
+            "Ada",
+            "the failed write was supposed to leave the old name on disk"
+        );
     }
 
     /// A quit writes what is outstanding. The window's quit takes the fast exit,

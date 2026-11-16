@@ -30,16 +30,12 @@ echo "== evidence table"
 python3 scripts/evidence-status.py
 
 echo "== no copied scope list"
-# The scope list lives in `DEFAULT_SCOPE` and nowhere else. It was pasted into
-# four files and drifted twice. An empty scope already means every read scope,
-# so no doc needs the literal string.
-if grep -rn --include='*.md' --include='*.sh' --include='*.json' \
-    -e 'user\.read collection\.read' . 2>/dev/null | grep -v '^\./target/'; then
-    echo "FAIL: the scope list is copied outside src/auth.rs. Leave TIDAL_SCOPE unset." >&2
-    exit 1
-fi
+# The list lives in `DEFAULT_SCOPE` and nowhere else. `scripts/scope-check.py` reads
+# the working tree, the index and the untracked files, and fails when it cannot read
+# something. Every earlier shell version failed open in a different way.
+python3 scripts/scope-check.py
 
-echo "== ci runs this script"
+echo "== ci runs the scripts"
 # CI runs this script and nothing else. A workflow that copied the commands would
 # go green while the real gate drifted, which is the failure this whole script
 # exists to prevent.
@@ -50,6 +46,10 @@ if [[ ! -f $workflow ]]; then
 fi
 if ! grep -qE '^[[:space:]]*(run:[[:space:]]*)?scripts/preflight\.sh[[:space:]]*$' "$workflow"; then
     echo "FAIL: $workflow does not run scripts/preflight.sh. Naming it in a comment is not a call." >&2
+    exit 1
+fi
+if ! grep -qE '^[[:space:]]*(run:[[:space:]]*)?scripts/preflight-linux\.sh[[:space:]]*$' "$workflow"; then
+    echo "FAIL: $workflow has no job that runs scripts/preflight-linux.sh, so a Linux-only build break goes unseen." >&2
     exit 1
 fi
 if grep -nE 'cargo (test|clippy)' "$workflow"; then

@@ -198,6 +198,14 @@ pub trait TokenStore: Send + Sync {
     /// Clear the stored token. Fails when the underlying write is rejected, so
     /// the caller can tell that a persistent session was not cleared.
     fn clear(&self) -> Result<(), String>;
+    /// Whether this store keeps the token in the process and nowhere else. A test
+    /// that must not touch the real keychain asks this instead of probing with a
+    /// write, because a probe into the real store is the very harm it guards against.
+    ///
+    /// Asked on the trait rather than by type, because the scene and the test both
+    /// hold an `Arc<dyn TokenStore>`. The default is the careful answer: an unknown
+    /// store is treated as one that can persist.
+    fn is_memory(&self) -> bool;
 }
 
 /// An in-memory store for tests and non-macOS platforms.
@@ -207,6 +215,10 @@ pub struct MemoryStore {
 }
 
 impl TokenStore for MemoryStore {
+    fn is_memory(&self) -> bool {
+        true
+    }
+
     fn load(&self) -> Option<Token> {
         self.token.lock().unwrap().clone()
     }
@@ -234,6 +246,9 @@ impl KeychainStore {
 
 #[cfg(target_os = "macos")]
 impl TokenStore for KeychainStore {
+    fn is_memory(&self) -> bool {
+        false
+    }
     fn load(&self) -> Option<Token> {
         let json = self.entry.get_password().ok()?;
         serde_json::from_str(&json).ok()

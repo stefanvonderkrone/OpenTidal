@@ -22,6 +22,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The same gate on Linux. It catches one thing the Mac cannot: a macOS-only item
+  # with no counterpart for other targets, which compiles to nothing here and stops
+  # this crate building at all. That happened once on this branch, and only a Linux
+  # build found it. Nothing here needs a keychain or Time Machine.
+  linux-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      # winit links xkbcommon on Linux, and the runner image does not ship it.
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev
+      - name: Toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Off-macOS gate
+        run: scripts/preflight-linux.sh
+
   preflight:
     runs-on: macos-latest
     timeout-minutes: 30

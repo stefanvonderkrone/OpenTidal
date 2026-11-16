@@ -42,7 +42,8 @@ scripts/preflight.sh              # tests, clippy, the repo rules
 
 That same script runs in CI. `.github/workflows/preflight.yml` calls it on every
 pull request and on every push to `main`, on a macOS runner, because the macOS-only
-test paths compile to nothing elsewhere. A command added to the script needs no
+test paths compile to nothing elsewhere. A second job builds and tests the crate on
+Linux, which is what notices a macOS-only function that lost its counterpart. A command added to the script needs no
 workflow edit. `main` is protected, so the check must pass before a merge, an open
 review thread blocks a merge, and a direct push is rejected.
 

@@ -43,8 +43,8 @@ The on-disk half, in `src/store.rs`. One SQLite file, one row set per account.
   delete, and a create reuses the first empty one. Routes are never persisted,
   so a slot means the same playlist across a restart.
 - **write**: replace one account's whole library in one transaction. This is
-  `Store::save` in code, read as "save an album" nowhere else, because the album
-  verb is **save** above.
+  `Store::write` in code. It never means the album verb **save**, and an edit the
+  write has not landed yet is **unwritten**.
 
 ## State
 

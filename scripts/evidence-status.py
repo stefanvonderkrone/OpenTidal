@@ -23,6 +23,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DOC = ROOT / "docs" / "user-state.md"
 
+# In a `live:` cell a backticked word may be a pragma, a column or a command. Only
+# a name followed by parentheses is read as a test, because that is how a test is
+# written when it is called by name. A `test:` cell needs no guard: the kind
+# already says the name is a test.
+TEST_CALL = re.compile(r"`([a-z][a-z0-9_]*)`\(")
+
 
 def real_tests() -> set[str]:
     out = subprocess.run(
@@ -42,7 +48,17 @@ def real_tests() -> set[str]:
 
 
 def claimed_tests(doc: str) -> list[str]:
-    """Every backticked name in a Status cell, whatever the cell's kind."""
+    """Every backticked name a Status cell claims is a test.
+
+    The cell kind decides, not the name's length or shape.
+
+    - `test:` names tests, so every name is held to the test list however short.
+    - `live:` may also name the test that covers a hand check, written as
+      `name`() so it reads as a call. Any other backticked word there is a pragma,
+      a column or a command, and is not a claim about a test.
+    - `pending:` describes work this branch does not build, so nothing in it can
+      be a test here. A column or a command named there is not a claim.
+    """
     names: list[str] = []
     for line in doc.splitlines():
         if not line.startswith("|"):
@@ -50,20 +66,51 @@ def claimed_tests(doc: str) -> list[str]:
         status = line.rsplit("|", 2)[1]
         if ":" not in status:
             continue
-        names.extend(re.findall(r"`([^`]+)`", status))
+        kind, _, rest = status.partition(":")
+        kind = kind.strip()
+        found = re.findall(r"`([^`]+)`", rest)
+        if kind == "test":
+            names.extend(found)
+        elif kind == "live":
+            names.extend(TEST_CALL.findall(rest))
     return names
+
+
+def uncalled_test_names(doc: str, tests: set[str]) -> list[str]:
+    """Real test names in a `live:` cell that were not written as a call.
+
+    A `live:` cell may name a test as `name`(). Leaving the parentheses off is a
+    silent hole: the name is not in the claim list, so a rename there passes. This
+    catches the forgotten parentheses.
+    """
+    missing_call: list[str] = []
+    for line in doc.splitlines():
+        if not line.startswith("|"):
+            continue
+        status = line.rsplit("|", 2)[1]
+        kind, _, rest = status.partition(":")
+        if kind.strip() != "live":
+            continue
+        called = set(TEST_CALL.findall(rest))
+        for name in re.findall(r"`([a-z][a-z0-9_]*)`(?!\()", rest):
+            if name in tests and name not in called:
+                missing_call.append(name)
+    return missing_call
 
 
 def main() -> int:
     tests = real_tests()
-    claimed = claimed_tests(DOC.read_text())
-    # A cell may also name a command or a column, which no test can match. Only a
-    # name shaped like a test is held to the test list, and every such name must
-    # exist: an escape hatch here would hide exactly the rename this catches.
-    shaped_like_a_test = [
-        name for name in claimed if re.fullmatch(r"[a-z][a-z0-9_]{6,}", name)
-    ]
-    missing = [name for name in shaped_like_a_test if name not in tests]
+    doc = DOC.read_text()
+    claimed = claimed_tests(doc)
+    uncalled = uncalled_test_names(doc, tests)
+    if uncalled:
+        print("FAIL: a live: row names a test without (), so nothing checks it:", file=sys.stderr)
+        for name in sorted(set(uncalled)):
+            print(f"  {name}", file=sys.stderr)
+        return 1
+    # Every claimed name must exist. There is no escape hatch: a length or shape
+    # filter here would hide exactly the rename this catches.
+    missing = [name for name in claimed if name not in tests]
 
     if missing:
         print("FAIL: the evidence table names tests that do not exist:", file=sys.stderr)

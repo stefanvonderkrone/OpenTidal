@@ -7,9 +7,13 @@ Run `scripts/preflight.sh` before every commit. It runs the tests, runs clippy
 on this crate with warnings as errors, and checks the rules marked below.
 
 Work lands on `main` through a pull request. `main` is protected: the `preflight`
-check from GitHub Actions must pass, force pushes and deletions are blocked, and
-the rules apply to admins too. A direct push is rejected, so push a branch and
-open a pull request.
+check from GitHub Actions must pass, force pushes and deletions are blocked, the
+rules apply to admins too, and an open review thread blocks a merge until someone
+resolves it. A direct push is rejected, so push a branch and open a pull request.
+
+The workflow lives on a branch until it merges. Until `.github/workflows/preflight.yml`
+reaches `main`, a pull request cut from `main` gets no `preflight` run, so the
+required check never reports and that pull request cannot merge.
 
 | Rule | Enforced by |
 | --- | --- |

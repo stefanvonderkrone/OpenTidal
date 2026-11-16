@@ -43,8 +43,12 @@ scripts/preflight.sh              # tests, clippy, the repo rules
 That same script runs in CI. `.github/workflows/preflight.yml` calls it on every
 pull request and on every push to `main`, on a macOS runner, because the macOS-only
 test paths compile to nothing elsewhere. A command added to the script needs no
-workflow edit. `main` is protected, so the check must pass before a merge and a
-direct push is rejected.
+workflow edit. `main` is protected, so the check must pass before a merge, an open
+review thread blocks a merge, and a direct push is rejected.
+
+The workflow is on a branch until it merges. A pull request cut from `main` before
+then gets no `preflight` run, so the required check never reports and that pull
+request cannot merge.
 
 ```sh
 cargo test                       # the invariant proofs and the store tests

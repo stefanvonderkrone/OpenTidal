@@ -41,9 +41,10 @@ scripts/preflight.sh              # tests, clippy, the repo rules
 ```
 
 That same script runs in CI. `.github/workflows/preflight.yml` calls it on every
-pull request and on every push to `main`, on a macOS runner, because the keychain
-and Time Machine paths only compile there. A command added to the script needs no
-workflow edit.
+pull request and on every push to `main`, on a macOS runner, because the macOS-only
+test paths compile to nothing elsewhere. A command added to the script needs no
+workflow edit. `main` is protected, so the check must pass before a merge and a
+direct push is rejected.
 
 ```sh
 cargo test                       # the invariant proofs and the store tests

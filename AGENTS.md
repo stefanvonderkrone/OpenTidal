@@ -6,6 +6,11 @@ what enforces it, so a rule with no enforcement is a known repeat.
 Run `scripts/preflight.sh` before every commit. It runs the tests, runs clippy
 on this crate with warnings as errors, and checks the rules marked below.
 
+Work lands on `main` through a pull request. `main` is protected: the `preflight`
+check from GitHub Actions must pass, force pushes and deletions are blocked, and
+the rules apply to admins too. A direct push is rejected, so push a branch and
+open a pull request.
+
 | Rule | Enforced by |
 | --- | --- |
 | Leave `TIDAL_SCOPE` unset in docs and scripts. The list lives in `DEFAULT_SCOPE` only. | `scripts/preflight.sh`, which fails when the literal scope string appears outside `src/auth.rs` |
@@ -19,7 +24,7 @@ on this crate with warnings as errors, and checks the rules marked below.
 | One name per thing. `Store::write` writes the library, **save** means an album, the keychain is `tokens`. | `GLOSSARY.md`, and review. A second meaning has been introduced twice. |
 | A test named in the evidence table must exist. | `scripts/preflight.sh` runs `scripts/evidence-status.py`, which fails on a name with no test. |
 | A session that can write holds one `OpenLibrary`, never a loose id beside a handle. | The type. `open_library` is the only constructor. |
-| The gate that guards a commit also guards the push. Never copy its commands into a workflow. | `.github/workflows/preflight.yml` runs `scripts/preflight.sh` on every pull request and on every push to `main`, so a command added to the script runs in CI with no other edit. |
+| The gate that guards a commit also guards the push. Never copy its commands into a workflow. | `.github/workflows/preflight.yml` runs `scripts/preflight.sh` on every pull request and on every push to `main`, so a command added to the script runs in CI with no other edit. `main` is protected, so the check must pass before a merge. |
 
 ## Not yet enforced
 

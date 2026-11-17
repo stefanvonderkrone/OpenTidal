@@ -28,12 +28,12 @@ thread and wakes `AppSpec::poll`. `setup` attaches the waker. No tokio.
 
 Auth is a state machine on `App`. `SignedOut`, `Authorizing`, `SignedIn`. The
 OAuth flow is authorization code with PKCE (S256) and a loopback redirect. The
-refresh token persists in the macOS keychain.
+refresh token persists in `auth.toml` by default. The macOS keychain stays as an option.
 
 ## PR sequence
 
 1. `feat/tidal-boundary` — the `MusicService` boundary, the `User` and `Token`
-   types, PKCE auth with keychain persistence, and the signed-in name in the
+   types, PKCE auth with token persistence, and the signed-in name in the
    sidebar and Account screen. Fake-backed headless proof.
 2. `feat/tidal-catalogue` — fetch real artists, albums, tracks, and playlists,
    replace the placeholder `catalog.rs` with a store keyed by opaque string ids.

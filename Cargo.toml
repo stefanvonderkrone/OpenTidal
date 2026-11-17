@@ -11,14 +11,18 @@ exclude = ["rune"]
 rune = { path = "rune/crates/rune" }
 
 # Tidal API: a blocking reqwest client (rustls, no openssl), JSON parsing, and
-# the PKCE S256 primitives. Tokens persist in the macOS keychain.
+# the PKCE S256 primitives. Tokens persist in a file by default.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.9"
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 rusqlite = { version = "0.43.0", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }

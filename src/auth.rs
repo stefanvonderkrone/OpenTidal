@@ -3,7 +3,12 @@
 //! The HTTP exchange lives in [`crate::tidal`]; this module is the pure state,
 //! the crypto, and the parsing, so a test proves it without a network.
 
-use std::sync::Mutex;
+use std::{
+    ffi::OsStr,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
@@ -231,6 +236,165 @@ impl TokenStore for MemoryStore {
     }
 }
 
+/// The path of the token file. An absolute XDG_DATA_HOME wins; otherwise the
+/// path falls back to `~/.local/share`. Pure, so a test needs no environment.
+pub fn token_file_path(xdg_data_home: Option<&OsStr>, home: Option<&Path>) -> Option<PathBuf> {
+    let base = xdg_data_home
+        .map(Path::new)
+        .filter(|path| !path.as_os_str().is_empty() && path.is_absolute())
+        .map(Path::to_path_buf)
+        .or_else(|| home.filter(|path| !path.as_os_str().is_empty()).map(|path| path.join(".local/share")))?;
+    Some(base.join("opentidal/auth.toml"))
+}
+
+/// A token store that keeps the token in one TOML file.
+pub struct FileStore {
+    path: PathBuf,
+}
+
+impl FileStore {
+    /// Make a store for one token file.
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Make a store at the path the environment selects, if there is one.
+    pub fn from_env() -> Option<Self> {
+        let xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+        let home = std::env::var_os("HOME");
+        token_file_path(xdg_data_home.as_deref(), home.as_deref().map(Path::new)).map(Self::new)
+    }
+
+    fn write(&self, token: &Token) -> std::io::Result<()> {
+        let text = toml::to_string(token).map_err(std::io::Error::other)?;
+        let parent = self.path.parent().ok_or_else(|| std::io::Error::other("token file has no parent"))?;
+        let mut directory = std::fs::DirBuilder::new();
+        directory.recursive(true);
+        private_directory(&mut directory);
+        directory.create(parent)?;
+        let temporary = self.path.with_extension(format!("toml.{}.tmp", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        private_file(&mut options);
+        let mut file = match options.open(&temporary) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A stale temporary file from a crash is safe to remove. Creating
+                // with create_new refuses an existing symlink.
+                std::fs::remove_file(&temporary)?;
+                options.open(&temporary)?
+            }
+            Err(error) => return Err(error),
+        };
+        let mut temporary = TemporaryFile::new(temporary);
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temporary.path, &self.path)?;
+        temporary.disarm();
+        sync_directory(parent)?;
+        exclude_from_backup(&self.path);
+        Ok(())
+    }
+}
+
+/// A temporary token file. It removes itself unless the rename succeeds, so a
+/// failed write leaves no half-written file for the next launch to find.
+struct TemporaryFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TemporaryFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Make the renamed directory entry durable. `sync_all` on the file does not
+/// make its name in the directory survive a crash.
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+/// No equivalent on other platforms. The rename still completes.
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Keep the token out of a Time Machine backup, using the same extended
+/// attribute that `Store::open` sets on the database.
+#[cfg(target_os = "macos")]
+fn exclude_from_backup(path: &Path) {
+    let _ = std::process::Command::new("xattr")
+        .args([
+            "-w",
+            "com.apple.metadata:com_apple_backup_excludeItem",
+            "com.apple.backupd",
+            &path.to_string_lossy(),
+        ])
+        .status();
+}
+
+/// No Time Machine off macOS. The call site in `write` is unconditional.
+#[cfg(not(target_os = "macos"))]
+fn exclude_from_backup(_path: &Path) {}
+
+#[cfg(unix)]
+fn private_directory(directory: &mut std::fs::DirBuilder) {
+    use std::os::unix::fs::DirBuilderExt;
+    directory.mode(0o700);
+}
+
+#[cfg(not(unix))]
+fn private_directory(_directory: &mut std::fs::DirBuilder) {}
+
+#[cfg(unix)]
+fn private_file(options: &mut std::fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
+}
+
+#[cfg(not(unix))]
+fn private_file(_options: &mut std::fs::OpenOptions) {}
+
+impl TokenStore for FileStore {
+    fn is_memory(&self) -> bool {
+        false
+    }
+
+    fn load(&self) -> Option<Token> {
+        toml::from_str::<Token>(&std::fs::read_to_string(&self.path).ok()?).ok()
+    }
+
+    fn save(&self, token: &Token) {
+        if let Err(error) = self.write(token) {
+            eprintln!("opentidal: cannot write tokens to {}: {error}", self.path.display());
+        }
+    }
+
+    fn clear(&self) -> Result<(), String> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
 /// The macOS keychain, holding the token as JSON under one entry.
 #[cfg(target_os = "macos")]
 pub struct KeychainStore {
@@ -271,6 +435,111 @@ impl TokenStore for KeychainStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_token_file_lives_under_xdg_data_home() {
+        assert_eq!(
+            token_file_path(Some(OsStr::new("/data")), Some(Path::new("/home/user"))),
+            Some(PathBuf::from("/data/opentidal/auth.toml"))
+        );
+        assert_eq!(
+            token_file_path(Some(OsStr::new("/data")), None),
+            Some(PathBuf::from("/data/opentidal/auth.toml"))
+        );
+    }
+
+    #[test]
+    fn without_xdg_data_home_the_token_file_falls_back_to_local_share() {
+        for xdg in [None, Some(OsStr::new("")), Some(OsStr::new("relative"))] {
+            assert_eq!(
+                token_file_path(xdg, Some(Path::new("/home/user"))),
+                Some(PathBuf::from("/home/user/.local/share/opentidal/auth.toml"))
+            );
+            assert_eq!(token_file_path(xdg, None), None);
+            assert_eq!(token_file_path(xdg, Some(Path::new(""))), None);
+        }
+    }
+
+    #[test]
+    fn a_file_store_survives_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("opentidal/auth.toml");
+        let token = Token { access_token: "a".into(), refresh_token: "r".into(), expires_in: 86400 };
+        let store = FileStore::new(path.clone());
+        assert!(!store.is_memory());
+        assert_eq!(store.load(), None);
+        store.save(&token);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "access_token = \"a\"\nrefresh_token = \"r\"\nexpires_in = 86400\n"
+        );
+        let restarted = FileStore::new(path);
+        assert_eq!(restarted.load(), Some(token));
+        restarted.clear().unwrap();
+        assert_eq!(restarted.load(), None);
+        assert!(restarted.clear().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_token_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("opentidal/auth.toml");
+        let store = FileStore::new(path.clone());
+        store.save(&Token { access_token: "a".into(), refresh_token: "r".into(), expires_in: 1 });
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        #[cfg(target_os = "macos")]
+        {
+            let out = std::process::Command::new("xattr")
+                .args(["-p", "com.apple.metadata:com_apple_backup_excludeItem", &path.to_string_lossy()])
+                .output()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&out.stdout).contains("com.apple.backupd"));
+        }
+    }
+
+    #[test]
+    fn a_failed_write_keeps_the_previous_token() {
+        if std::process::Command::new("id").arg("-u").output().is_ok_and(|output| output.stdout == b"0\n") {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("opentidal/auth.toml");
+        let store = FileStore::new(path.clone());
+        let token = Token { access_token: "a".into(), refresh_token: "r".into(), expires_in: 1 };
+        store.save(&token);
+        let temporary = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+        std::fs::create_dir(&temporary).unwrap();
+        store.save(&Token { access_token: "b".into(), ..token.clone() });
+        assert_eq!(store.load(), Some(token));
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("opentidal/auth.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A directory at the target makes the rename fail after the temporary
+        // file has been written, which is where a half-written file would stay.
+        std::fs::create_dir(&path).unwrap();
+        FileStore::new(path).save(&Token { access_token: "a".into(), refresh_token: "r".into(), expires_in: 1 });
+        let leftovers: Vec<_> = std::fs::read_dir(directory.path().join("opentidal"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "a failed write left a temporary token file");
+    }
+
+    #[test]
+    fn a_corrupt_token_file_reads_as_signed_out() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.toml");
+        std::fs::write(&path, "not a token").unwrap();
+        assert_eq!(FileStore::new(path).load(), None);
+    }
 
     /// The verifier survives a round trip through the challenge (the challenge
     /// is deterministic and non-empty, and never leaks the verifier).

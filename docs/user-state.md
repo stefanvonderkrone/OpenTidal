@@ -1,10 +1,10 @@
 # User state on disk
 
 The signed-in user and their library survive a restart in one SQLite file.
-A fresh install has no session. Sign-in writes the token to the keychain and
+A fresh install has no session. Sign-in writes the token to the token store and
 the user row to the file. A restart shows the name before any network call.
 
-The keychain holds the secret and nothing else. The file holds no token, so a
+The token store holds the secret and nothing else. The file holds no token, so a
 copy of the file grants no access to Tidal.
 
 ## Key
@@ -14,7 +14,7 @@ token, through `auth::decode_claims(...).user_id()` in `src/auth.rs`. That
 function already exists and already has a test.
 
 ```rust
-let token = store.load()?;                 // keychain
+let token = store.load()?;                 // token store
 let uid = decode_claims(&token.access_token)?.user_id()?;
 ```
 
@@ -23,9 +23,9 @@ a refresh never touches the file.
 
 A hash of the access token does not work. The access token rotates on every
 refresh, so the key would move and every refresh would have to move the user
-row. A crash between the keychain write and the row move loses the user. The
+row. A crash between the token write and the row move loses the user. The
 hash also gives no security, because the token it hashes already sits in the
-keychain.
+token store.
 
 ## Store
 
@@ -95,7 +95,7 @@ Notes:
 - `track_id`, `album_id`, `artist_id` hold integer catalogue indices. The
   catalogue ships with the app and never changes, so the schema cannot carry
   a foreign key to it. `Library::check` validates these ids on load.
-- No `is_active` column. The keychain token decides who is active. A stored
+- No `is_active` column. The token store decides who is active. A stored
   flag would be a second source of truth and could disagree after a crash.
 
 ## Start
@@ -111,7 +111,7 @@ The start path runs in this order. It never blocks on the network.
 3. `user_id()` found, user row found. Signed in at once, name from the row.
 4. `user_id()` found, row missing. Signed in, name `You`, profile fetch fills
    the row. A missing row is not an error.
-5. If `token_expired(&token)`, refresh. Refresh writes the keychain only.
+5. If `token_expired(&token)`, refresh. Refresh writes the token store only.
 6. Fetch the profile and update `user.name` and `user.updated_at`.
 
 The refresh in step 5 can fail. A `401` or `400` from the token endpoint means
@@ -133,19 +133,19 @@ next start, which is the next thing that tries.
 
 ## Writes
 
-- Sign-in: write the keychain, then the `user` row. The code writes the token
+- Sign-in: write the token store, then the `user` row. The code writes the token
   first, because the token is what makes a session real. A row without a token
   is inert, and a token without a row loads as a new account.
-- Sign-out: write what is outstanding, then clear the keychain, then drop the
+- Sign-out: write what is outstanding, then clear the token store, then drop the
   in-memory library and close the database. The rows stay on disk, so the same
   account finds them on its next sign-in. A kept library in memory would show one
   account's data while another is signed in.
   When the write fails, sign-out does not happen. The session stays `SignedIn`,
   the library stays in memory with its unwritten edits, and the Account screen
-  says why. Clearing the keychain there would drop the only copy of those edits.
+  says why. Clearing the token store there would drop the only copy of those edits.
   `sign_out_keeps_unwritten_edits` holds this. A session with no open library
   always signs out, because it has nowhere to write and nothing to lose.
-- Refresh: keychain only. No file write. This is the gain over a rotating key.
+- Refresh: token store only. No library write. This is the gain over a rotating key.
 - Profile fetch: update `user.name`.
 - Library change: one comparison per frame, not a write per operation. The app
   keeps the library as last written, and `drain` writes when the two differ. This
@@ -321,17 +321,17 @@ nothing there is a test.
 | A failed write loses nothing | Abort a child insert with a trigger, assert the previous library loads | test: `a_failed_write_is_atomic` |
 | A repeated write makes no duplicates | Write twice, assert one row per bit | test: `write_is_idempotent` |
 | An email is not a display name | A profile whose `username` is an address asserts `You` | test: `an_email_is_not_used_as_a_name` |
-| The key holds offline | `uid` read from the keychain alone, no network, before any fetch | test: `the_user_id_comes_from_the_token`, `the_fake_token_names_no_user` |
+| The key holds offline | `uid` read from the token store alone, no network, before any fetch | test: `the_user_id_comes_from_the_token`, `the_fake_token_names_no_user` |
 | The file is private | `stat -f '%Lp'` returns `600` | live: 2026-11-15, plus `a_restart_reads_the_written_library`() |
 | Schema is sound | `PRAGMA integrity_check` is `ok` and no row has an orphan `user_id` | live: 2026-11-15, plus `replacement_removes_stale_rows`() |
 | A like reaches the disk from a live session | Like a track, wait for idle, read the row | live: 2026-11-15 |
 | Token is not in the file | `strings opentidal.db` shows no token | live: 2026-11-15, and the schema has no token column |
 | The database is out of the backup | `xattr -p com.apple.metadata:com_apple_backup_excludeItem` shows `com.apple.backupd` | test: `the_database_is_excluded_from_backups`, `the_apps_own_directory_is_excluded_from_backups` |
 | The excluded directory is the real one | The real config and database path functions feed the matcher | test: `the_default_database_directory_is_the_one_excluded` |
-| No data loss at sign-in | Kill the process between the keychain write and the library write, and the reverse | pending: no kill harness. The keychain-first order makes a token without a row read as a new account, so the loss is a name, not the library |
+| No data loss at sign-in | Kill the process between the token write and the library write, and the reverse | pending: no kill harness. The token-first order makes a token without a row read as a new account, so the loss is a name, not the library |
 | Start needs no network | Launch with the network off, name and playlist visible | pending: no test. Start reads the disk first, then fetches the profile |
 | A library screen needs no network | Open Liked Songs offline, assert the disk rows paint | pending: no test |
-| A refresh writes no rows | Count rows before and after a refresh, `user_version` unchanged | pending: no test. A refresh writes the keychain only |
+| A refresh writes no rows | Count rows before and after a refresh, `user_version` unchanged | pending: no test. A refresh writes the token store only |
 | A partial sync loses nothing | Fail the read after page 2, assert every row is still present | pending: sync PR |
 | A partial sync deletes nothing | Same test, assert the delete pass did not run | pending: sync PR |
 | An invalid history row cannot hide a valid entry | Seed an unknown track then two distinct valid ones, assert both load | test: `an_unknown_history_row_does_not_hide_a_valid_one` |
@@ -346,5 +346,5 @@ Read against a real account on 2026-11-15.
   refresh needs no row move.
 - The access token lives about four hours. A doctored `exp` claim sends the app
   down the refresh path, so the refresh is testable without the wait.
-- After sign-out the keychain holds the `signed-out` sentinel, and a start reads
-  it as no token.
+- After sign-out the default token store has no `auth.toml`, and a start reads
+  it as no token. The keychain option keeps its `signed-out` sentinel.

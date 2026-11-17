@@ -18,6 +18,7 @@ required check never reports and that pull request cannot merge.
 
 | Rule | Enforced by |
 | --- | --- |
+| The token file path comes only from `token_file_path`. It uses `XDG_DATA_HOME` with the `~/.local/share` fallback, mode 0600, atomic replace, and the backup-exclusion flag on macOS. | `cargo test`, `the_token_file_lives_under_xdg_data_home`, `without_xdg_data_home_the_token_file_falls_back_to_local_share`, `the_token_file_is_private`, `a_file_store_survives_a_restart`, and `a_failed_write_keeps_the_previous_token` |
 | Leave `TIDAL_SCOPE` unset in docs and scripts. The list lives in `DEFAULT_SCOPE` only. | `scripts/scope-check.py`, run by `scripts/preflight.sh`. It fails on the literal list or on any assignment of the variable outside `src/auth.rs`, in the working tree, the index or an untracked file |
 | A `Library` field is stored by `src/store.rs` and checked by `Library::check`, or it is not part of the library. | `cargo test`. The round-trip test compares whole libraries, so a new field with no column fails it. |
 | A session that can write has its library on disk before the app rests or quits. A quit that cannot write reports the lost edits, because nothing can refuse a quit. The deterministic build has no store by design, so it keeps nothing. | `cargo test`, `only_a_dirty_library_asks_for_a_frame`, `a_quit_writes_what_is_outstanding` and `a_quit_that_cannot_write_reports_the_edits_as_lost` |

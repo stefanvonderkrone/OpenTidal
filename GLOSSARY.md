@@ -37,8 +37,10 @@ The on-disk half, in `src/store.rs`. One SQLite file, one row set per account.
 
 - **store**: the SQLite database at
   `~/Library/Application Support/OpenTidal/opentidal.db`.
-- **keychain**: the token store. It holds the token and nothing else. Code calls
-  it `tokens`.
+- **tokens**: the token store. The default is the token file at
+  `$XDG_DATA_HOME/opentidal/auth.toml`, with `~/.local/share` as the fallback.
+  `OPENTIDAL_TOKENS=keychain` or `"tokens": "keychain"` in the config selects the macOS keychain.
+  The store holds the token and nothing else.
 - **slot**: a position in the fixed playlist array. A slot is empty after a
   delete, and a create reuses the first empty one. Routes are never persisted,
   so a slot means the same playlist across a restart.
@@ -74,6 +76,6 @@ today; the catalogue and library stay local until the later PRs move them.
 - **session** — the signed-in state on `App`, not `State`. Its variants are
   `SignedOut`, `Authorizing`, `SignedIn`, and `Failed`, from `src/auth.rs`.
 - **token** — an OAuth access token and its refresh token. The refresh token
-  persists in the macOS keychain.
+  persists in the token file or the macOS keychain.
 - **user id**: Tidal's account id, from the `uid` claim of the access token.
   It is the database key. It does not change on a refresh or a fresh sign-in.

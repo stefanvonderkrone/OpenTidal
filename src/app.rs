@@ -624,7 +624,7 @@ impl Default for App {
             Arc::new(tidal::FakeService::default())
         };
         let tokens: Arc<dyn TokenStore> = if live {
-            keychain_store()
+            token_store(&env_or("OPENTIDAL_TOKENS", &file.tokens))
         } else {
             Arc::new(auth::MemoryStore::default())
         };
@@ -697,6 +697,8 @@ fn env_or(name: &str, fallback: &str) -> String {
 #[derive(Default, Deserialize)]
 struct FileConfig {
     #[serde(default)]
+    tokens: String,
+    #[serde(default)]
     live: bool,
     #[serde(default)]
     client_id: String,
@@ -750,15 +752,43 @@ fn config_path_under(home: &std::path::Path) -> Option<std::path::PathBuf> {
     Some(home.join(sub))
 }
 
-/// The macOS keychain store, or an in-memory store on other platforms.
-fn keychain_store() -> Arc<dyn TokenStore> {
+fn wants_keychain(choice: &str) -> bool {
+    choice.trim() == "keychain"
+}
+
+fn token_store(choice: &str) -> Arc<dyn TokenStore> {
+    token_store_with(choice, auth::FileStore::from_env(), keychain_store)
+}
+
+/// The keychain store, when this platform has one. Called only when chosen.
+fn keychain_store() -> Option<Arc<dyn TokenStore>> {
     #[cfg(target_os = "macos")]
     {
-        Arc::new(auth::KeychainStore::new("opentidal", "tidal"))
+        Some(Arc::new(auth::KeychainStore::new("opentidal", "tidal")))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Arc::new(auth::MemoryStore::default())
+        eprintln!("opentidal: keychain tokens are only available on macOS. Using the token file.");
+        None
+    }
+}
+
+/// Both stores are passed in so a test can prove the default writes a file
+/// without ever opening the real keychain.
+fn token_store_with(
+    choice: &str,
+    file: Option<auth::FileStore>,
+    keychain: fn() -> Option<Arc<dyn TokenStore>>,
+) -> Arc<dyn TokenStore> {
+    if wants_keychain(choice) && let Some(store) = keychain() {
+        return store;
+    }
+    match file {
+        Some(store) => Arc::new(store),
+        None => {
+            eprintln!("opentidal: no token file path is available. Tokens stay in memory.");
+            Arc::new(auth::MemoryStore::default())
+        }
     }
 }
 
@@ -766,6 +796,28 @@ fn keychain_store() -> Arc<dyn TokenStore> {
 mod tests {
     use super::*;
     use crate::catalog::TrackId;
+
+    #[test]
+    fn the_default_token_store_is_the_file() {
+        // Check the choice before opening a store, so a wrong default cannot
+        // reach the real keychain from a test.
+        assert!(!wants_keychain(""));
+        assert!(!wants_keychain("file"));
+        assert!(!wants_keychain("unknown"));
+        assert!(wants_keychain("keychain"));
+        assert!(wants_keychain(" keychain "));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.toml");
+        let store = token_store_with("", Some(auth::FileStore::new(path.clone())), || None);
+        assert!(!store.is_memory());
+        store.save(&auth::Token {
+            access_token: "a".into(),
+            refresh_token: "r".into(),
+            expires_in: 1,
+        });
+        let token = auth::FileStore::new(path).load().unwrap();
+        assert_eq!(token.access_token, "a");
+    }
 
     /// The directory this app really keeps its database in is the one the backup
     /// exclusion matches. Both halves are the real functions, so a change to where

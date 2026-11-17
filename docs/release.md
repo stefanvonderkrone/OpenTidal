@@ -30,9 +30,10 @@ token without prompting, across updates.
 - The loopback redirect (`http://127.0.0.1:PORT/callback`) works today. A custom
   scheme is the alternative if Tidal changes its redirect policy.
 
-## 3. Keychain storage
+## 3. Optional keychain storage
 
-- Tokens live in the macOS keychain under service `opentidal`, account `tidal`.
+- The default token store is `auth.toml` under XDG_DATA_HOME. The keychain stays
+  as an option under service `opentidal`, account `tidal`.
 - Prefer `kSecAttrAccessibleAfterFirstUnlock`, so the app can read the token at
   launch while the keychain is still locked. `keyring` does not expose this.
   Switching the store to `security-framework` is the follow-up when launch reads
@@ -67,7 +68,7 @@ file instead. The file is the operator's and stays out of the repo.
   list drifts from [`DEFAULT_SCOPE`](../src/auth.rs) and from the Tidal
   documentation. The list changed twice already.
 - The client id and secret never enter the repo. The user signs in once through
-  the browser, and the refresh token lands in the keychain. On later launches
+  the browser, and the refresh token lands in the token store. On later launches
   the app restores the session and refreshes an expired access token
   automatically, so the user signs in only when the refresh token is revoked.
 

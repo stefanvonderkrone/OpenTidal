@@ -286,12 +286,53 @@ impl FileStore {
             }
             Err(error) => return Err(error),
         };
+        let mut temporary = TemporaryFile::new(temporary);
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
-        std::fs::rename(temporary, &self.path)?;
+        std::fs::rename(&temporary.path, &self.path)?;
+        temporary.disarm();
+        sync_directory(parent)?;
         exclude_from_backup(&self.path);
         Ok(())
     }
+}
+
+/// A temporary token file. It removes itself unless the rename succeeds, so a
+/// failed write leaves no half-written file for the next launch to find.
+struct TemporaryFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TemporaryFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Make the renamed directory entry durable. `sync_all` on the file does not
+/// make its name in the directory survive a crash.
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+/// No equivalent on other platforms. The rename still completes.
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Keep the token out of a Time Machine backup, using the same extended
@@ -473,6 +514,23 @@ mod tests {
         std::fs::create_dir(&temporary).unwrap();
         store.save(&Token { access_token: "b".into(), ..token.clone() });
         assert_eq!(store.load(), Some(token));
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("opentidal/auth.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A directory at the target makes the rename fail after the temporary
+        // file has been written, which is where a half-written file would stay.
+        std::fs::create_dir(&path).unwrap();
+        FileStore::new(path).save(&Token { access_token: "a".into(), refresh_token: "r".into(), expires_in: 1 });
+        let leftovers: Vec<_> = std::fs::read_dir(directory.path().join("opentidal"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "a failed write left a temporary token file");
     }
 
     #[test]

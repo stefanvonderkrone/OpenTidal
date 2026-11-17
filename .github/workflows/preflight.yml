@@ -1,0 +1,68 @@
+name: preflight
+
+# One gate for every change. Pull requests and pushes to main run the same
+# `scripts/preflight.sh` a developer runs before a commit, so there is no second
+# copy of the commands to drift apart from the first.
+#
+# macOS, not Linux. The tests that cover the macOS-only paths compile to nothing
+# elsewhere, so a Linux job cannot see them: the Time Machine exclusion test is
+# the one that proves the database stays out of a backup. A Linux build also needs
+# `libxkbcommon-dev` to link, which is another thing to keep in step by hand.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push replaces a run still going: only the newest commit matters.
+concurrency:
+  group: preflight-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  # The same gate on Linux. It catches one thing the Mac cannot: a macOS-only item
+  # with no counterpart for other targets, which compiles to nothing here and stops
+  # this crate building at all. That happened once on this branch, and only a Linux
+  # build found it. Nothing here needs a keychain or Time Machine.
+  linux-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      # winit links xkbcommon on Linux, and the runner image does not ship it.
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev
+      - name: Toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Off-macOS gate
+        run: scripts/preflight-linux.sh
+
+  preflight:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      # `rust-toolchain.toml` names the version and its components, so it stays the
+      # only place a version is written. This step proves in the log which toolchain
+      # actually ran, and rustup installs whatever the file names. The bash line is
+      # here because `preflight.sh` starts with `#!/usr/bin/env bash` and takes the
+      # first bash on PATH, which decides whether the script runs under 3.2 or 5.
+      - name: Toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version
+          cargo --version
+          bash --version | head -1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The vendored rune tree is most of the build time. Keep what a failed or
+          # cancelled run compiled, so the next attempt starts closer to done.
+          cache-on-failure: true
+      - name: Preflight
+        run: scripts/preflight.sh

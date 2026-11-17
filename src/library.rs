@@ -7,7 +7,6 @@
 //! sizes and calls [`Library::check`] after every step.
 
 use crate::catalog::{AlbumId, ArtistId, TrackId};
-#[cfg(test)]
 use crate::catalog;
 
 #[cfg(not(test))]
@@ -91,7 +90,6 @@ impl Default for Library {
 }
 
 /// A safety violation, named so the random-walk test reports what broke.
-#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Violation {
     LikedOutOfRange,
@@ -306,9 +304,7 @@ impl Library {
 
     /// Every reference the library holds is in range and within its cap. This
     /// is the property the exhaustive proof and the random walk both check
-    /// after every operation. Test-only: the proof invokes it, the binary
-    /// does not.
-    #[cfg(test)]
+    /// after every operation. The store also calls it on load.
     pub fn check(&self) -> Result<(), Violation> {
         if self.liked & !catalog::track_mask() != 0 {
             return Err(Violation::LikedOutOfRange);
@@ -371,7 +367,6 @@ impl Library {
 
 /// True when a slice has a duplicate. Shared by the three duplicate checks in
 /// [`Library::check`].
-#[cfg(test)]
 fn has_dup<T: PartialEq>(xs: &[T]) -> bool {
     xs.iter().enumerate().any(|(i, x)| xs[..i].contains(x))
 }
@@ -480,12 +475,10 @@ mod tests {
     /// a checker that actually detects violations.
     #[test]
     fn check_detects_violations() {
-        let mut l = Library::default();
-        l.liked = crate::catalog::track_mask() + 1;
+        let l = Library { liked: crate::catalog::track_mask() + 1, ..Default::default() };
         assert_eq!(l.check(), Err(Violation::LikedOutOfRange));
 
-        let mut l = Library::default();
-        l.history = vec![TrackId(200)];
+        let l = Library { history: vec![TrackId(200)], ..Default::default() };
         assert_eq!(l.check(), Err(Violation::HistoryOutOfRange));
 
         let mut l = Library::default();

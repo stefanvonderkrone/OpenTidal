@@ -8,6 +8,7 @@ mod catalog;
 mod library;
 mod screens;
 mod state;
+mod store;
 mod tidal;
 
 use rune::tok::{self, radius, space, type_};
@@ -27,20 +28,76 @@ const HEART: Icon = Icon { name: "heart", view: 24.0, body: "<path d=\"M12 21s-6
 
 type Scene = (&'static str, fn(&mut App));
 
-const SCENES: [Scene; 5] = [
+const SCENES: [Scene; 6] = [
     ("default", |_| {}),
     ("accent-blue", |a| a.core.accent = 0),
     ("accent-pink", |a| a.core.accent = 2),
     ("paused", |a| a.core.playing = false),
     ("signed-in", |a| {
+        a.core.lib.set_name("Fake User".to_string());
         a.auth = auth::Auth::SignedIn {
             token: auth::Token { access_token: "fake".to_string(), refresh_token: "fake".to_string(), expires_in: 0 },
-            name: "Fake User".to_string(),
         };
     }),
+    ("signed-in-stored", signed_in_stored_scene),
 ];
 
+/// Signs in as a user the database can key on, so a driven scene proves the write
+/// reaches disk. The token is a JWT because the key comes from its `uid` claim.
+///
+/// The scene writes a fabricated token and a fabricated library, so it owns both
+/// stores. With live mode on, `App::default` hands the app the real keychain and the
+/// real database path, and a drive would replace the developer's session with a fake.
+/// That happened: an old binary in live mode replaced a real token. Forcing both here
+/// is what stops it, and `the_stored_scene_owns_its_store_and_its_database` checks it.
+fn signed_in_stored_scene(a: &mut App) {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let payload = URL_SAFE_NO_PAD.encode(br#"{"uid":173210380,"exp":4102444800}"#);
+    let token = auth::Token {
+        access_token: format!("h.{payload}.sig"),
+        refresh_token: "fake-refresh".to_string(),
+        expires_in: 0,
+    };
+    a.live = false;
+    a.service = std::sync::Arc::new(tidal::FakeService::default());
+    a.tokens = std::sync::Arc::new(auth::MemoryStore::default());
+    // A scratch database, so the library this scene writes cannot land in the real
+    // one. `OPENTIDAL_DB` names the file outright, which is the contract `db_path`
+    // keeps: a run that pointed two instances at one file needs exactly that file.
+    // Without it, a directory of this run's own, named for the process.
+    // A path already set on the app is kept: a test points the scene at its own file,
+    // and the scene must write there rather than somewhere of its own choosing.
+    let db = a.db_override.clone().or_else(|| {
+        std::env::var("OPENTIDAL_DB")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+    }).unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("opentidal-scenes")
+                .join(format!("run-{}", std::process::id()))
+                .join("scene.db")
+    });
+    if let Some(dir) = db.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    a.db_override = Some(db);
+    // A driven scene must never write a fabricated token into the real keychain. The
+    // assignment above is the fix; this refuses the drive if it ever stops working,
+    // rather than replacing someone's session in silence.
+    assert!(
+        a.tokens.is_memory(),
+        "the stored scene has a persistent token store, so a drive would overwrite a real session"
+    );
+    a.tokens.save(&token);
+    a.setup(std::sync::Arc::new(|| ()));
+    a.core.lib.set_name("Stored User".to_string());
+}
+
 fn view(app: &App, _cx: &mut Cx<App>) -> El {
+    // The library may have changed during this frame's events. Ask for one more
+    // frame so `drain` writes it; a window at rest draws none.
+    app.wake_if_dirty();
     let s = &app.core;
     let t = tok::theme(true);
     let accent = tok::accent(s.accent, true);
@@ -122,7 +179,7 @@ fn sidebar(app: &App, t: tok::Theme, accent: Color) -> El {
         }
     }
 
-    let name = app.auth.name().map(str::to_string).unwrap_or_else(|| s.lib.name.clone());
+    let name = s.lib.name.clone();
     let user = text(&name)
         .key("user-name")
         .font(type_::LABEL)
@@ -339,7 +396,7 @@ fn volume(t: tok::Theme, accent: Color) -> El {
 }
 
 fn main() {
-    rune::run(AppSpec::<App> {
+    let spec = AppSpec::<App> {
         scenes: &SCENES,
         setup: Some(|app, waker| app.setup(waker)),
         poll: Some(|app, _t, _tx| app.drain()),
@@ -350,5 +407,16 @@ fn main() {
             false
         }),
         ..AppSpec::new("OpenTidal", (1280.0, 800.0), App::default, view)
-    });
+    };
+    // A quit takes the fast path, which drops no state, so the last save must
+    // happen in a window hook. `AppSpec` has no hook fields, so drive the app
+    // through `App`, which does.
+    rune::App::new(spec)
+        .on_quit(|app, _tx| {
+            app.quit();
+        })
+        .on_close(|app, _tx| {
+            app.quit();
+        })
+        .run();
 }

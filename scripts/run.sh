@@ -3,8 +3,8 @@
 # identity, so the macOS keychain does not ask for the token on every launch.
 # For live mode set OPENTIDAL_LIVE=1 and the TIDAL_* env vars:
 #   OPENTIDAL_LIVE=1 TIDAL_CLIENT_ID=... TIDAL_CLIENT_SECRET=... \
-#   TIDAL_REDIRECT_URI=http://127.0.0.1:8080/callback \
-#   TIDAL_SCOPE="user.read collection.read playlists.read entitlements.read recommendations.read search.read" scripts/run.sh
+#   TIDAL_REDIRECT_URI=http://127.0.0.1:8080/callback scripts/run.sh
+# Leave TIDAL_SCOPE unset to request every read scope the app needs.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -54,28 +54,17 @@ pub const DEFAULT_SCOPE: &str =
 
 /// The auth state. A variant carries only the data valid in it: a login in
 /// flight holds its verifier and state, a signed-in state holds a token.
-#[derive(Clone, PartialEq, Eq, Debug)]
+///
+/// The display name is not here. It belongs to the library, which is what a
+/// restart reads before any network call, so one stored name serves the
+/// sidebar, the Account page, and the profile fetch.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub enum Auth {
+    #[default]
     SignedOut,
     Authorizing { state: String, verifier: String },
-    SignedIn { token: Token, name: String },
+    SignedIn { token: Token },
     Failed { message: String },
-}
-
-impl Default for Auth {
-    fn default() -> Self {
-        Auth::SignedOut
-    }
-}
-
-impl Auth {
-    /// The displayed name, or `None` while signed out.
-    pub fn name(&self) -> Option<&str> {
-        match self {
-            Auth::SignedIn { name, .. } => Some(name),
-            _ => None,
-        }
-    }
 }
 
 /// A random PKCE code verifier: 32 bytes, base64url, no padding.
@@ -141,21 +130,17 @@ pub fn parse_token(json: &str, fallback_refresh: &str) -> Result<Token, String> 
 }
 
 /// The claims of a Tidal access token, which is a JWT. The `uid` claim is the
-/// user id (Tidal's tokens carry `uid`, not the OIDC `sub`); the name fields
-/// vary, so read them in order. `exp` is the absolute expiry, in seconds since
-/// the Unix epoch.
+/// user id (Tidal's tokens carry `uid`, not the OIDC `sub`). `exp` is the
+/// absolute expiry, in seconds since the Unix epoch.
+///
+/// The token carries no display name, so the profile name comes from
+/// `/users/me` in [`crate::tidal`].
 #[derive(Default, Deserialize)]
 pub struct JwtClaims {
     #[serde(default)]
     pub uid: Option<serde_json::Value>,
     #[serde(default)]
     pub sub: Option<String>,
-    #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub email: Option<String>,
     #[serde(default)]
     pub exp: Option<u64>,
 }
@@ -171,15 +156,6 @@ impl JwtClaims {
             _ => None,
         });
         uid.or_else(|| self.sub.clone()).filter(|s| !s.is_empty())
-    }
-
-    /// A display name from the token, in order of preference.
-    pub fn display_name(&self) -> Option<String> {
-        [&self.username, &self.name, &self.email]
-            .into_iter()
-            .flatten()
-            .map(|s| s.trim().to_string())
-            .find(|s| !s.is_empty())
     }
 }
 
@@ -222,6 +198,14 @@ pub trait TokenStore: Send + Sync {
     /// Clear the stored token. Fails when the underlying write is rejected, so
     /// the caller can tell that a persistent session was not cleared.
     fn clear(&self) -> Result<(), String>;
+    /// Whether this store keeps the token in the process and nowhere else. A test
+    /// that must not touch the real keychain asks this instead of probing with a
+    /// write, because a probe into the real store is the very harm it guards against.
+    ///
+    /// Asked on the trait rather than by type, because the scene and the test both
+    /// hold an `Arc<dyn TokenStore>`. The default is the careful answer: an unknown
+    /// store is treated as one that can persist.
+    fn is_memory(&self) -> bool;
 }
 
 /// An in-memory store for tests and non-macOS platforms.
@@ -231,6 +215,10 @@ pub struct MemoryStore {
 }
 
 impl TokenStore for MemoryStore {
+    fn is_memory(&self) -> bool {
+        true
+    }
+
     fn load(&self) -> Option<Token> {
         self.token.lock().unwrap().clone()
     }
@@ -258,6 +246,9 @@ impl KeychainStore {
 
 #[cfg(target_os = "macos")]
 impl TokenStore for KeychainStore {
+    fn is_memory(&self) -> bool {
+        false
+    }
     fn load(&self) -> Option<Token> {
         let json = self.entry.get_password().ok()?;
         serde_json::from_str(&json).ok()
@@ -330,15 +321,6 @@ mod tests {
         assert_eq!(t.access_token, "b");
     }
 
-    /// The auth state exposes its name and token only while signed in.
-    #[test]
-    fn auth_name_only_when_signed_in() {
-        let a = Auth::default();
-        assert_eq!(a.name(), None);
-        let a = Auth::SignedIn { token: Token { access_token: "a".into(), refresh_token: "r".into(), expires_in: 1 }, name: "Ada".into() };
-        assert_eq!(a.name(), Some("Ada"));
-    }
-
     /// The memory store round-trips a token.
     #[test]
     fn memory_store_round_trips() {
@@ -351,15 +333,15 @@ mod tests {
         assert_eq!(store.load(), None);
     }
 
-    /// The JWT decoder reads `sub` and the name from the token payload.
+    /// The JWT decoder reads `sub` and `uid` from the token payload.
     #[test]
-    fn decode_claims_reads_sub_and_name() {
+    fn decode_claims_reads_sub_and_uid() {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-        let payload = URL_SAFE_NO_PAD.encode(br#"{"sub":"123","username":"ada"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"sub":"123","uid":"456"}"#);
         let token = format!("h.{payload}.sig");
         let claims = decode_claims(&token).unwrap();
         assert_eq!(claims.sub.as_deref(), Some("123"));
-        assert_eq!(claims.display_name().as_deref(), Some("ada"));
+        assert_eq!(claims.user_id().as_deref(), Some("456"));
     }
 
     /// Tidal tokens carry the user id in `uid`; `user_id` prefers it over `sub`

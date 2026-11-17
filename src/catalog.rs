@@ -164,19 +164,16 @@ pub fn tracks_of_artist(id: ArtistId) -> impl Iterator<Item = Track> + 'static {
 }
 
 /// The bitmask that covers every valid track id: bits `0..TRACKS.len()`.
-#[cfg(test)]
 pub fn track_mask() -> u32 {
     (1u32 << TRACKS.len()) - 1
 }
 
 /// The bitmask that covers every valid album id.
-#[cfg(test)]
 pub fn album_mask() -> u32 {
     (1u32 << ALBUMS.len()) - 1
 }
 
 /// The bitmask that covers every valid artist id.
-#[cfg(test)]
 pub fn artist_mask() -> u32 {
     (1u32 << ARTISTS.len()) - 1
 }

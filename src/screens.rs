@@ -616,13 +616,38 @@ pub fn settings_page(p: SettingsPage, app: &App, t: tok::Theme) -> El {
     }
 }
 
+/// Add the reason a sign-out was refused, when there is one. Every branch that
+/// draws the Sign out button calls this, or the button looks dead.
+fn with_write_error(app: &App, body: El, t: tok::Theme) -> El {
+    match &app.write_error {
+        Some(error) => body.child(
+            text(error.clone())
+                .key("write-error")
+                .font(type_::BODY)
+                .color(t.text_secondary),
+        ),
+        None => body,
+    }
+}
+
 fn account_page(app: &App, t: tok::Theme) -> El {
     match &app.auth {
-        crate::auth::Auth::SignedIn { name, .. } => {
-            page("Account", "Your profile", t,
-                col().gap(space::S3)
-                    .child(settings_row("acct-name".into(), "Name", name, t))
-                    .child(sign_out_button(t)))
+        crate::auth::Auth::SignedIn { .. } => {
+            let name = app.core.lib.name.clone();
+            let mut body = col().gap(space::S3)
+                .child(settings_row("acct-name".into(), "Name", &name, t));
+            // A fetch that failed without ending the session is said here, beside
+            // the name it could not refresh. It must not look like a failed sign-in:
+            // the session works, the network did not.
+            if let Some(reason) = &app.profile_error {
+                body = body.child(
+                    text(reason.clone())
+                        .key("profile-error")
+                        .font(type_::BODY)
+                        .color(t.text_secondary),
+                );
+            }
+            page("Account", "Your profile", t, with_write_error(app, body, t).child(sign_out_button(t)))
         }
         crate::auth::Auth::Authorizing { .. } => {
             page("Account", "Your profile", t,
@@ -631,9 +656,11 @@ fn account_page(app: &App, t: tok::Theme) -> El {
         }
         crate::auth::Auth::Failed { message } => {
             let sign_in = sign_in_button(t);
+            let body = col().gap(space::S3)
+                .child(text(message).key("auth-error").font(type_::BODY).color(t.text_secondary));
+            // This branch offers Sign out too, so it must say why one was refused.
             page("Account", "Your profile", t,
-                col().gap(space::S3)
-                    .child(text(message).key("auth-error").font(type_::BODY).color(t.text_secondary))
+                with_write_error(app, body, t)
                     .child(sign_in)
                     .child(sign_out_button(t)))
         }

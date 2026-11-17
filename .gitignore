@@ -4,3 +4,5 @@ rune/target/
 /artifacts/
 /opentidal.json
 /opentidal.local.json
+__pycache__/
+*.pyc

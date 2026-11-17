@@ -59,10 +59,13 @@ file instead. The file is the operator's and stays out of the repo.
     "live": true,
     "client_id": "<client id>",
     "client_secret": "<client secret>",
-    "redirect_uri": "http://127.0.0.1:8080/callback",
-    "scope": "user.read collection.read playlists.read entitlements.read recommendations.read search.read"
+    "redirect_uri": "http://127.0.0.1:8080/callback"
   }
   ```
+
+  Omit `scope` to request every read scope the app needs. A hard-coded scope
+  list drifts from [`DEFAULT_SCOPE`](../src/auth.rs) and from the Tidal
+  documentation. The list changed twice already.
 - The client id and secret never enter the repo. The user signs in once through
   the browser, and the refresh token lands in the keychain. On later launches
   the app restores the session and refreshes an expired access token

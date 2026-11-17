@@ -341,6 +341,10 @@ struct Resource {
 
 /// The user's display name from the resource attributes. The field names vary
 /// across the API versions, so read the known ones in order and fall back.
+///
+/// The order matters for privacy. Tidal returns the account email in
+/// `username`, and this name is stored on disk in the clear and shown in the
+/// sidebar, so a real name wins over anything that looks like an address.
 fn name_from(attributes: &Option<Value>) -> String {
     let Some(attrs) = attributes else { return "You".to_string() };
     let mut parts = Vec::new();
@@ -354,13 +358,24 @@ fn name_from(attributes: &Option<Value>) -> String {
         return parts.join(" ");
     }
     for key in ["name", "username"] {
-        if let Some(s) = attrs.get(key).and_then(Value::as_str) {
-            if !s.is_empty() {
-                return s.to_string();
-            }
+        if let Some(s) = attrs.get(key).and_then(Value::as_str)
+            && !s.is_empty()
+            && !is_email(s)
+        {
+            return s.to_string();
         }
     }
     "You".to_string()
+}
+
+/// Whether a name looks like an email address. A stored address is one copy of
+/// a secret the user did not choose to publish on their own disk.
+fn is_email(s: &str) -> bool {
+    let (local, domain) = match s.split_once('@') {
+        Some(parts) => parts,
+        None => return false,
+    };
+    !local.is_empty() && domain.contains('.') && !domain.starts_with('.')
 }
 
 #[cfg(test)]
@@ -388,6 +403,22 @@ mod tests {
         let attrs = serde_json::json!({ "username": "ada" });
         assert_eq!(name_from(&Some(attrs)), "ada");
         assert_eq!(name_from(&None), "You");
+    }
+
+    /// An account email is not a display name. Tidal returns it in `username`,
+    /// and the name is written to disk in the clear.
+    #[test]
+    fn an_email_is_not_used_as_a_name() {
+        let attrs = serde_json::json!({ "username": "ada@example.com" });
+        assert_eq!(name_from(&Some(attrs)), "You");
+
+        let attrs = serde_json::json!({ "firstName": "Ada", "username": "ada@example.com" });
+        assert_eq!(name_from(&Some(attrs)), "Ada");
+
+        assert!(is_email("ada@example.com"));
+        assert!(!is_email("ada"));
+        assert!(!is_email("@example.com"));
+        assert!(!is_email("ada@"));
     }
 
     /// The loopback port comes from the URI, and a URI without a port fails.

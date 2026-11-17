@@ -10,8 +10,10 @@ now-playing bar.
 
 The user's data is real and mutable now: like tracks, save albums, follow
 artists, download albums, and create, rename, reorder and delete playlists and
-collections. All of it lives in memory and every operation is proven to keep
-the library valid.
+collections. Every operation is proven to keep the library valid. The library
+persists in `~/Library/Application Support/OpenTidal/opentidal.db`, keyed by the
+Tidal user id from the access token, so a restart shows it before any network
+call. `docs/user-state.md` is the design.
 
 Sign in to Tidal now works through the `MusicService` port in `src/tidal.rs`.
 The OAuth authorization-code flow with PKCE lives in `src/auth.rs`, and the
@@ -31,10 +33,26 @@ The toolchain is pinned in `rust-toolchain.toml`.
 
 ## Verify
 
-The app verifies headless. No display or GPU window is needed.
+The app verifies headless. No display or GPU window is needed. Run the one
+command that gates a commit:
 
 ```sh
-cargo test                       # the invariant proofs
+scripts/preflight.sh              # tests, clippy, the repo rules
+```
+
+That same script runs in CI. `.github/workflows/preflight.yml` calls it on every
+pull request and on every push to `main`, on a macOS runner, because the macOS-only
+test paths compile to nothing elsewhere. A second job builds and tests the crate on
+Linux, which is what notices a macOS-only function that lost its counterpart. A command added to the script needs no
+workflow edit. `main` is protected, so the check must pass before a merge, an open
+review thread blocks a merge, and a direct push is rejected.
+
+The workflow is on a branch until it merges. A pull request cut from `main` before
+then gets no `preflight` run, so the required check never reports and that pull
+request cannot merge.
+
+```sh
+cargo test                       # the invariant proofs and the store tests
 scripts/control-opentidal doctor # one readiness check
 ```
 
@@ -60,9 +78,11 @@ OPENTIDAL_LIVE=1 \
 TIDAL_CLIENT_ID=... \
 TIDAL_CLIENT_SECRET=... \
 TIDAL_REDIRECT_URI=http://127.0.0.1:8080/callback \
-TIDAL_SCOPE="user.read collection.read playlists.read entitlements.read recommendations.read search.read" \
 scripts/run.sh
 ```
+
+Leave `TIDAL_SCOPE` unset to request every read scope the app needs. Set it
+only to narrow the request.
 
 Run `scripts/run.sh`, not `cargo run`. It builds, ad-hoc signs the binary, and
 runs it. The signature gives the dev binary a stable identity, so the macOS

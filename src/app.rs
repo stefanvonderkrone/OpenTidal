@@ -1882,6 +1882,149 @@ mod tests {
         assert_eq!(counting.0.load(Ordering::SeqCst), 1, "the sync did not start once the profile landed");
     }
 
+    /// The library a fresh run would load for `user` from `path`.
+    fn on_disk(user: &str, path: &std::path::Path) -> Library {
+        Store::open(path).unwrap().load(user, &mut Catalogue::seed()).unwrap().unwrap().lib
+    }
+
+    /// A sync that fails changes nothing, in memory or on disk, and says so.
+    #[test]
+    fn a_failed_sync_leaves_the_library_and_the_file_untouched() {
+        let dir = TempDir::new("sync-fails");
+        let path = dir.path();
+        let mut app = signed_in("account-a", &path, LibraryRows::default());
+        app.service = Arc::new(tidal::FakeService {
+            library: Err(ServiceError::Http("429 Too Many Requests".to_string())),
+            ..tidal::FakeService::default()
+        });
+        app.core.lib.toggle_like(track(4));
+        app.core.lib.tidal_playlists.insert(app.catalogue.playlist_id("seed-playlist-1").unwrap());
+        app.flush_library();
+        let before = app.core.lib.clone();
+
+        app.sync();
+        drain_until(&mut app, |a| a.last_sync.is_some());
+
+        assert_eq!(app.core.lib, before, "a failed sync changed the library in memory");
+        assert_eq!(on_disk("account-a", &path), before, "a failed sync changed the library on disk");
+        let Some(Err(message)) = &app.last_sync else {
+            panic!("a failed sync reported {:?}", app.last_sync);
+        };
+        assert!(message.ends_with("Nothing changed."), "the message does not say nothing changed: {message}");
+    }
+
+    /// A sync that lands is on disk after the next frame, with the playlist name
+    /// a restart can show.
+    #[test]
+    fn a_sync_lands_on_disk() {
+        let dir = TempDir::new("sync-lands");
+        let path = dir.path();
+        let mut app = signed_in("account-a", &path, tidal_rows("A"));
+        app.sync();
+        drain_until(&mut app, |a| a.last_sync.is_some());
+        assert!(matches!(app.last_sync, Some(Ok(report)) if report.liked == 1 && report.tidal_playlists == 1));
+
+        let mut next_run = app_without_a_session();
+        next_run.open_library("account-a", &path);
+        assert!(next_run.core.lib.is_liked(&track(0)), "the synced like is not on disk");
+        let names: Vec<String> = next_run
+            .core
+            .lib
+            .tidal_playlists
+            .iter()
+            .map(|id| next_run.catalogue.playlist(id).unwrap().name.clone())
+            .collect();
+        assert_eq!(names, ["A secret"], "the synced playlist is not on disk");
+    }
+
+    /// A sync that lands after a sign-out and a new sign-in to the same account
+    /// belongs to the old session and is dropped.
+    #[test]
+    fn a_sync_for_an_earlier_session_is_dropped() {
+        let dir = TempDir::new("sync-earlier-session");
+        let path = dir.path();
+        let mut app = signed_in("account-a", &path, tidal_rows("A"));
+        app.sync();
+        app.sign_out();
+        app.open_library("account-a", &path);
+        app.auth = Auth::SignedIn { token: fake_token() };
+        drain_until(&mut app, |a| !a.sync.is_pending());
+        app.drain();
+
+        assert!(app.core.lib.liked.is_empty(), "a sync from the earlier session landed");
+        assert_eq!(app.last_sync, None);
+    }
+
+    /// A sync that lands after a dead refresh token closed the library is
+    /// dropped, so it cannot fill a library that has nowhere to be written.
+    #[test]
+    fn a_sync_for_a_closed_library_is_dropped() {
+        let dir = TempDir::new("sync-closed");
+        let path = dir.path();
+        let mut app = signed_in("account-a", &path, tidal_rows("A"));
+        app.sync();
+        app.end_dead_session(ServiceError::InvalidGrant("revoked".to_string()));
+        drain_until(&mut app, |a| !a.sync.is_pending());
+        app.drain();
+
+        assert!(app.library.is_none());
+        assert_eq!(app.core.lib, Library::default(), "a sync filled a closed library");
+        assert_eq!(app.last_sync, None);
+    }
+
+    /// An edit made while a sync runs survives it. The sync replaces only the
+    /// mirrored memberships, never the whole library.
+    ///
+    /// The first version drained while it waited, so the edit was written before
+    /// the result landed, and a sync that replaced the library with the disk copy
+    /// still passed. The edit now stays unwritten until the result is applied.
+    #[test]
+    fn an_edit_during_a_sync_survives_it() {
+        let dir = TempDir::new("sync-edit");
+        let path = dir.path();
+        let mut app = signed_in("account-a", &path, tidal_rows("A"));
+        app.sync();
+        for _ in 0..1_000 {
+            if !app.sync.is_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mine = app.core.lib.create_playlist("Made while syncing".to_string()).unwrap();
+        app.core.lib.toggle_download(Catalogue::seed().album_id("seed-album-3").unwrap());
+        assert_ne!(on_disk("account-a", &path), app.core.lib, "the edit was written before the sync landed");
+        app.drain();
+
+        assert_eq!(app.core.lib.playlist(mine).map(|p| p.name.as_str()), Some("Made while syncing"));
+        assert_eq!(app.core.lib.downloaded.len(), 1, "the sync dropped a download made while it ran");
+        assert!(app.core.lib.is_liked(&track(0)), "the sync did not land");
+        assert_eq!(on_disk("account-a", &path), app.core.lib);
+    }
+
+    /// A dead refresh token found by the sync ends the session the same way the
+    /// profile fetch does: no library, no token.
+    #[test]
+    fn a_dead_refresh_token_during_sync_closes_the_library() {
+        let dir = TempDir::new("sync-dead-token");
+        let path = dir.path();
+        let mut app = signed_in("account-a", &path, LibraryRows::default());
+        app.service = Arc::new(tidal::FakeService {
+            library: Err(ServiceError::InvalidGrant("refresh token revoked".to_string())),
+            ..tidal::FakeService::default()
+        });
+        app.tokens.save(&fake_token());
+        app.core.lib.toggle_like(track(1));
+
+        app.sync();
+        drain_until(&mut app, |a| a.library.is_none());
+
+        assert!(app.library.is_none(), "a dead token left the library writable");
+        assert_eq!(app.core.lib, Library::default(), "the library stayed in memory");
+        assert_eq!(app.tokens.load(), None, "the dead token stayed stored");
+        assert!(matches!(app.auth, Auth::Failed { .. }));
+        assert!(on_disk("account-a", &path).is_liked(&track(1)), "the last edit was not written first");
+    }
+
     /// The fake token carries no `uid` claim, so the headless build never
     /// touches a database file.
     #[test]

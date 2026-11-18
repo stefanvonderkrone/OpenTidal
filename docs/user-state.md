@@ -198,6 +198,8 @@ next start, which is the next thing that tries.
   always signs out, because it has nowhere to write and nothing to lose.
 - Refresh: token store only. No library write. This is the gain over a rotating key.
 - Profile fetch: update `user.name`.
+- Sync: replace the four mirrored memberships in memory. The next frame writes
+  the library through `Store::write`, so a sync costs one write, like any edit.
 - Library change: one comparison per frame, not a write per operation. The app
   keeps the library as last written, and `drain` writes when the two differ. This
   replaces the earlier "write through in the same operation", which would have
@@ -221,11 +223,9 @@ says the library could not be opened, and the Account screen shows that.
 While the app is read-only, the library is a mirror of Tidal, not a truth.
 Every row came from Tidal. Tidal still holds it.
 
-**That recovery is planned, not built.** The sync is not in this branch: the
-catalogue now has Tidal ids and a place on disk, but nothing fetches it yet, and
-the evidence table marks every sync check `pending: sync PR`. So today a row dropped by `Store::load` stays gone
-until a sync exists. The rule below says what the drop does now and what the
-sync will make true later; do not read it as a working recovery path.
+**The sync is the recovery.** A row dropped by `Store::load` comes back on the
+next sync that lists it. Local data is the exception: a dropped download or
+history entry has no server copy, which the paragraph below covers.
 
 Both paths treat a bad leaf the same way. `Store::load`, the sync, and any
 future reader drop the leaf that fails `Library::check` and log a count. The
@@ -405,7 +405,12 @@ nothing there is a test.
 | Start needs no network | Launch with the network off, name and playlist visible | pending: no test. Start reads the disk first, then fetches the profile |
 | A library screen needs no network | Open Liked Songs offline, assert the disk rows paint | pending: no test |
 | A refresh writes no rows | Count rows before and after a refresh, `user_version` unchanged | pending: no test. A refresh writes the token store only |
-| A failed sync changes nothing | Fail the fetch, assert the library in memory and on disk are unchanged | pending: sync PR |
+| A failed sync changes nothing | Fail the fetch, assert the library in memory and on disk are unchanged, and the message says so | test: `a_failed_sync_leaves_the_library_and_the_file_untouched` |
+| A sync lands on disk | Sync, then open the file in a new run, assert the like and the playlist name | test: `a_sync_lands_on_disk` |
+| A sync for an earlier session is dropped | Start a sync, sign out and back in, drain, assert nothing landed | test: `a_sync_for_an_earlier_session_is_dropped` |
+| A sync for a closed library is dropped | Start a sync, end the session on a dead token, drain, assert the library stays empty | test: `a_sync_for_a_closed_library_is_dropped` |
+| An edit during a sync survives it | Edit after the read lands and before it applies, assert the edit and the sync both remain | test: `an_edit_during_a_sync_survives_it` |
+| A dead token found by a sync ends the session | The read returns a dead grant, assert no library, no token, and the last edit on disk | test: `a_dead_refresh_token_during_sync_closes_the_library` |
 | A failed page fails the whole fetch | Serve an error as page 2, assert the fetch returns no rows | test: `a_failed_page_fails_the_whole_fetch` |
 | A paged list is read to its last page | Two liked-track pages, assert all three members in order | test: `liked_tracks_follow_the_cursor_to_the_last_page` |
 | The fixtures decode into a whole library | Read every fixture, sync, assert the counts, no drop, and the playlist tracks | test: `the_fixtures_decode_into_a_whole_library` |

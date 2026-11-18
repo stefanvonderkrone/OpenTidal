@@ -836,6 +836,11 @@ impl App {
                         eprintln!(
                             "opentidal: the profile fetch failed, staying signed in: {e:?}"
                         );
+                        // The token did not change, so a pass waiting for a new one
+                        // would say it syncs forever.
+                        if let (Some(open), Auth::SignedIn { token }) = (self.library.as_mut(), &self.auth) {
+                            open.passes.renewal_failed(&token.access_token, &e);
+                        }
                         // A reader does not need the error detail, which the log keeps
                         // for a bug report. The message must say which kind of failure
                         // this is: a network that came back needs nothing from them, a
@@ -2457,6 +2462,32 @@ mod tests {
         assert_eq!(service.tokens(), ["fake-access", "fresh", "fresh", "fresh", "fresh"]);
         assert_eq!(app.tokens.load().map(|t| t.access_token), Some("fresh".to_string()), "the fresh token was not kept");
         assert!(matches!(app.auth, Auth::SignedIn { .. }));
+    }
+
+    /// A renewal that fails without ending the grant stalls the pass that
+    /// waited on it, so the list stops saying it syncs. A later scroll retries
+    /// it, and a second rejection renews again instead of ending the session.
+    #[test]
+    fn a_failed_renewal_stalls_the_pass_until_a_scroll_retries() {
+        let dir = TempDir::new("page-renewal-fails");
+        let path = dir.path();
+        let pages = vec![(RemoteList::Liked, vec![page(&["seed-track-1"]), page(&["seed-track-2"])])];
+        let service = Arc::new(Recorded { rejects: |token| token == "fake-access", ..Recorded::new(pages) });
+        let mut app = signed_in_with("account-a", &path, service.clone());
+        app.revalidate_on_entry = true;
+        app.refresh = |_, _| Err(ServiceError::Http("offline".into()));
+
+        crate::state::open_section(&mut app.core, crate::state::Route::LikedSongs);
+        drain_until(&mut app, |a| !a.profile.is_pending() && settled(a));
+        assert!(matches!(app.pass_status(RemoteList::Liked), PassStatus::Stalled(_)), "a failed renewal left the pass syncing");
+        assert!(matches!(app.auth, Auth::SignedIn { .. }), "a renewal that could not reach Tidal ended the session");
+
+        app.refresh = |_, token| Ok(Token { access_token: "fresh".into(), refresh_token: token.refresh_token.clone(), expires_in: 3600 });
+        app.want(RemoteList::Liked, 1);
+        drain_until(&mut app, |a| !a.profile.is_pending() && settled(a) && a.core.lib.is_liked(&track(1)));
+        assert!(matches!(app.auth, Auth::SignedIn { .. }), "the retry after a failed renewal ended the session");
+        assert!(app.core.lib.is_liked(&track(1)), "a scroll did not retry the stalled pass");
+        assert_eq!(service.tokens(), ["fake-access", "fake-access", "fresh"]);
     }
 
     /// A renewed token that Tidal rejects too ends the session, the same rule

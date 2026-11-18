@@ -306,7 +306,9 @@ A pass obeys five rules.
 5. Read one page at a time, and never while the profile fetch is pending. The
    page worker never refreshes the token. A page Tidal rejects starts one
    renewal through the profile fetch, and the pass resumes with the fresh
-   token. A fresh token Tidal rejects too ends the session.
+   token. A fresh token Tidal rejects too ends the session. A renewal that
+   fails without ending the grant stalls every pass that waited on it, and a
+   later scroll retries the pass.
 
 A Tidal playlist is a catalogue playlist, not a user playlist. Its name and
 tracks live in the catalogue, and the library holds only its id in
@@ -476,6 +478,7 @@ names the test that covers the code path, and no hand check has happened.
 | A page applied twice changes nothing | Sync twice over the same pages, assert the library, the catalogue revision and the file are unchanged | test: `a_page_applied_twice_changes_nothing` |
 | A rejected page forces one renewal | Reject the first token, assert one profile fetch and the pass resuming with the fresh token | test: `an_unauthorized_page_forces_one_refresh` |
 | A renewed token rejected again ends the session | Reject every page token, assert one renewal, then no library and no token | test: `a_renewed_token_rejected_again_ends_the_session` |
+| A failed renewal stalls its passes and a scroll retries them | Reject the first token and fail the refresh, assert the pass stalls and the session stays, then scroll and assert the fresh token reads the page | test: `a_failed_renewal_stalls_the_pass_until_a_scroll_retries` |
 | A catalogue-only change reaches disk | Read a Tidal playlist's tracks, assert the library is unchanged and a new run loads the tracks | test: `a_catalogue_only_change_reaches_disk` |
 | Entering a route starts one pass | Open Liked Songs twice, assert one page, then Albums, assert one more | test: `entering_a_route_starts_one_pass_and_reentering_does_not` |
 | A larger view reads the next page | Enter a two-page list, assert one page, ask for two rows, assert both pages | test: `a_larger_want_reads_the_next_page` |

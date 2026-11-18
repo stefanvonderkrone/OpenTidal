@@ -298,6 +298,18 @@ impl Passes {
         }
     }
 
+    /// The renewal of `token` failed, but the grant lives. Every pass that
+    /// waits on it stalls with `error`, so a later demand retries it, and a
+    /// rejection on that retry renews again instead of ending the grant.
+    pub fn renewal_failed(&mut self, token: &str, error: &ServiceError) {
+        for pass in self.by.values_mut().filter(|pass| pass.rejected(token)) {
+            pass.renewed = false;
+            if let State::Next { phase, .. } = &mut pass.state {
+                *phase = Phase::Stalled(error.clone());
+            }
+        }
+    }
+
     pub fn status(&self, of: &RemoteList) -> PassStatus {
         let Some(pass) = self.by.get(of) else {
             return PassStatus::Idle;

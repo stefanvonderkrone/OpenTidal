@@ -1,0 +1,29 @@
+{
+  "data": [
+    {"type": "tracks", "id": "75413016"},
+    {"type": "tracks", "id": "12345678"}
+  ],
+  "included": [
+    {
+      "type": "credits",
+      "id": "credit-producer-1",
+      "attributes": {"name": "Kevin Parker", "role": "Producer"},
+      "relationships": {
+        "artist": {"data": {"type": "artists", "id": "1566"}},
+        "category": {"data": {"type": "creditCategories", "id": "producer"}}
+      }
+    },
+    {
+      "type": "credits",
+      "id": "credit-writer-1",
+      "attributes": {"name": "Kevin Parker", "role": "Composer"},
+      "relationships": {
+        "artist": {"data": {"type": "artists", "id": "1566"}},
+        "category": {"data": {"type": "creditCategories", "id": "composer"}}
+      }
+    }
+  ],
+  "links": {
+    "self": "/v2/tracks?filter%5Bid%5D=75413016%2C12345678&include=credits"
+  }
+}

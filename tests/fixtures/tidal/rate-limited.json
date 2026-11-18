@@ -1,0 +1,9 @@
+{
+  "errors": [
+    {
+      "status": "429",
+      "title": "Too Many Requests",
+      "detail": "Rate limit exceeded for this client."
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "data": [
+    {"type": "playlists", "id": "f6b9f0a1-6c8e-4d24-9c71-1d0e2f3a4b5c", "meta": {"addedAt": "2026-11-02T09:00:00Z"}}
+  ],
+  "included": [
+    {
+      "type": "playlists",
+      "id": "f6b9f0a1-6c8e-4d24-9c71-1d0e2f3a4b5c",
+      "attributes": {
+        "name": "Evening Drive",
+        "description": "A local playlist with a remote copy",
+        "numberOfItems": 2,
+        "duration": "PT11M24S"
+      },
+      "relationships": {
+        "coverArt": {
+          "data": [
+            {"type": "coverArts", "id": "playlist-cover-1", "meta": {"width": 1280, "height": 1280}}
+          ]
+        }
+      }
+    }
+  ],
+  "links": {
+    "self": "/v2/userCollectionPlaylists/me/relationships/items?include=items"
+  }
+}

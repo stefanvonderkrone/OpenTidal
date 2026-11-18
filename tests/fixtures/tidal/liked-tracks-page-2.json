@@ -1,0 +1,23 @@
+{
+  "data": [
+    {"type": "tracks", "id": "98765432", "meta": {"addedAt": "2026-10-02T08:15:00Z"}}
+  ],
+  "included": [
+    {
+      "type": "tracks",
+      "id": "98765432",
+      "attributes": {
+        "title": "Eventually",
+        "duration": "PT5M19S",
+        "popularity": 0.61,
+        "explicit": false,
+        "trackNumber": 3,
+        "mediaTags": ["LOSSLESS"],
+        "tidalUrl": "https://tidal.com/browse/track/98765432"
+      }
+    }
+  ],
+  "links": {
+    "self": "/v2/userCollectionTracks/me/relationships/items?include=items&page%5Bcursor%5D=page-2"
+  }
+}

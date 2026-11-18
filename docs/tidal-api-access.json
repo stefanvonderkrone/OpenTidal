@@ -1,0 +1,463 @@
+{
+  "forbidden": [
+    {
+      "method": "get",
+      "path": "/credits",
+      "spec": "credits"
+    },
+    {
+      "method": "get",
+      "path": "/credits/{id}",
+      "spec": "credits"
+    },
+    {
+      "method": "get",
+      "path": "/tracks/{id}/relationships/credits",
+      "spec": "tracks"
+    },
+    {
+      "method": "get",
+      "path": "/dynamicModules",
+      "spec": "dynamicModules"
+    },
+    {
+      "method": "get",
+      "path": "/dynamicModules/{id}/relationships/items",
+      "spec": "dynamicModules"
+    },
+    {
+      "method": "get",
+      "path": "/dynamicPages",
+      "spec": "dynamicPages"
+    },
+    {
+      "method": "get",
+      "path": "/dynamicPages/{id}/relationships/dynamicModules",
+      "spec": "dynamicPages"
+    },
+    {
+      "method": "get",
+      "path": "/userCollectionFolders",
+      "spec": "folders"
+    },
+    {
+      "method": "get",
+      "path": "/userCollectionFolders/{id}",
+      "spec": "folders"
+    },
+    {
+      "method": "get",
+      "path": "/userCollectionFolders/{id}/relationships/items",
+      "spec": "folders"
+    }
+  ],
+  "sources": {
+    "albumCollections": "https://artifacts.apis.io/tidal/openapi/tidal-usercollectionalbums-api-openapi.yml",
+    "albums": "https://artifacts.apis.io/tidal/openapi/tidal-albums-api-openapi.yml",
+    "artistCollections": "https://artifacts.apis.io/tidal/openapi/tidal-usercollectionartists-api-openapi.yml",
+    "artists": "https://artifacts.apis.io/tidal/openapi/tidal-artists-api-openapi.yml",
+    "credits": "https://artifacts.apis.io/tidal/openapi/tidal-credits-api-openapi.yml",
+    "dynamicModules": "https://artifacts.apis.io/tidal/openapi/tidal-dynamic-modules-api-openapi.yml",
+    "dynamicPages": "https://artifacts.apis.io/tidal/openapi/tidal-dynamicpages-api-openapi.yml",
+    "folders": "https://artifacts.apis.io/tidal/openapi/tidal-usercollectionfolders-api-openapi.yml",
+    "playlistCollections": "https://artifacts.apis.io/tidal/openapi/tidal-usercollectionplaylists-api-openapi.yml",
+    "playlists": "https://artifacts.apis.io/tidal/openapi/tidal-playlists-api-openapi.yml",
+    "trackCollections": "https://artifacts.apis.io/tidal/openapi/tidal-usercollectiontracks-api-openapi.yml",
+    "tracks": "https://artifacts.apis.io/tidal/openapi/tidal-tracks-api-openapi.yml",
+    "users": "https://artifacts.apis.io/tidal/openapi/tidal-users-api-openapi.yml"
+  },
+  "tiers": {
+    "albumCollections": {
+      "/userCollectionAlbums/{id}": {
+        "get": "THIRD_PARTY"
+      },
+      "/userCollectionAlbums/{id}/relationships/items": {
+        "delete": "THIRD_PARTY",
+        "get": "THIRD_PARTY",
+        "post": "THIRD_PARTY"
+      },
+      "/userCollectionAlbums/{id}/relationships/owners": {
+        "get": "THIRD_PARTY"
+      }
+    },
+    "albums": {
+      "/albums": {
+        "get": "THIRD_PARTY",
+        "post": "INTERNAL"
+      },
+      "/albums/{id}": {
+        "delete": "INTERNAL",
+        "get": "THIRD_PARTY",
+        "patch": "INTERNAL"
+      },
+      "/albums/{id}/relationships/albumStatistics": {
+        "get": "INTERNAL"
+      },
+      "/albums/{id}/relationships/artists": {
+        "get": "THIRD_PARTY"
+      },
+      "/albums/{id}/relationships/coverArt": {
+        "get": "THIRD_PARTY",
+        "patch": "INTERNAL"
+      },
+      "/albums/{id}/relationships/genres": {
+        "get": "INTERNAL"
+      },
+      "/albums/{id}/relationships/items": {
+        "get": "THIRD_PARTY",
+        "patch": "INTERNAL"
+      },
+      "/albums/{id}/relationships/owners": {
+        "get": "THIRD_PARTY"
+      },
+      "/albums/{id}/relationships/priceConfig": {
+        "get": "INTERNAL"
+      },
+      "/albums/{id}/relationships/providers": {
+        "get": "THIRD_PARTY"
+      },
+      "/albums/{id}/relationships/replacement": {
+        "get": "INTERNAL"
+      },
+      "/albums/{id}/relationships/shares": {
+        "get": "INTERNAL"
+      },
+      "/albums/{id}/relationships/similarAlbums": {
+        "get": "THIRD_PARTY"
+      },
+      "/albums/{id}/relationships/suggestedCoverArts": {
+        "get": "INTERNAL"
+      },
+      "/albums/{id}/relationships/usageRules": {
+        "get": "THIRD_PARTY"
+      }
+    },
+    "artistCollections": {
+      "/userCollectionArtists/{id}": {
+        "get": "THIRD_PARTY"
+      },
+      "/userCollectionArtists/{id}/relationships/items": {
+        "delete": "THIRD_PARTY",
+        "get": "THIRD_PARTY",
+        "post": "THIRD_PARTY"
+      },
+      "/userCollectionArtists/{id}/relationships/owners": {
+        "get": "THIRD_PARTY"
+      }
+    },
+    "artists": {
+      "/artists": {
+        "get": "THIRD_PARTY",
+        "post": "INTERNAL"
+      },
+      "/artists/{id}": {
+        "get": "THIRD_PARTY",
+        "patch": "INTERNAL"
+      },
+      "/artists/{id}/relationships/albums": {
+        "get": "THIRD_PARTY"
+      },
+      "/artists/{id}/relationships/biography": {
+        "get": "THIRD_PARTY"
+      },
+      "/artists/{id}/relationships/followers": {
+        "get": "INTERNAL"
+      },
+      "/artists/{id}/relationships/following": {
+        "delete": "INTERNAL",
+        "get": "INTERNAL",
+        "post": "INTERNAL"
+      },
+      "/artists/{id}/relationships/owners": {
+        "get": "THIRD_PARTY"
+      },
+      "/artists/{id}/relationships/profileArt": {
+        "get": "THIRD_PARTY",
+        "patch": "INTERNAL"
+      },
+      "/artists/{id}/relationships/radio": {
+        "get": "THIRD_PARTY"
+      },
+      "/artists/{id}/relationships/roles": {
+        "get": "THIRD_PARTY"
+      },
+      "/artists/{id}/relationships/similarArtists": {
+        "get": "THIRD_PARTY"
+      },
+      "/artists/{id}/relationships/trackProviders": {
+        "get": "THIRD_PARTY"
+      },
+      "/artists/{id}/relationships/tracks": {
+        "get": "THIRD_PARTY"
+      },
+      "/artists/{id}/relationships/videos": {
+        "get": "THIRD_PARTY"
+      }
+    },
+    "credits": {
+      "/credits": {
+        "get": "INTERNAL"
+      },
+      "/credits/{id}": {
+        "get": "INTERNAL"
+      },
+      "/credits/{id}/relationships/artist": {
+        "get": "INTERNAL"
+      },
+      "/credits/{id}/relationships/category": {
+        "get": "INTERNAL"
+      }
+    },
+    "dynamicModules": {
+      "/dynamicModules": {
+        "get": "INTERNAL"
+      },
+      "/dynamicModules/{id}/relationships/items": {
+        "get": "INTERNAL"
+      }
+    },
+    "dynamicPages": {
+      "/dynamicPages": {
+        "get": "INTERNAL"
+      },
+      "/dynamicPages/{id}/relationships/dynamicModules": {
+        "get": "INTERNAL"
+      },
+      "/dynamicPages/{id}/relationships/subject": {
+        "get": "INTERNAL"
+      }
+    },
+    "folders": {
+      "/userCollectionFolders": {
+        "get": "INTERNAL",
+        "post": "INTERNAL"
+      },
+      "/userCollectionFolders/{id}": {
+        "delete": "INTERNAL",
+        "get": "INTERNAL",
+        "patch": "INTERNAL"
+      },
+      "/userCollectionFolders/{id}/relationships/items": {
+        "delete": "INTERNAL",
+        "get": "INTERNAL",
+        "post": "INTERNAL"
+      },
+      "/userCollectionFolders/{id}/relationships/owners": {
+        "get": "INTERNAL"
+      }
+    },
+    "playlistCollections": {
+      "/userCollectionPlaylists/{id}": {
+        "get": "THIRD_PARTY"
+      },
+      "/userCollectionPlaylists/{id}/relationships/items": {
+        "delete": "THIRD_PARTY",
+        "get": "THIRD_PARTY",
+        "post": "THIRD_PARTY"
+      },
+      "/userCollectionPlaylists/{id}/relationships/owners": {
+        "get": "THIRD_PARTY"
+      }
+    },
+    "playlists": {
+      "/playlists": {
+        "get": "THIRD_PARTY",
+        "post": "THIRD_PARTY"
+      },
+      "/playlists/{id}": {
+        "delete": "THIRD_PARTY",
+        "get": "THIRD_PARTY",
+        "patch": "THIRD_PARTY"
+      },
+      "/playlists/{id}/relationships/collaboratorProfiles": {
+        "delete": "INTERNAL",
+        "get": "INTERNAL",
+        "post": "INTERNAL"
+      },
+      "/playlists/{id}/relationships/collaborators": {
+        "get": "INTERNAL"
+      },
+      "/playlists/{id}/relationships/coverArt": {
+        "get": "THIRD_PARTY",
+        "patch": "INTERNAL"
+      },
+      "/playlists/{id}/relationships/items": {
+        "delete": "THIRD_PARTY",
+        "get": "THIRD_PARTY",
+        "patch": "THIRD_PARTY",
+        "post": "THIRD_PARTY"
+      },
+      "/playlists/{id}/relationships/ownerProfiles": {
+        "get": "THIRD_PARTY"
+      },
+      "/playlists/{id}/relationships/owners": {
+        "get": "THIRD_PARTY"
+      }
+    },
+    "trackCollections": {
+      "/userCollectionTracks": {
+        "get": "THIRD_PARTY"
+      },
+      "/userCollectionTracks/{id}": {
+        "get": "THIRD_PARTY"
+      },
+      "/userCollectionTracks/{id}/relationships/items": {
+        "delete": "THIRD_PARTY",
+        "get": "THIRD_PARTY",
+        "post": "THIRD_PARTY"
+      },
+      "/userCollectionTracks/{id}/relationships/owners": {
+        "get": "THIRD_PARTY"
+      }
+    },
+    "tracks": {
+      "/tracks": {
+        "get": "THIRD_PARTY",
+        "post": "INTERNAL"
+      },
+      "/tracks/{id}": {
+        "delete": "INTERNAL",
+        "get": "THIRD_PARTY",
+        "patch": "INTERNAL"
+      },
+      "/tracks/{id}/relationships/albums": {
+        "get": "THIRD_PARTY",
+        "patch": "INTERNAL"
+      },
+      "/tracks/{id}/relationships/artists": {
+        "get": "THIRD_PARTY"
+      },
+      "/tracks/{id}/relationships/credits": {
+        "get": "INTERNAL"
+      },
+      "/tracks/{id}/relationships/download": {
+        "get": "INTERNAL"
+      },
+      "/tracks/{id}/relationships/genres": {
+        "get": "INTERNAL"
+      },
+      "/tracks/{id}/relationships/lyrics": {
+        "get": "INTERNAL"
+      },
+      "/tracks/{id}/relationships/metadataStatus": {
+        "get": "INTERNAL"
+      },
+      "/tracks/{id}/relationships/owners": {
+        "get": "THIRD_PARTY"
+      },
+      "/tracks/{id}/relationships/priceConfig": {
+        "get": "INTERNAL"
+      },
+      "/tracks/{id}/relationships/providers": {
+        "get": "THIRD_PARTY"
+      },
+      "/tracks/{id}/relationships/radio": {
+        "get": "THIRD_PARTY"
+      },
+      "/tracks/{id}/relationships/replacement": {
+        "get": "INTERNAL"
+      },
+      "/tracks/{id}/relationships/shares": {
+        "get": "INTERNAL"
+      },
+      "/tracks/{id}/relationships/similarTracks": {
+        "get": "THIRD_PARTY"
+      },
+      "/tracks/{id}/relationships/sourceFile": {
+        "get": "THIRD_PARTY"
+      },
+      "/tracks/{id}/relationships/suggestedTracks": {
+        "get": "INTERNAL"
+      },
+      "/tracks/{id}/relationships/trackStatistics": {
+        "get": "INTERNAL"
+      },
+      "/tracks/{id}/relationships/usageRules": {
+        "get": "THIRD_PARTY"
+      }
+    },
+    "users": {
+      "/users/{id}": {
+        "get": "THIRD_PARTY"
+      }
+    }
+  },
+  "used": [
+    {
+      "method": "get",
+      "path": "/users/{id}",
+      "spec": "users"
+    },
+    {
+      "method": "get",
+      "path": "/userCollectionTracks/{id}/relationships/items",
+      "spec": "trackCollections"
+    },
+    {
+      "method": "get",
+      "path": "/userCollectionAlbums/{id}/relationships/items",
+      "spec": "albumCollections"
+    },
+    {
+      "method": "get",
+      "path": "/userCollectionArtists/{id}/relationships/items",
+      "spec": "artistCollections"
+    },
+    {
+      "method": "get",
+      "path": "/userCollectionPlaylists/{id}/relationships/items",
+      "spec": "playlistCollections"
+    },
+    {
+      "method": "get",
+      "path": "/playlists/{id}/relationships/items",
+      "spec": "playlists"
+    },
+    {
+      "method": "get",
+      "path": "/tracks",
+      "spec": "tracks"
+    },
+    {
+      "method": "get",
+      "path": "/tracks/{id}",
+      "spec": "tracks"
+    },
+    {
+      "method": "get",
+      "path": "/albums/{id}",
+      "spec": "albums"
+    },
+    {
+      "method": "get",
+      "path": "/albums/{id}/relationships/items",
+      "spec": "albums"
+    },
+    {
+      "method": "get",
+      "path": "/artists/{id}",
+      "spec": "artists"
+    },
+    {
+      "method": "get",
+      "path": "/artists/{id}/relationships/albums",
+      "spec": "artists"
+    },
+    {
+      "method": "get",
+      "path": "/artists/{id}/relationships/tracks",
+      "spec": "artists"
+    },
+    {
+      "method": "get",
+      "path": "/artists/{id}/relationships/similarArtists",
+      "spec": "artists"
+    },
+    {
+      "method": "get",
+      "path": "/artists/{id}/relationships/videos",
+      "spec": "artists"
+    }
+  ],
+  "version": "1.10.14"
+}

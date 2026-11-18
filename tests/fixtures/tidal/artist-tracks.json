@@ -1,0 +1,27 @@
+{
+  "data": [
+    {"type": "tracks", "id": "12345678"},
+    {"type": "tracks", "id": "75413016"},
+    {"type": "tracks", "id": "98765432"}
+  ],
+  "included": [
+    {
+      "type": "tracks",
+      "id": "12345678",
+      "attributes": {"title": "The Less I Know the Better", "duration": "PT3M38S", "popularity": 0.91}
+    },
+    {
+      "type": "tracks",
+      "id": "75413016",
+      "attributes": {"title": "Let It Happen", "duration": "PT7M46S", "popularity": 0.82}
+    },
+    {
+      "type": "tracks",
+      "id": "98765432",
+      "attributes": {"title": "Eventually", "duration": "PT5M19S", "popularity": 0.61}
+    }
+  ],
+  "links": {
+    "self": "/v2/artists/1566/relationships/tracks?collapseBy=FINGERPRINT&include=tracks"
+  }
+}

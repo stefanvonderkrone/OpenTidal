@@ -1,0 +1,27 @@
+{
+  "data": [
+    {"type": "albums", "id": "251380836"},
+    {"type": "albums", "id": "445567890"},
+    {"type": "albums", "id": "556677889"}
+  ],
+  "included": [
+    {
+      "type": "albums",
+      "id": "251380836",
+      "attributes": {"title": "Currents", "type": "ALBUM", "releaseDate": "2015-07-17"}
+    },
+    {
+      "type": "albums",
+      "id": "445567890",
+      "attributes": {"title": "Let It Happen EP", "type": "EP", "releaseDate": "2015-04-01"}
+    },
+    {
+      "type": "albums",
+      "id": "556677889",
+      "attributes": {"title": "The Less I Know the Better", "type": "SINGLE", "releaseDate": "2015-11-10"}
+    }
+  ],
+  "links": {
+    "self": "/v2/artists/1566/relationships/albums?include=albums"
+  }
+}

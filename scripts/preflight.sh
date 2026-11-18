@@ -35,6 +35,11 @@ echo "== no copied scope list"
 # something. Every earlier shell version failed open in a different way.
 python3 scripts/scope-check.py
 
+echo "== tidal api access tiers"
+# A summary doc named internal endpoints as usable three times. This check reads
+# the pinned snapshot, so an endpoint that needs internal access fails the gate.
+python3 scripts/tidal-api-check.py
+
 echo "== ci runs the scripts"
 # CI runs this script and nothing else. A workflow that copied the commands would
 # go green while the real gate drifted, which is the failure this whole script

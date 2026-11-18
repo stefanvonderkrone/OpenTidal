@@ -1,0 +1,27 @@
+{
+  "data": [
+    {"type": "artists", "id": "1566", "meta": {"addedAt": "2026-10-11T11:20:00Z"}}
+  ],
+  "included": [
+    {
+      "type": "artists",
+      "id": "1566",
+      "attributes": {
+        "name": "Tame Impala",
+        "popularity": 0.88,
+        "handle": "tameimpala",
+        "tidalUrl": "https://tidal.com/browse/artist/1566"
+      },
+      "relationships": {
+        "profileArt": {
+          "data": [
+            {"type": "profileArt", "id": "1566-large", "meta": {"width": 1280, "height": 720}}
+          ]
+        }
+      }
+    }
+  ],
+  "links": {
+    "self": "/v2/userCollectionArtists/me/relationships/items?include=items"
+  }
+}

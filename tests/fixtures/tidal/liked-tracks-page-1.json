@@ -1,0 +1,38 @@
+{
+  "data": [
+    {"type": "tracks", "id": "75413016", "meta": {"addedAt": "2026-11-01T12:00:00Z"}},
+    {"type": "tracks", "id": "12345678", "meta": {"addedAt": "2026-10-28T09:30:00Z"}}
+  ],
+  "included": [
+    {
+      "type": "tracks",
+      "id": "75413016",
+      "attributes": {
+        "title": "Let It Happen",
+        "duration": "PT7M46S",
+        "popularity": 0.82,
+        "explicit": false,
+        "trackNumber": 1,
+        "mediaTags": ["LOSSLESS"],
+        "tidalUrl": "https://tidal.com/browse/track/75413016"
+      }
+    },
+    {
+      "type": "tracks",
+      "id": "12345678",
+      "attributes": {
+        "title": "The Less I Know the Better",
+        "duration": "PT3M38S",
+        "popularity": 0.91,
+        "explicit": false,
+        "trackNumber": 2,
+        "mediaTags": ["LOSSLESS"],
+        "tidalUrl": "https://tidal.com/browse/track/12345678"
+      }
+    }
+  ],
+  "links": {
+    "self": "/v2/userCollectionTracks/me/relationships/items?include=items",
+    "next": "/v2/userCollectionTracks/me/relationships/items?include=items&page%5Bcursor%5D=page-2"
+  }
+}

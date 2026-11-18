@@ -43,6 +43,43 @@ refresh token persists in `auth.toml` by default. The macOS keychain stays as an
 
 Each later PR depends on the one before.
 
+## Decisions for the user library
+
+The user library and the real catalogue land on one branch in five milestones.
+Each milestone passes the preflight before the next one starts.
+
+1. Opaque ids and the catalogue store replace the placeholder catalogue. The
+   migration drops the old rows because their ids do not exist on Tidal. The
+   proof bounds are rebuilt with a small fake catalogue and string ids.
+2. The library sync reads saved albums, followed artists, liked tracks,
+   favorited playlists, owned playlists, and playlists inside those resources.
+   The sync is read-only. A local edit on a remote playlist is blocked. Locally
+   created playlists stay editable. The sync keeps the local history and the
+   local downloads, and it writes only after every page arrives.
+3. The cover cache lives under `XDG_CACHE_HOME`. A cache miss starts a fetch.
+   The fake tests the miss path. No image work runs on the startup path or the
+   UI thread.
+4. Track credits arrive through `include=credits` on a track request. The album
+   page shows the track list with the credits of each track. There is no album
+   credit object.
+5. The artist page shows albums, EPs and singles, top songs sorted by popularity
+   in the app, and similar artists. Compilations and appears-on stay unproven
+   until a live check against a real account.
+
+Nested folders are dropped. The public API cannot derive them. The folder
+endpoints need `r_usr`, which this app cannot request. The deprecated folder
+view does not carry a parent field in its schema. Local collections stay flat.
+
+Playback history stays local. Public v2 has no third-party playback history.
+The local history stays empty until playback exists.
+
+`scripts/tidal-api-check.py` runs in the preflight. It fails when an endpoint in
+the used list is not `THIRD_PARTY`, or when an endpoint in the forbidden list
+stops being `INTERNAL`. The endpoint list lives in
+`docs/tidal-api-access.json`. The fixtures in `tests/fixtures/tidal/` are
+synthetic. Each one must be replaced with a sanitized real response before it
+is used as live evidence.
+
 ## Confirmed live
 
 Read these against a real account on 2026-11-15.

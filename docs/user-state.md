@@ -281,9 +281,11 @@ rows near the viewport. The rows in view ask for the members up to the last
 visible row plus 20 more, so a scroll toward the end reads the next page before
 the reader gets there. A line keyed `pass-status` under the list says whether a
 page is loading, whether the pass stalled, or whether the list is read to its
-end. A stalled pass reads again when a scroll asks for more rows than before, or
-when the screen opens again. A pass that stalls with the last row already in
-view therefore waits for the screen to open again.
+end. A pass stalled by a failed page reads that page again when a scroll asks
+for more rows than before. A pass stalled by a repeated cursor or the page cap
+does not, because the same page would stall it again. Opening the screen again
+starts a new pass from the first page. A pass that stalls with the last row
+already in view therefore waits for the screen to open again.
 
 Returning to a list read to its end reads its first page again behind the rows
 already shown. Returning to a list whose pass stopped part way resumes that pass
@@ -403,6 +405,7 @@ names the test that covers the code path, and no hand check has happened.
 | A network error keeps the session | Land an `Http` profile error, assert `SignedIn`, the disk name, and the stored token | test: `a_network_error_keeps_the_session_signed_in` |
 | A rejected fresh token ends the session | Classify a post-refresh `Unauthorized` as a dead grant | test: `a_fresh_token_that_is_rejected_ends_the_session` |
 | A scope is assigned nowhere but `src/auth.rs` | Write an assignment into a doc, a script and an untracked file | `python3 scripts/scope-check.py`, by hand: each fails, and a clean tree passes |
+| No design doc calls the retired whole-library sync current | Restore an old sync phrase in `docs/tidal-api.md`, then run the check on the docs as they stood before the paged read | `python3 scripts/sync-rule-check.py` in `scripts/preflight.sh`, and by hand on 2026-11-18: each run fails and names the file, line and phrase, and the current docs pass |
 | A driven scene owns its stores | Run the stored scene over a non-memory store, assert it installs its own and a scratch database path | test: `the_stored_scene_owns_its_store_and_its_database` |
 | A quit whose write fails reports the lost edits | Make every write fail, then quit and assert the report | test: `a_quit_that_cannot_write_reports_the_edits_as_lost` |
 | An invalid index cannot hide a valid collection | Seed a negative index first with one allowed, assert the valid one loads | test: `an_invalid_collection_index_does_not_hide_a_valid_one` |

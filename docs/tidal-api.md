@@ -51,11 +51,11 @@ Each milestone passes the preflight before the next one starts.
 1. Opaque ids and the catalogue store replace the placeholder catalogue. The
    migration drops the old rows because their ids do not exist on Tidal. The
    proof bounds are rebuilt with a small fake catalogue and string ids.
-2. The library sync reads saved albums, followed artists, liked tracks,
-   favorited playlists, owned playlists, and playlists inside those resources.
-   The sync is read-only. A local edit on a remote playlist is blocked. Locally
-   created playlists stay editable. The sync keeps the local history and the
-   local downloads, and it writes only after every page arrives.
+2. The library reads liked tracks, saved albums, followed artists, favorited
+   playlists, owned playlists, and the tracks of a Tidal playlist. It reads one
+   page at a time and applies each page as it lands. The read is read-only. A
+   local edit on a remote playlist is blocked. Locally created playlists stay
+   editable. A read never touches the local history or the local downloads.
 3. The cover cache lives under `XDG_CACHE_HOME`. A cache miss starts a fetch.
    The fake tests the miss path. No image work runs on the startup path or the
    UI thread.
@@ -66,22 +66,38 @@ Each milestone passes the preflight before the next one starts.
    in the app, and similar artists. Compilations and appears-on stay unproven
    until a live check against a real account.
 
-The sync reads six lists, in this order:
+A pass reads one remote list from its first page, one page per call. Each
+remote list has its own pass and its own endpoints:
 
-- `GET /userCollectionTracks/me/relationships/items?include=items,items.albums,items.artists`
-- `GET /userCollectionAlbums/me/relationships/items?include=items,items.artists`
-- `GET /userCollectionArtists/me/relationships/items?include=items`
-- `GET /userCollectionPlaylists/me/relationships/items?include=items`
-- `GET /playlists?filter[owners.id]=<uid>` for the owned playlists
-- `GET /playlists/<id>/relationships/items?include=items,items.albums,items.artists`
-  for each distinct playlist from the two lists above
+- Liked tracks:
+  `GET /userCollectionTracks/me/relationships/items?include=items,items.albums,items.artists,items.albums.coverArt`
+- Saved albums:
+  `GET /userCollectionAlbums/me/relationships/items?include=items,items.artists,items.coverArt`
+- Followed artists: `GET /userCollectionArtists/me/relationships/items?include=items`
+- Playlists: the favorited playlists from
+  `GET /userCollectionPlaylists/me/relationships/items?include=items,items.coverArt`,
+  then the owned playlists from `GET /playlists?filter%5Bowners.id%5D=<uid>`
+- The tracks of one Tidal playlist:
+  `GET /playlists/<id>/relationships/items?include=items,items.albums,items.artists,items.albums.coverArt`
 
-Each list follows `links.next` until it is absent. One page budget of 400 pages
-covers the whole fetch. A repeated cursor, an exhausted budget, a failed page, or
-a `next` link that is not a path on the service host fails the whole fetch, so
-the bearer token never leaves the Tidal host and no partial read is applied.
-Whether Tidal honours the nested `include` on the relationship endpoints is not
-checked live. A track whose album or artist is missing is dropped and counted.
+The live reads below cover these endpoints and the nested include strings.
+
+A sync reads the first four lists to their last page. A Tidal playlist's tracks
+are read only when the user opens that playlist. In the live build, opening a
+list's screen starts a pass that reads the first page, and a scroll that needs
+more rows reads the next page. The list on screen reads first.
+
+A page follows `links.next` to the next page. Each pass reads at most 400
+pages. A repeated cursor, the 400-page cap, a failed page, or a `next` link that
+is not a path on the service host stalls the pass, so the bearer token never
+leaves the Tidal host. A stalled pass keeps every page it applied. After a
+failed page, a scroll that asks for more rows reads the same page again. Opening
+the screen again starts a new pass from the first page.
+
+A page before the last one merges as partial. It adds and reorders members, but
+it never removes one, because a member it omits may sit on a later page. Only a
+complete pass, whose last page landed, can remove a member that Tidal no longer
+lists. A member the catalogue cannot hold is dropped and counted.
 
 Nested folders are dropped. The public API cannot derive them. The folder
 endpoints need `r_usr`, which this app cannot request. The deprecated folder

@@ -46,6 +46,11 @@ echo "== tidal api access tiers"
 # the pinned snapshot, so an endpoint that needs internal access fails the gate.
 python3 scripts/tidal-api-check.py
 
+echo "== no retired sync claims"
+# The design docs described the deleted whole-library sync as current after the
+# code moved to one page at a time. This check fails on the retired phrases.
+python3 scripts/sync-rule-check.py
+
 echo "== ci runs the scripts"
 # CI runs this script and nothing else. A workflow that copied the commands would
 # go green while the real gate drifted, which is the failure this whole script

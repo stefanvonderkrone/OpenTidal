@@ -256,7 +256,6 @@ impl Passes {
 
     /// The view shows the first `rows` members of `of`. A stalled pass whose
     /// demand grows tries again.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the virtual list is the first caller"))]
     pub fn want(&mut self, of: &RemoteList, rows: usize) {
         let Some(pass) = self.by.get_mut(of) else {
             return;

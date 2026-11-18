@@ -665,12 +665,18 @@ impl App {
     }
 
     /// The view shows the first `rows` members of `list`. A no-op with no open
-    /// library, or with no pass for the list.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the virtual list is the first caller"))]
-    pub fn want(&mut self, list: RemoteList, rows: usize) {
+    /// library, or with no pass for the list. The view reports its rows during
+    /// layout, before the next `drain`, so this enters the route and starts the
+    /// page itself. A window at rest runs no other `drain` to start it.
+    /// Returns whether the list's status changed, so the view draws it.
+    pub fn want(&mut self, list: RemoteList, rows: usize) -> bool {
+        let before = self.pass_status(list.clone());
+        self.enter_route();
         if let Some(open) = self.library.as_mut() {
             open.passes.want(&list, rows);
         }
+        self.pump();
+        self.pass_status(list.clone()) != before
     }
 
     /// How far the open account's pass for `list` got. `Idle` with no library.

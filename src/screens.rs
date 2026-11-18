@@ -3,8 +3,10 @@
 //! real state now: every screen reads it and every action mutates it through
 //! the proven operations.
 
+use std::borrow::{Borrow, Cow};
+
 use rune::tok::{self, radius, space, type_};
-use rune::{Color, El, ScrollSpec, TextEdit, col, el, oklch, row, text, text_input};
+use rune::{Color, El, GrowthSpec, ScrollSpec, TextEdit, col, el, oklch, row, text, text_input};
 use crate::app::{App, Cover, Covers};
 use crate::catalogue::{Album, AlbumId, Artist, ArtistId, Catalogue, CataloguePlaylist, CataloguePlaylistId, Track, TrackId};
 use crate::library::{self, PlaylistId, RemoteList};
@@ -246,6 +248,58 @@ fn page(title: &str, subtitle: &str, t: tok::Theme, body: El) -> El {
         )
 }
 
+/// Members the view asks for past the last row it shows. The scene's fake
+/// pages hold 20, and the live page size is not recorded yet.
+const LOOKAHEAD: usize = 20;
+
+/// A remote list inside the page's scroll, `per` members to a row. Only the
+/// rows near the viewport are built, from the state at layout time, and each
+/// row is keyed by its first member's id, so a reorder never names the wrong
+/// item. The rows in view ask for one page more of `list`.
+fn remote_rows<T: Borrow<str> + 'static>(
+    app: &App,
+    key: &str,
+    list: Option<RemoteList>,
+    ids: impl for<'a> Fn(&'a App) -> &'a [T] + Clone + 'static,
+    per: usize,
+    row_height: f32,
+    member: impl Fn(&App, usize, &T) -> El + 'static,
+) -> El {
+    let count = ids(app).len().div_ceil(per);
+    let key_ids = ids.clone();
+    let rows = col().key(key).w_full().growth(GrowthSpec::default()).virtual_rows(
+        count,
+        row_height,
+        move |a: &App, i| match key_ids(a).get(i * per) {
+            Some(id) => Cow::Borrowed(id.borrow()),
+            None => Cow::Owned(format!("row-{i}")),
+        },
+        move |a: &App, i| {
+            let mut r = row().w_full().gap(space::S3).pb(space::S3);
+            for (j, id) in ids(a).iter().enumerate().skip(i * per).take(per) {
+                r = r.child(member(a, j, id));
+            }
+            r
+        },
+    );
+    match list {
+        Some(list) => rows.on_visible_rows(move |a: &mut App, seen| a.want(list.clone(), seen.end * per + LOOKAHEAD)),
+        None => rows,
+    }
+}
+
+/// The line under a remote list: what its pass is doing. Nothing while no
+/// pass reads it.
+fn pass_status(app: &App, list: Option<RemoteList>, t: tok::Theme) -> Option<El> {
+    let line = match app.pass_status(list?) {
+        PassStatus::Idle => return None,
+        PassStatus::Loading => "Loading from Tidal…",
+        PassStatus::Stalled(_) => "Tidal did not send the rest. Scroll down or open this screen again to retry.",
+        PassStatus::Complete => "Up to date with Tidal.",
+    };
+    Some(text(line).key("pass-status").font(type_::LABEL).color(t.text_secondary))
+}
+
 fn all_albums_grid(cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
     let cards: Vec<El> = cat.albums().enumerate().map(|(i, a)| album_card(i, a, cat, covers, t)).collect();
     grid(cards, 5)
@@ -335,37 +389,64 @@ pub fn for_you(cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
             .child(shelf("From your genres", t, b)))
 }
 
-pub fn liked_songs(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
-    let tracks: Vec<&Track> = cat.tracks().filter(|tr| s.lib.is_liked(&tr.id)).collect();
-    let body = if tracks.is_empty() {
+/// The rows of a track list, keyed `track-<pos>` inside each row.
+fn track_rows(app: &App, list: Option<RemoteList>, t: tok::Theme, ids: impl for<'a> Fn(&'a App) -> &'a [TrackId] + Clone + 'static) -> El {
+    remote_rows(app, "tracks", list, ids, 1, 48.0, move |a: &App, pos, id: &TrackId| {
+        match a.catalogue.track(id) {
+            Some(tr) => track_row(pos, tr, a.core.now_playing.as_ref() == Some(id), &a.catalogue, t).grow(1.0),
+            None => el(),
+        }
+    })
+}
+
+/// A remote list's rows, or the line that says it is empty, with its status
+/// line under them.
+fn with_status(app: &App, list: Option<RemoteList>, body: El, t: tok::Theme) -> El {
+    col().gap(space::S3).child(body).children(pass_status(app, list, t))
+}
+
+pub fn liked_songs(app: &App, t: tok::Theme) -> El {
+    let list = Some(RemoteList::Liked);
+    let body = if app.core.lib.liked.is_empty() {
         empty("Nothing liked yet. Tap the heart on the now-playing bar.", t)
     } else {
-        track_list(tracks, s.now_playing.as_ref(), cat, t)
+        track_rows(app, list.clone(), t, |a: &App| &a.core.lib.liked[..])
     };
-    page("Liked Songs", "Tracks you liked", t, body)
+    page("Liked Songs", "Tracks you liked", t, with_status(app, list, body, t))
 }
 
-pub fn albums(s: &State, cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
-    let saved: Vec<&Album> = cat.albums().filter(|a| s.lib.is_saved_album(&a.id)).collect();
-    let body = if saved.is_empty() {
+pub fn albums(app: &App, t: tok::Theme) -> El {
+    let list = Some(RemoteList::Albums);
+    let body = if app.core.lib.saved_albums.is_empty() {
         empty("No saved albums yet. Open an album and tap Save.", t)
     } else {
-        grid(saved.into_iter().enumerate().map(|(i, a)| album_card(i, a, cat, covers, t)).collect(), 5)
+        remote_rows(app, "rows", list.clone(), |a: &App| &a.core.lib.saved_albums[..], 5, 232.0, move |a: &App, pos, id: &AlbumId| {
+            match a.catalogue.album(id) {
+                Some(album) => album_card(pos, album, &a.catalogue, a.covers(), t),
+                None => el(),
+            }
+        })
     };
-    page("Albums", "Albums you saved", t, body)
+    page("Albums", "Albums you saved", t, with_status(app, list, body, t))
 }
 
-pub fn artists(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
-    let followed: Vec<&Artist> = cat.artists().filter(|a| s.lib.is_following(&a.id)).collect();
-    let body = if followed.is_empty() {
+pub fn artists(app: &App, t: tok::Theme) -> El {
+    let list = Some(RemoteList::Artists);
+    let body = if app.core.lib.followed.is_empty() {
         empty("No artists yet. Open an artist and tap Follow.", t)
     } else {
-        grid(followed.into_iter().enumerate().map(|(i, a)| artist_card(i, a, t)).collect(), 6)
+        remote_rows(app, "rows", list.clone(), |a: &App| &a.core.lib.followed[..], 6, 160.0, move |a: &App, pos, id: &ArtistId| {
+            match a.catalogue.artist(id) {
+                Some(artist) => artist_card(pos, artist, t),
+                None => el(),
+            }
+        })
     };
-    page("Artists", "Artists you follow", t, body)
+    page("Artists", "Artists you follow", t, with_status(app, list, body, t))
 }
 
-pub fn playlists(s: &State, cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
+pub fn playlists(app: &App, t: tok::Theme) -> El {
+    let s = &app.core;
     let new_btn = el().key("new-playlist").label("New playlist")
         .h(40.0).px(space::S3).radius(radius::MD).center_y().focusable(true)
         .fill(t.text)
@@ -386,15 +467,19 @@ pub fn playlists(s: &State, cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) 
     };
     // Tidal playlists open the read-only catalogue route, so no edit action can
     // reach one. Only this account's memberships are listed.
-    let tidal: Vec<El> = s.lib.tidal_playlists.iter()
-        .filter_map(|id| cat.playlist(id))
-        .enumerate()
-        .map(|(n, p)| catalogue_playlist_card(format!("tidal-playlist-{n}"), p, "From Tidal", covers, t))
-        .collect();
-    if !tidal.is_empty() {
+    let list = Some(RemoteList::Playlists);
+    if s.lib.tidal_playlists.is_empty() {
+        body = body.children(pass_status(app, list, t));
+    } else {
+        let rows = remote_rows(app, "rows", list.clone(), |a: &App| &a.core.lib.tidal_playlists[..], 5, 232.0, move |a: &App, n, id: &CataloguePlaylistId| {
+            match a.catalogue.playlist(id) {
+                Some(p) => catalogue_playlist_card(format!("tidal-playlist-{n}"), p, "From Tidal", a.covers(), t),
+                None => el(),
+            }
+        });
         body = body
             .child(text("From Tidal").key("tidal-playlists-title").font(type_::SECTION).color(t.text))
-            .child(grid(tidal, 5));
+            .child(with_status(app, list, rows, t));
     }
     page("Playlists", "Your playlists", t, body)
 }
@@ -864,7 +949,7 @@ pub fn detail(route: &Route, app: &App, accent: Color, t: tok::Theme) -> El {
     match route {
         Route::Album(id) => album_detail(id, s, cat, covers, accent, t),
         Route::Artist(id) => artist_detail(id, s, cat, accent, t),
-        Route::CataloguePlaylist(id) => catalogue_playlist_detail(id, s, cat, covers, accent, t),
+        Route::CataloguePlaylist(id) => catalogue_playlist_detail(id, app, accent, t),
         Route::UserPlaylist(id) => user_playlist_detail(*id, app, accent, t),
         _ => page("Detail", "", t, el()),
     }
@@ -928,11 +1013,14 @@ fn artist_detail(id: &ArtistId, s: &State, cat: &Catalogue, accent: Color, t: to
         .child(detail_body(track_list(tracks, s.now_playing.as_ref(), cat, t)))
 }
 
-fn catalogue_playlist_detail(id: &CataloguePlaylistId, s: &State, cat: &Catalogue, covers: Covers<'_>, accent: Color, t: tok::Theme) -> El {
+fn catalogue_playlist_detail(id: &CataloguePlaylistId, app: &App, accent: Color, t: tok::Theme) -> El {
+    let (cat, covers) = (&app.catalogue, app.covers());
     let Some(p) = cat.playlist(id) else {
         return page("Playlist", "This playlist is gone", t, el());
     };
-    let tracks: Vec<&Track> = p.tracks.iter().filter_map(|tid| cat.track(tid)).collect();
+    let list = RemoteList::of(Some(&Route::CataloguePlaylist(id.clone())));
+    let subject = id.clone();
+    let rows = track_rows(app, list.clone(), t, move |a: &App| a.catalogue.playlist(&subject).map_or(&[][..], |p| &p.tracks[..]));
 
     let play = id.clone();
     let actions = vec![
@@ -941,7 +1029,7 @@ fn catalogue_playlist_detail(id: &CataloguePlaylistId, s: &State, cat: &Catalogu
 
     col().grow(1.0).min_h(0.0)
         .child(hero(cover_art("hero-cover", &covers.playlist(p), 200.0, radius::MD, t), &p.name, &p.description, t, actions))
-        .child(detail_body(track_list(tracks, s.now_playing.as_ref(), cat, t)))
+        .child(detail_body(with_status(app, list, rows, t)))
 }
 
 fn user_playlist_detail(id: PlaylistId, app: &App, accent: Color, t: tok::Theme) -> El {

@@ -19,3 +19,11 @@ the album and artist resources it names, because the sync asks for
 `/playlists?filter[owners.id]=<uid>`. It lists one playlist that is also
 favorited, so a test can prove that the read fetches its items once.
 `owned-playlist-items.json` holds the items of the other one.
+
+`album-cover-art.json` answers
+`/albums/<id>/relationships/coverArt?include=coverArt`. Its shape is a guess
+from the pinned albums spec, and nothing real backs it. The resource type
+`artworks`, the `files` array, and each file's `href` and `meta.width` are all
+unproven. The decoder matches the included artwork by id only, so it works
+with either type name. It holds a second artwork with another id, so a test
+can prove that the read picks the artwork the relationship names.

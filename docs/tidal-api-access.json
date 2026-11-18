@@ -462,6 +462,16 @@
       "method": "get",
       "path": "/artists/{id}/relationships/videos",
       "spec": "artists"
+    },
+    {
+      "method": "get",
+      "path": "/albums/{id}/relationships/coverArt",
+      "spec": "albums"
+    },
+    {
+      "method": "get",
+      "path": "/playlists/{id}/relationships/coverArt",
+      "spec": "playlists"
     }
   ],
   "version": "1.10.14"

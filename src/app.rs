@@ -1179,6 +1179,9 @@ mod tests {
             fn library(&self, _token: &str, _user: &str) -> Result<crate::library::LibraryRows, ServiceError> {
                 Err(ServiceError::Unauthorized)
             }
+            fn cover(&self, _token: &str, _cover: &crate::catalogue::CoverRequest) -> Result<Vec<u8>, ServiceError> {
+                Err(ServiceError::Unauthorized)
+            }
         }
         let calls = AtomicUsize::new(0);
         let refresh = |t: &Token| {
@@ -1870,6 +1873,9 @@ mod tests {
             fn library(&self, _token: &str, _user: &str) -> Result<LibraryRows, ServiceError> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(tidal_rows("A"))
+            }
+            fn cover(&self, _token: &str, _cover: &crate::catalogue::CoverRequest) -> Result<Vec<u8>, ServiceError> {
+                Err(ServiceError::Http("unused".to_string()))
             }
         }
         let dir = TempDir::new("sync-waits");

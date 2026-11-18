@@ -6,13 +6,14 @@
 //! This module is rune-free. It holds no network or token state in `State`; the
 //! app wraps a service in `Arc` on [`crate::app::App`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::auth::{OAuthConfig, Token};
-use crate::catalogue::{AlbumRow, ArtistRow, CatalogueRows, PlaylistRow, TrackRow};
+use crate::catalogue::{AlbumRow, ArtistRow, CatalogueRows, CoverOwner, CoverRequest, PlaylistRow, TrackRow};
 use crate::library::LibraryRows;
 
 /// A Tidal user id, an opaque string. The newtype keeps it from being mistaken
@@ -51,13 +52,31 @@ pub trait MusicService: Send + Sync {
     /// Read every page of the account's library. A failed page, a repeated
     /// cursor, or the page cap returns an error and no rows.
     fn library(&self, token: &str, user: &str) -> Result<LibraryRows, ServiceError>;
+    /// The bytes of one cover, near [`COVER_PX`] wide. Unchecked: the cover
+    /// cache checks them before a put.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
+    fn cover(&self, token: &str, cover: &CoverRequest) -> Result<Vec<u8>, ServiceError>;
 }
+
+/// The width a cover fetch asks for: 168 pt cards and 200 pt heroes at 2x.
+#[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
+pub const COVER_PX: u64 = 640;
+
+/// The largest image body a cover fetch accepts.
+#[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
+pub const MAX_COVER_BYTES: u64 = 4 * 1024 * 1024;
 
 /// A fixed, deterministic service for tests and headless drives.
 pub struct FakeService {
     pub user: User,
     /// What a sync reads. The default is an empty library.
     pub library: Result<LibraryRows, ServiceError>,
+    #[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
+    /// What `cover` answers, by artwork id. A missing id is `Http("404")`.
+    pub covers: BTreeMap<String, Result<Vec<u8>, ServiceError>>,
+    #[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
+    /// How many times `cover` ran, so a test proves a hit made no fetch.
+    pub cover_calls: AtomicUsize,
 }
 
 impl Default for FakeService {
@@ -65,6 +84,8 @@ impl Default for FakeService {
         FakeService {
             user: User { id: UserId("fake-user".to_string()), name: "Fake User".to_string() },
             library: Ok(LibraryRows::default()),
+            covers: BTreeMap::new(),
+            cover_calls: AtomicUsize::new(0),
         }
     }
 }
@@ -75,6 +96,13 @@ impl MusicService for FakeService {
     }
     fn library(&self, _token: &str, _user: &str) -> Result<LibraryRows, ServiceError> {
         self.library.clone()
+    }
+    fn cover(&self, _token: &str, cover: &CoverRequest) -> Result<Vec<u8>, ServiceError> {
+        self.cover_calls.fetch_add(1, Ordering::SeqCst);
+        self.covers
+            .get(cover.artwork.as_str())
+            .cloned()
+            .unwrap_or_else(|| Err(ServiceError::Http("404".to_string())))
     }
 }
 
@@ -117,6 +145,32 @@ impl HttpService {
         }
         resp.json::<Document>().map_err(|e| ServiceError::Decode(e.to_string()))
     }
+
+    /// GET an image with no `Authorization` header, a 15 s timeout, and a body
+    /// cap of [`MAX_COVER_BYTES`]. It takes no token, so the token cannot reach
+    /// the image host.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
+    fn get_image(&self, url: &reqwest::Url) -> Result<Vec<u8>, ServiceError> {
+        use std::io::Read;
+        let resp = self
+            .client
+            .get(url.clone())
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .map_err(|e| ServiceError::Http(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ServiceError::Http(format!("{status} for a cover image")));
+        }
+        let mut body = Vec::new();
+        resp.take(MAX_COVER_BYTES + 1)
+            .read_to_end(&mut body)
+            .map_err(|e| ServiceError::Http(e.to_string()))?;
+        if body.len() as u64 > MAX_COVER_BYTES {
+            return Err(ServiceError::Http("a cover image is over the size cap".to_string()));
+        }
+        Ok(body)
+    }
 }
 
 impl MusicService for HttpService {
@@ -141,6 +195,10 @@ impl MusicService for HttpService {
 
     fn library(&self, token: &str, user: &str) -> Result<LibraryRows, ServiceError> {
         fetch_library(&mut |path: &str| self.get_doc(token, path), &self.prefix, user)
+    }
+
+    fn cover(&self, token: &str, cover: &CoverRequest) -> Result<Vec<u8>, ServiceError> {
+        fetch_cover(&mut |path: &str| self.get_doc(token, path), &mut |url| self.get_image(url), cover)
     }
 }
 
@@ -561,6 +619,61 @@ fn fetch_library(get: &mut PageSource, prefix: &str, user: &str) -> Result<Libra
     Ok(rows)
 }
 
+/// The `coverArt` relationship read of a cover's owner, with the artwork
+/// included. These are the two pinned third-party endpoints in the manifest.
+#[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
+fn cover_path(owner: &CoverOwner) -> String {
+    match owner {
+        CoverOwner::Album(id) => format!("/albums/{}/relationships/coverArt?include=coverArt", id.as_str()),
+        CoverOwner::Playlist(id) => format!("/playlists/{}/relationships/coverArt?include=coverArt", id.as_str()),
+    }
+}
+
+/// The whole cover read, over any sources. `get_doc` carries the bearer token
+/// to the service. `get_image` takes only a URL, so the token cannot reach the
+/// image host by construction.
+///
+/// The response shape is synthetic: the included artwork is matched by id
+/// only, because its type is `coverArts` in the library fixtures and
+/// `artworks` in the spec, and neither is proven live.
+#[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
+fn fetch_cover(
+    get_doc: &mut PageSource,
+    get_image: &mut dyn FnMut(&reqwest::Url) -> Result<Vec<u8>, ServiceError>,
+    cover: &CoverRequest,
+) -> Result<Vec<u8>, ServiceError> {
+    let doc = get_doc(&cover_path(&cover.owner))?;
+    let artwork = doc
+        .included
+        .iter()
+        .find(|r| r.id == cover.artwork.as_str())
+        .ok_or_else(|| ServiceError::Decode("the cover response does not include its artwork".to_string()))?;
+    let href = pick_file(artwork.attributes.as_ref())
+        .ok_or_else(|| ServiceError::Decode("the artwork names no file".to_string()))?;
+    let url = reqwest::Url::parse(&href)
+        .ok()
+        .filter(|url| url.scheme() == "https" && url.host_str().is_some_and(|h| !h.is_empty()))
+        .ok_or_else(|| ServiceError::Decode(format!("a cover link is not an https URL: {href}")))?;
+    get_image(&url)
+}
+
+/// The href of the smallest file at least [`COVER_PX`] wide, else the widest.
+/// A file with no href or no width is skipped.
+#[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
+fn pick_file(attributes: Option<&Value>) -> Option<String> {
+    let files = attributes?.get("files")?.as_array()?;
+    let sized = files.iter().filter_map(|f| {
+        let href = f.get("href")?.as_str()?;
+        let width = f.get("meta")?.get("width")?.as_u64()?;
+        Some((width, href))
+    });
+    let (wide, narrow): (Vec<_>, Vec<_>) = sized.partition(|(w, _)| *w >= COVER_PX);
+    wide.into_iter()
+        .min_by_key(|(w, _)| *w)
+        .or_else(|| narrow.into_iter().max_by_key(|(w, _)| *w))
+        .map(|(_, href)| href.to_owned())
+}
+
 /// The user's display name from the resource attributes. The field names vary
 /// across the API versions, so read the known ones in order and fall back.
 ///
@@ -817,6 +930,150 @@ mod tests {
         assert_eq!(seen.len(), 8);
         assert!(seen.iter().all(|(_, bearer)| *bearer), "a request went without the token: {seen:?}");
         assert!(seen[1].0.ends_with("page%5Bcursor%5D=page-2"), "the second page was not requested: {seen:?}");
+    }
+
+    /// A cover request for an album or playlist of the fixtures.
+    fn cover_request(owner: &str, artwork: &str) -> CoverRequest {
+        let mut cat = crate::catalogue::Catalogue::seed();
+        cat.absorb(CatalogueRows {
+            albums: vec![AlbumRow {
+                id: owner.into(),
+                title: "Currents".into(),
+                artist: "seed-artist-0".into(),
+                cover: artwork.into(),
+            }],
+            ..CatalogueRows::default()
+        });
+        cat.album(&cat.album_id(owner).unwrap()).unwrap().cover_request().unwrap()
+    }
+
+    /// Run `fetch_cover` over one document, recording the paths and the image
+    /// URLs it asked for.
+    fn read_cover(doc: &str, request: &CoverRequest) -> (Result<Vec<u8>, ServiceError>, Vec<String>, Vec<String>) {
+        let mut paths = Vec::new();
+        let mut images = Vec::new();
+        let result = fetch_cover(
+            &mut |path: &str| {
+                paths.push(path.to_owned());
+                Ok(serde_json::from_str(doc).unwrap())
+            },
+            &mut |url| {
+                images.push(url.to_string());
+                Ok(b"image".to_vec())
+            },
+            request,
+        );
+        (result, paths, images)
+    }
+
+    fn cover_fixture() -> String {
+        std::fs::read_to_string(format!("{}/tests/fixtures/tidal/album-cover-art.json", env!("CARGO_MANIFEST_DIR")))
+            .unwrap()
+    }
+
+    /// The read asks the pinned relationship endpoint, finds the artwork the
+    /// relationship names, and fetches one of its files.
+    #[test]
+    fn a_cover_link_is_read_from_the_artwork_files() {
+        let request = cover_request("251380836", "251380836-large");
+        let (result, paths, images) = read_cover(&cover_fixture(), &request);
+        assert_eq!(result, Ok(b"image".to_vec()));
+        assert_eq!(paths, ["/albums/251380836/relationships/coverArt?include=coverArt"]);
+        assert_eq!(images, ["https://resources.tidal.com/images/251380836/750x750.jpg"]);
+        assert_eq!(
+            cover_path(&CoverOwner::Playlist(
+                crate::catalogue::Catalogue::seed().playlist_id("seed-playlist-0").unwrap()
+            )),
+            "/playlists/seed-playlist-0/relationships/coverArt?include=coverArt"
+        );
+    }
+
+    /// The smallest file at least `COVER_PX` wide wins. With none that wide,
+    /// the widest wins.
+    #[test]
+    fn the_smallest_file_at_or_above_the_width_wins() {
+        let file = |w: u64| serde_json::json!({ "href": format!("https://i.example/{w}.jpg"), "meta": { "width": w } });
+        let attrs = |ws: &[u64]| serde_json::json!({ "files": ws.iter().map(|&w| file(w)).collect::<Vec<_>>() });
+        assert_eq!(pick_file(Some(&attrs(&[1280, 160, 640, 750]))).as_deref(), Some("https://i.example/640.jpg"));
+        assert_eq!(pick_file(Some(&attrs(&[1280, 750]))).as_deref(), Some("https://i.example/750.jpg"));
+        assert_eq!(pick_file(Some(&attrs(&[80, 320, 160]))).as_deref(), Some("https://i.example/320.jpg"));
+    }
+
+    /// A link that is not an absolute https URL is refused before any image
+    /// request, so a cover never comes over plain HTTP or from a relative path.
+    #[test]
+    fn a_cover_link_that_is_not_https_is_refused() {
+        let request = cover_request("251380836", "251380836-large");
+        for href in ["http://resources.tidal.com/x.jpg", "/images/x.jpg", "//resources.tidal.com/x.jpg", "file:///etc/passwd", "ftp://resources.tidal.com/x.jpg"] {
+            let doc = serde_json::json!({
+                "included": [{ "type": "artworks", "id": "251380836-large",
+                    "attributes": { "files": [{ "href": href, "meta": { "width": 640 } }] } }]
+            })
+            .to_string();
+            let (result, _, images) = read_cover(&doc, &request);
+            assert!(matches!(result, Err(ServiceError::Decode(_))), "{href} was accepted: {result:?}");
+            assert!(images.is_empty(), "{href} was fetched");
+        }
+    }
+
+    /// An artwork with no usable file, or a response without the named artwork,
+    /// is a decode error, not an empty cover.
+    #[test]
+    fn a_cover_with_no_files_is_a_decode_error() {
+        let request = cover_request("251380836", "251380836-large");
+        for doc in [
+            r#"{"included":[{"type":"artworks","id":"251380836-large","attributes":{"files":[]}}]}"#,
+            r#"{"included":[{"type":"artworks","id":"251380836-large","attributes":{}}]}"#,
+            r#"{"included":[{"type":"artworks","id":"251380836-large","attributes":{"files":[{"href":"https://i.example/x.jpg"}]}}]}"#,
+            r#"{"included":[{"type":"artworks","id":"someone-else","attributes":{"files":[{"href":"https://i.example/x.jpg","meta":{"width":640}}]}}]}"#,
+            r#"{"data":[]}"#,
+        ] {
+            let (result, _, images) = read_cover(doc, &request);
+            assert!(matches!(result, Err(ServiceError::Decode(_))), "{doc} gave {result:?}");
+            assert!(images.is_empty());
+        }
+    }
+
+    /// The image request carries no bearer token, and a body over the cap is
+    /// refused rather than read whole.
+    #[test]
+    fn an_image_body_over_the_cap_is_refused() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut authorized = Vec::new();
+            for size in [16usize, MAX_COVER_BYTES as usize + 1] {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let n = conn.read(&mut buf).unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                authorized.push(request.contains("authorization:"));
+                let _ = conn.write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n").as_bytes(),
+                );
+                let _ = conn.write_all(&vec![0xAB; size]);
+            }
+            authorized
+        });
+        let svc = HttpService::new(&format!("http://127.0.0.1:{}/v2", addr.port()));
+        let url = reqwest::Url::parse(&format!("http://127.0.0.1:{}/image.jpg", addr.port())).unwrap();
+        assert_eq!(svc.get_image(&url), Ok(vec![0xAB; 16]));
+        assert!(matches!(svc.get_image(&url), Err(ServiceError::Http(_))), "an over-cap body was accepted");
+        assert_eq!(server.join().unwrap(), [false, false], "an image request carried a token");
+    }
+
+    /// The fake answers from its cover map and counts every call.
+    #[test]
+    fn fake_service_serves_and_counts_covers() {
+        let svc = FakeService {
+            covers: BTreeMap::from([("251380836-large".to_string(), Ok(b"png".to_vec()))]),
+            ..FakeService::default()
+        };
+        assert_eq!(svc.cover("t", &cover_request("251380836", "251380836-large")), Ok(b"png".to_vec()));
+        assert_eq!(svc.cover("t", &cover_request("251380836", "other")), Err(ServiceError::Http("404".to_string())));
+        assert_eq!(svc.cover_calls.load(Ordering::SeqCst), 2);
     }
 
     /// The fake returns its fixed user and never touches the network.

@@ -2025,6 +2025,35 @@ mod tests {
         assert!(on_disk("account-a", &path).is_liked(&track(1)), "the last edit was not written first");
     }
 
+    /// A landed profile fetch starts a sync in live mode, with the token the
+    /// fetch proved, and never in the fake build. A fake scene or test that
+    /// fetches the profile must not have its library replaced by surprise.
+    #[test]
+    fn a_landed_profile_syncs_only_in_live_mode() {
+        for live in [false, true] {
+            let dir = TempDir::new(if live { "trigger-live" } else { "trigger-fake" });
+            let path = dir.path();
+            let mut app = signed_in("account-a", &path, tidal_rows("A"));
+            app.live = live;
+            let session = app.session;
+            let user = User { id: crate::tidal::UserId("account-a".to_string()), name: "Ada".to_string() };
+            app.profile.request((), move |_| (session, Ok((fake_token(), user))));
+            drain_until(&mut app, |a| !a.profile.is_pending() && !a.sync.is_pending() && a.core.lib.name == "Ada");
+            if live {
+                drain_until(&mut app, |a| a.last_sync.is_some());
+            } else {
+                // Long enough for a sync the fake build must not start to land.
+                for _ in 0..50 {
+                    app.drain();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+
+            assert_eq!(app.core.lib.is_liked(&track(0)), live, "live mode is {live}, and the sync disagreed");
+            assert_eq!(app.last_sync.is_some(), live);
+        }
+    }
+
     /// The fake token carries no `uid` claim, so the headless build never
     /// touches a database file.
     #[test]

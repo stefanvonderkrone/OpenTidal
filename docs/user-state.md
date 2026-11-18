@@ -352,7 +352,8 @@ fails when the name does not exist. `live:` names a check done by hand, and name
 test that also covers it as `name`(), with the parentheses. The parentheses matter:
 without them a renamed test there would pass unchecked, and another pragma or column
 name would be read as a test. `pending:` names work this branch does not build, so
-nothing there is a test.
+nothing there is a test. A `live:` cell that starts with `not run` is open: it
+names the test that covers the code path, and no hand check has happened.
 
 | Claim | Check | Status |
 | --- | --- | --- |
@@ -395,6 +396,11 @@ nothing there is a test.
 | A repeated write makes no duplicates | Write twice, assert one row per bit | test: `write_is_idempotent` |
 | An email is not a display name | A profile whose `username` is an address asserts `You` | test: `an_email_is_not_used_as_a_name` |
 | The key holds offline | `uid` read from the token store alone, no network, before any fetch | test: `the_user_id_comes_from_the_token`, `the_fake_token_names_no_user` |
+| A landed profile fetch starts a sync in live mode only | Land a profile in live and in fake mode, assert only live syncs | test: `a_landed_profile_syncs_only_in_live_mode` |
+| A live sign-in syncs the library | Sign in with a real account, assert Liked Songs and the From Tidal grid fill and the file holds the rows | live: not run. No token exists, so this stays open. The trigger is covered by `a_landed_profile_syncs_only_in_live_mode`() |
+| Tidal honours the nested include | A live read of liked tracks reports no dropped item | pending: no token. A track whose album or artist is missing is dropped and counted |
+| A live next link starts with the base path | A live read of a library longer than one page reaches its last page | pending: no token. The fixtures send `/v2/...`, and any other shape fails the read with a clear error |
+| The owned playlist list pages like the others | A live read of an account with many owned playlists | pending: no token |
 | The file is private | `stat -f '%Lp'` returns `600` | live: 2026-11-15, plus `a_restart_reads_the_written_library`() |
 | Schema is sound | `PRAGMA integrity_check` is `ok` and no row has an orphan `user_id` | live: 2026-11-15, plus `replacement_removes_stale_rows`() |
 | A like reaches the disk from a live session | Like a track, wait for idle, read the row | live: 2026-11-15 |

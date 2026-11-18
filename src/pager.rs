@@ -1,7 +1,6 @@
 //! Which page of which remote list to read next. Rune-free and free of I/O.
 //! The app hands each `PageRequest` to the page worker and lands its
 //! `PageResult` here, so every scheduling and renewal rule lives in one place.
-#![cfg_attr(not(test), expect(dead_code, reason = "the page worker is the first caller"))]
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -257,6 +256,7 @@ impl Passes {
 
     /// The view shows the first `rows` members of `of`. A stalled pass whose
     /// demand grows tries again.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the virtual list is the first caller"))]
     pub fn want(&mut self, of: &RemoteList, rows: usize) {
         let Some(pass) = self.by.get_mut(of) else {
             return;

@@ -143,7 +143,7 @@ pub enum CoverOutcome {
     Ready(PathBuf),
     /// No cover can come now: Tidal names no file, the body is not an image,
     /// the put failed, or there is no usable token. The app asks again after
-    /// the next sync lands.
+    /// the next page lands.
     Unavailable,
     /// Tidal is limiting requests. The app asks again in the next batch.
     Deferred,

@@ -17,7 +17,8 @@ use serde::Deserialize;
 use crate::auth::{self, Auth, OAuthConfig, Token, TokenStore};
 use crate::catalogue::{Album, ArtworkId, Catalogue, CataloguePlaylist, CoverOwner, CoverRequest};
 use crate::covers::{self, CoverCache, CoverOutcome};
-use crate::library::{Library, LibraryRows, SyncReport};
+use crate::library::{Library, RemoteList};
+use crate::pager::{Landed, PageResult, PassStatus, Passes};
 use crate::state::State;
 use crate::store::Store;
 use crate::tidal::{self, MusicService, ServiceError, User};
@@ -76,11 +77,22 @@ pub struct App {
     /// The profile fetch after sign-in, drained by `poll`. Carries the session
     /// it was started under and the possibly-refreshed token to persist.
     pub profile: Latest<ProfileFetch>,
-    /// The library read, drained by `poll`. Running is `sync.is_pending()`, never a
-    /// second flag.
-    pub sync: Latest<SyncFetch>,
-    /// The outcome of the last sync for this account. `None` before the first one.
-    pub last_sync: Option<Result<SyncReport, String>>,
+    /// Whether the pending profile fetch is a renewal a rejected page forced. A
+    /// renewal starts no sync. Set with each profile request.
+    profile_renews: bool,
+    /// Refreshes a token. A field, so a test renews without a network.
+    pub(crate) refresh: fn(&OAuthConfig, &Token) -> Result<Token, ServiceError>,
+    /// The page worker, drained by `poll`. `Passes` asks for one page at a
+    /// time, so `Latest` never replaces a page in flight for the same account.
+    pub pages: Latest<PageFetch>,
+    /// Mints pass ids. Never reset, so a page for a closed library finds no pass.
+    next_pass: u64,
+    /// Whether entering a list's route starts a pass. `live` by default. A
+    /// deterministic scene turns it off, so its fixture library is not erased.
+    pub(crate) revalidate_on_entry: bool,
+    /// `Catalogue::revision` at the last write, so a change to the catalogue
+    /// alone, such as a playlist's tracks, still reaches disk.
+    on_disk_revision: u64,
     /// The process's image cache, made in `setup` with the waker. `None` before
     /// setup, so nothing decodes on the startup path.
     images: Option<ImageCache>,
@@ -118,6 +130,9 @@ struct OpenLibrary {
     /// Dropping the open library drops every shown image and the cache handle,
     /// so no cover outlives its account in memory.
     covers: Option<AccountCovers>,
+    /// This account's passes. Dropped with the library, so a page that lands
+    /// for another account finds no pass.
+    passes: Passes,
 }
 
 /// One account's covers. `states` is the only record of what the view wants,
@@ -143,7 +158,7 @@ enum CoverState {
     /// `ImageCache::file` returned this handle. The handle keeps the decoded
     /// pixels alive, because the image cache holds only weak references.
     Shown(Image),
-    /// No cover for now. A landed sync clears it, so the next frame asks again.
+    /// No cover for now. A landed page clears it, so the next frame asks again.
     Unavailable,
 }
 
@@ -162,8 +177,8 @@ type AuthFlow = (u64, Result<Token, String>);
 /// persist.
 type ProfileFetch = (u64, Result<(Token, User), ServiceError>);
 
-/// A finished library read, tagged with its ticket, carrying the token to persist.
-type SyncFetch = (Ticket, Result<(Token, LibraryRows), ServiceError>);
+/// A finished page, tagged with the account it was read for.
+type PageFetch = (Ticket, PageResult);
 
 /// A dummy token for the deterministic sign-in, so the fake path exercises the
 /// same `SignedIn` state without a network.
@@ -179,7 +194,7 @@ impl App {
     pub fn setup(&mut self, waker: Waker) {
         self.auth_flow.set_waker(waker.clone());
         self.profile.set_waker(waker.clone());
-        self.sync.set_waker(waker.clone());
+        self.pages.set_waker(waker.clone());
         self.cover_fetch.set_waker(waker.clone());
         self.images = Some(ImageCache::new(waker.clone()));
         self.waker = Some(waker);
@@ -275,6 +290,7 @@ impl App {
                 let row_pending = match store.write(user_id, &self.core.lib, &self.catalogue) {
                     Ok(()) => {
                         self.on_disk = self.core.lib.clone();
+                        self.on_disk_revision = self.catalogue.revision();
                         false
                     }
                     Err(error) => {
@@ -287,6 +303,7 @@ impl App {
                     store,
                     row_pending,
                     covers: self.account_covers(user_id),
+                    passes: Passes::default(),
                 });
                 return;
             }
@@ -300,11 +317,13 @@ impl App {
             }
         }
         self.on_disk = self.core.lib.clone();
+        self.on_disk_revision = self.catalogue.revision();
         self.library = Some(OpenLibrary {
             user_id: user_id.to_string(),
             store,
             row_pending: false,
             covers: self.account_covers(user_id),
+            passes: Passes::default(),
         });
     }
 
@@ -413,12 +432,18 @@ impl App {
         changed
     }
 
-    /// Clear every unavailable cover after a sync lands, so the next frame asks
+    /// Clear every unavailable cover after a page lands, so the next frame asks
     /// for it again. A cover never retries on a timer.
     fn rearm_covers(&self) {
         if let Some(open) = self.library.as_ref().and_then(|open| open.covers.as_ref()) {
             open.states.borrow_mut().retain(|_, state| !matches!(state, CoverState::Unavailable));
         }
+    }
+
+    /// Whether the library or the catalogue changed since the last write. The
+    /// one dirty test, so `flush_library` and `wake_if_dirty` cannot disagree.
+    fn owes_disk(&self) -> bool {
+        self.core.lib != self.on_disk || self.catalogue.revision() != self.on_disk_revision
     }
 
     /// Write the library when it differs from what is on disk. This runs at the
@@ -429,6 +454,7 @@ impl App {
     /// there was nothing to write. A caller that is about to discard the library
     /// must check this, or a failed write loses the only copy.
     fn flush_library(&mut self) -> bool {
+        let owes_disk = self.owes_disk();
         let Some(open) = self.library.as_mut() else {
             // Signed in with no open library means the database would not open, so
             // anything edited now can never be written. Reporting "nothing owed"
@@ -443,6 +469,7 @@ impl App {
                 Ok(()) => {
                     open.row_pending = false;
                     self.on_disk = self.core.lib.clone();
+                    self.on_disk_revision = self.catalogue.revision();
                     self.write_failed = false;
                     self.write_error = None;
                 }
@@ -454,7 +481,7 @@ impl App {
             }
             return true;
         }
-        if self.core.lib == self.on_disk {
+        if !owes_disk {
             // Nothing is owed, so no failure is outstanding. Without this a refused
             // sign-out's message would sit over a library that is fully written, and
             // the wake flag would stay set so the next edit never asked for a frame.
@@ -465,6 +492,7 @@ impl App {
         match open.store.write(&open.user_id, &self.core.lib, &self.catalogue) {
             Ok(()) => {
                 self.on_disk = self.core.lib.clone();
+                self.on_disk_revision = self.catalogue.revision();
                 self.write_failed = false;
                 // A write landed, so any refusal shown earlier is out of date.
                 self.write_error = None;
@@ -556,7 +584,6 @@ impl App {
         // The message belongs to the account that just closed. It must not follow
         // the next account onto its own Account screen.
         self.write_error = None;
-        self.last_sync = None;
         self.core.lib = Library::default();
         // A playlist screen for the old account names a playlist that no longer
         // exists, which the state invariant forbids. Drop those routes and keep
@@ -589,7 +616,6 @@ impl App {
         // A new session starts with no fetch history, so a message about the previous
         // one's failed fetch must not follow it onto the Account screen.
         self.profile_error = None;
-        self.last_sync = None;
         self.restore_library(&user_id);
         self.auth = Auth::SignedIn { token: token.clone() };
         self.fetch_profile(token);
@@ -599,41 +625,131 @@ impl App {
     /// expired or rejected token first. The result carries the (possibly
     /// renewed) token to persist and the session it belongs to.
     fn fetch_profile(&mut self, token: Token) {
-        let service = self.service.clone();
-        let config = self.oauth.clone();
-        let session = self.session;
+        let (service, config, session, refresh) = (self.service.clone(), self.oauth.clone(), self.session, self.refresh);
+        self.profile_renews = false;
         self.profile.request(token, move |t| {
             (session, with_fresh_token(&|t| refresh(&config, t), t, &|access| service.current_user(access)))
         });
     }
 
-    /// Start a sync for the open account. A no-op with no open library, with no
-    /// signed-in token, or with a sync already running. It also waits for a
-    /// pending profile fetch: both workers may refresh the token, and two
-    /// refreshes of one refresh token race each other.
-    pub fn sync(&mut self) {
-        if self.token_in_use() {
+    /// Refresh the session's token, then prove it with a profile fetch. A
+    /// rejected page or an expired token starts it. A no-op while a profile
+    /// fetch is pending, because two refreshes of one refresh token race.
+    fn renew_token(&mut self) {
+        if self.profile.is_pending() {
             return;
         }
-        let (Some(open), Auth::SignedIn { token }) = (&self.library, &self.auth) else {
+        let Auth::SignedIn { token } = &self.auth else {
             return;
         };
-        let ticket = Ticket { session: self.session, user_id: open.user_id.clone() };
-        let service = self.service.clone();
-        let config = self.oauth.clone();
-        self.sync.request(token.clone(), move |t| {
-            let user = ticket.user_id.clone();
-            let result =
-                with_fresh_token(&|t| refresh(&config, t), t, &|access| service.library(access, &user));
-            (ticket, result)
+        let (service, config, session, refresh) = (self.service.clone(), self.oauth.clone(), self.session, self.refresh);
+        self.profile_renews = true;
+        self.profile.request(token.clone(), move |t| {
+            (session, renew(&|t| refresh(&config, t), t, &|access| service.current_user(access)))
         });
     }
 
-    /// Whether a worker that may refresh the token is running. A new sync or a
-    /// cover batch waits for both, because two refreshes of one refresh token
-    /// race each other.
+    /// Read every mirrored list to its last page. A no-op with no open library.
+    /// The pages start in `pump`, once no profile fetch is pending.
+    pub fn sync(&mut self) {
+        if let Some(open) = self.library.as_mut() {
+            open.passes.read_to_end(&mut self.next_pass);
+        }
+        // The button is the user's retry after a renewal that could not reach
+        // Tidal, which `pump` does not repeat on its own.
+        if let Auth::SignedIn { token } = &self.auth
+            && auth::token_expired(token)
+        {
+            self.renew_token();
+        }
+    }
+
+    /// The view shows the first `rows` members of `list`. A no-op with no open
+    /// library, or with no pass for the list.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the virtual list is the first caller"))]
+    pub fn want(&mut self, list: RemoteList, rows: usize) {
+        if let Some(open) = self.library.as_mut() {
+            open.passes.want(&list, rows);
+        }
+    }
+
+    /// How far the open account's pass for `list` got. `Idle` with no library.
+    pub fn pass_status(&self, list: RemoteList) -> PassStatus {
+        self.library.as_ref().map_or(PassStatus::Idle, |open| open.passes.status(&list))
+    }
+
+    /// Start a pass for the list the top route shows. `Passes::enter` reads
+    /// only a change of list, so calling this every frame starts nothing new.
+    fn enter_route(&mut self) {
+        if !self.revalidate_on_entry {
+            return;
+        }
+        let list = RemoteList::of(self.core.stack.last());
+        if let Some(open) = self.library.as_mut() {
+            open.passes.enter(list, &mut self.next_pass);
+        }
+    }
+
+    /// Start the next page, if a pass wants one. Nothing starts while the
+    /// profile fetch may refresh the token. An expired token is renewed first,
+    /// unless the last profile fetch could not reach Tidal, so an offline
+    /// session does not retry on every frame. The page worker never refreshes.
+    fn pump(&mut self) {
+        if self.token_in_use() {
+            return;
+        }
+        let (Some(open), Auth::SignedIn { token }) = (self.library.as_mut(), &self.auth) else {
+            return;
+        };
+        if auth::token_expired(token) {
+            if self.profile_error.is_none() {
+                self.renew_token();
+            }
+            return;
+        }
+        let Some(request) = open.passes.next_request(&token.access_token) else {
+            return;
+        };
+        let ticket = Ticket { session: self.session, user_id: open.user_id.clone() };
+        let (service, access) = (self.service.clone(), token.access_token.clone());
+        self.pages.request((), move |_| {
+            let result = service.page(&access, &ticket.user_id, &request.of, request.after.as_ref());
+            (ticket, PageResult { pass: request.pass, result, token: access })
+        });
+    }
+
+    /// Land a finished page on its pass and act on what the pass says.
+    /// Returns true when a page for the open account landed.
+    fn drain_pages(&mut self) -> bool {
+        let Some((ticket, page)) = self.pages.take() else {
+            return false;
+        };
+        if !self.ticket_holds(&ticket) {
+            return false;
+        }
+        let Some(open) = self.library.as_mut() else {
+            return false;
+        };
+        match open.passes.land(page) {
+            Landed::Merge(merge) => {
+                let report = self.core.lib.merge(&mut self.catalogue, merge);
+                if report.dropped > 0 {
+                    eprintln!("opentidal: a page named {} item(s) the catalogue cannot hold", report.dropped);
+                }
+                self.rearm_covers();
+            }
+            Landed::Renew => self.renew_token(),
+            Landed::DeadGrant(error) => self.end_dead_session(error),
+            Landed::Kept => {}
+        }
+        true
+    }
+
+    /// Whether a worker that may refresh the token is running. A page or a
+    /// cover batch waits for it, because two refreshes of one refresh token
+    /// race each other. Only the profile fetch refreshes.
     fn token_in_use(&self) -> bool {
-        self.profile.is_pending() || self.sync.is_pending()
+        self.profile.is_pending()
     }
 
     /// Whether a worker result still belongs to the open library: the same
@@ -685,6 +801,7 @@ impl App {
             && session == self.session
         {
             changed = true;
+            let renewal = std::mem::take(&mut self.profile_renews);
             match result {
                 Ok((token, user)) => {
                     self.keep_token(token);
@@ -695,8 +812,9 @@ impl App {
                     self.profile_error = None;
                     // The live build syncs once the token is proven. The fake build
                     // syncs from the Account screen only, so a scene or a test that
-                    // fetches the profile never replaces its library by surprise.
-                    if self.live {
+                    // fetches the profile never replaces its library by surprise. A
+                    // renewal resumes the passes it was started for instead.
+                    if self.live && !renewal {
                         self.sync();
                     }
                 }
@@ -728,23 +846,9 @@ impl App {
                 }
             }
         }
-        if let Some((ticket, result)) = self.sync.take()
-            && self.ticket_holds(&ticket)
-        {
-            changed = true;
-            match result {
-                Ok((token, rows)) => {
-                    self.keep_token(token);
-                    self.last_sync = Some(Ok(self.core.lib.sync(&mut self.catalogue, rows)));
-                    self.rearm_covers();
-                }
-                Err(e @ ServiceError::InvalidGrant(_)) => self.end_dead_session(e),
-                Err(e) => {
-                    eprintln!("opentidal: the sync failed, nothing changed: {e:?}");
-                    self.last_sync = Some(Err(sync_error_text(&e)));
-                }
-            }
-        }
+        changed |= self.drain_pages();
+        self.enter_route();
+        self.pump();
         changed |= self.drain_covers();
         self.flush_library();
         changed
@@ -763,7 +867,7 @@ impl App {
         }
         // `drain` clears the flag when a write succeeds, so a failure alone stops
         // the wake. The next `drain` retries, because the library is still dirty.
-        if self.core.lib != self.on_disk
+        if self.owes_disk()
             && !self.write_failed
             && let Some(waker) = &self.waker
         {
@@ -799,26 +903,11 @@ impl App {
     }
 }
 
-/// The reason a sync failed, for the Account screen. Every message says that
-/// nothing changed, because a failed sync applies nothing.
-fn sync_error_text(error: &ServiceError) -> String {
-    let reason = match error {
-        ServiceError::Unauthorized | ServiceError::Auth(_) | ServiceError::InvalidGrant(_) => {
-            "Tidal would not accept this session. Sign out and sign in again."
-        }
-        ServiceError::Paging(_) => "Your Tidal library is too large to read in one sync.",
-        ServiceError::Decode(_) => "Tidal sent something this version cannot read.",
-        ServiceError::Http(_) => "Could not reach Tidal.",
-        ServiceError::RateLimited(_) => "Tidal is limiting requests.",
-    };
-    format!("{reason} Nothing changed.")
-}
-
 /// Run `call` with a fresh token, refreshing it first when it is expired or when
 /// the service rejects it. Returns the token actually used, so the caller can
 /// persist a renewed one. A refresh the endpoint rejects outright (for example
 /// `invalid_grant`) surfaces as [`ServiceError::InvalidGrant`], which the caller
-/// maps to clearing the stored token. The profile fetch and the sync both use it.
+/// maps to clearing the stored token. The profile fetch uses it.
 ///
 /// The refresh is a parameter. A test needs to count the refreshes and make them
 /// fail on demand, which the network call cannot do without a server. Production
@@ -855,6 +944,19 @@ fn with_fresh_token<T>(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Refresh first, then make the call with the fresh token. A rejected page
+/// forces this, because the token it carried was not expired by its clock. A
+/// fresh token the service rejects too is a dead grant, through `after_refresh`.
+fn renew<T>(
+    refresh: &dyn Fn(&Token) -> Result<Token, ServiceError>,
+    token: Token,
+    call: &dyn Fn(&str) -> Result<T, ServiceError>,
+) -> Result<(Token, T), ServiceError> {
+    let fresh = refresh(&token)?;
+    let answer = after_refresh(call(&fresh.access_token))?;
+    Ok((fresh, answer))
 }
 
 /// Read the answer to a request made with a freshly minted token. A token minted a
@@ -936,8 +1038,12 @@ impl Default for App {
             session: 0,
             auth_flow: Latest::default(),
             profile: Latest::default(),
-            sync: Latest::default(),
-            last_sync: None,
+            profile_renews: false,
+            refresh,
+            pages: Latest::default(),
+            next_pass: 0,
+            revalidate_on_entry: live,
+            on_disk_revision: 0,
             images: None,
             cover_fetch: Latest::default(),
             cover_root_override: None,
@@ -1227,6 +1333,7 @@ mod tests {
             tokens: Arc::new(auth::MemoryStore::default()),
             service: Arc::new(tidal::FakeService::default()),
             live: false,
+            revalidate_on_entry: false,
             ..App::default()
         };
         // A fresh store, so the tests start from no token whatever the config says.
@@ -1418,9 +1525,6 @@ mod tests {
         struct AlwaysRejects;
         impl MusicService for AlwaysRejects {
             fn current_user(&self, _token: &str) -> Result<User, ServiceError> {
-                Err(ServiceError::Unauthorized)
-            }
-            fn library(&self, _token: &str, _user: &str) -> Result<crate::library::LibraryRows, ServiceError> {
                 Err(ServiceError::Unauthorized)
             }
             fn page(
@@ -2026,35 +2130,129 @@ mod tests {
         }
     }
 
-    /// A Tidal library with one liked track and one private playlist, for the
-    /// account the name says.
-    fn tidal_rows(name: &str) -> LibraryRows {
+    type Pages = Vec<(RemoteList, Vec<Result<tidal::Page, ServiceError>>)>;
+
+    /// One page of seed ids with no catalogue rows. The fake sets `next`.
+    fn page(members: &[&str]) -> Result<tidal::Page, ServiceError> {
+        Ok(tidal::Page {
+            rows: crate::catalogue::CatalogueRows::default(),
+            members: members.iter().map(|m| m.to_string()).collect(),
+            next: None,
+        })
+    }
+
+    /// One liked track and one private playlist, for the account the name says.
+    fn tidal_pages(name: &str) -> Pages {
         use crate::catalogue::{CatalogueRows, PlaylistRow};
-        LibraryRows {
-            catalogue: CatalogueRows {
-                playlists: vec![PlaylistRow {
-                    id: format!("{name}-private"),
-                    name: format!("{name} secret"),
-                    description: String::new(),
-                    tracks: vec!["seed-track-0".into()],
-                    cover: String::new(),
-                }],
-                ..CatalogueRows::default()
-            },
-            liked: vec!["seed-track-0".into()],
-            tidal_playlists: vec![format!("{name}-private")],
-            ..LibraryRows::default()
+        let private = format!("{name}-private");
+        let rows = CatalogueRows {
+            playlists: vec![PlaylistRow {
+                id: private.clone(),
+                name: format!("{name} secret"),
+                description: String::new(),
+                tracks: vec!["seed-track-0".into()],
+                cover: String::new(),
+            }],
+            ..CatalogueRows::default()
+        };
+        vec![
+            (RemoteList::Liked, vec![page(&["seed-track-0"])]),
+            (RemoteList::Playlists, vec![Ok(tidal::Page { rows, members: vec![private], next: None })]),
+        ]
+    }
+
+    /// A fake service that records every page call's token, counts the profile
+    /// fetches, rejects the page tokens `rejects` names, and can hold each page
+    /// until a test releases it.
+    struct Recorded {
+        inner: tidal::FakeService,
+        tokens: std::sync::Mutex<Vec<String>>,
+        users: std::sync::atomic::AtomicUsize,
+        rejects: fn(&str) -> bool,
+        hold: Option<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl Recorded {
+        fn new(pages: Pages) -> Recorded {
+            Recorded {
+                inner: tidal::FakeService { pages: pages.into_iter().collect(), ..tidal::FakeService::default() },
+                tokens: std::sync::Mutex::new(Vec::new()),
+                users: std::sync::atomic::AtomicUsize::new(0),
+                rejects: |_| false,
+                hold: None,
+            }
+        }
+
+        /// Hold every page until the returned sender releases it.
+        fn held(pages: Pages) -> (Recorded, std::sync::mpsc::Sender<()>) {
+            let (release, wait) = std::sync::mpsc::channel();
+            (Recorded { hold: Some(std::sync::Mutex::new(wait)), ..Recorded::new(pages) }, release)
+        }
+
+        fn tokens(&self) -> Vec<String> {
+            self.tokens.lock().unwrap().clone()
+        }
+
+        fn users(&self) -> usize {
+            self.users.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
-    /// An app signed in to `user` on the file at `path`, whose fake service reads
-    /// `rows` on a sync.
-    fn signed_in(user: &str, path: &std::path::Path, rows: LibraryRows) -> App {
+    impl MusicService for Recorded {
+        fn current_user(&self, token: &str) -> Result<User, ServiceError> {
+            self.users.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.current_user(token)
+        }
+        fn page(
+            &self,
+            token: &str,
+            user: &str,
+            of: &RemoteList,
+            after: Option<&tidal::Cursor>,
+        ) -> Result<tidal::Page, ServiceError> {
+            if let Some(hold) = &self.hold {
+                let _ = hold.lock().unwrap().recv();
+            }
+            self.tokens.lock().unwrap().push(token.to_string());
+            if (self.rejects)(token) {
+                return Err(ServiceError::Unauthorized);
+            }
+            self.inner.page(token, user, of, after)
+        }
+        fn cover(&self, token: &str, cover: &crate::catalogue::CoverRequest) -> Result<Vec<u8>, ServiceError> {
+            self.inner.cover(token, cover)
+        }
+    }
+
+    /// An app signed in to `user` on the file at `path`, reading through `service`.
+    fn signed_in_with(user: &str, path: &std::path::Path, service: Arc<dyn MusicService>) -> App {
         let mut app = app_without_a_session();
-        app.service = Arc::new(tidal::FakeService { library: Ok(rows), ..tidal::FakeService::default() });
+        app.service = service;
         app.open_library(user, path);
         app.auth = Auth::SignedIn { token: fake_token() };
         app
+    }
+
+    /// An app signed in to `user` on the file at `path`, whose fake service
+    /// answers `pages`.
+    fn signed_in(user: &str, path: &std::path::Path, pages: Pages) -> App {
+        signed_in_with(user, path, Arc::new(Recorded::new(pages)))
+    }
+
+    const MIRRORED: [RemoteList; 4] = [RemoteList::Liked, RemoteList::Albums, RemoteList::Artists, RemoteList::Playlists];
+
+    /// No page is in flight and no mirrored list is still reading.
+    fn settled(app: &App) -> bool {
+        !app.pages.is_pending() && MIRRORED.iter().all(|list| app.pass_status(list.clone()) != PassStatus::Loading)
+    }
+
+    /// The library a fresh run would load for `user` from `path`.
+    fn on_disk(user: &str, path: &std::path::Path) -> Library {
+        Store::open(path).unwrap().load(user, &mut Catalogue::seed()).unwrap().unwrap().lib
+    }
+
+    fn tracks(ns: &[usize]) -> Vec<TrackId> {
+        ns.iter().map(|&n| track(n)).collect()
     }
 
     /// Account A's private playlist names never reach account B. The catalogue
@@ -2066,9 +2264,9 @@ mod tests {
         let dir = TempDir::new("cross-account-names");
         let path = dir.path();
 
-        let mut app = signed_in("account-a", &path, tidal_rows("A"));
+        let mut app = signed_in("account-a", &path, tidal_pages("A"));
         app.sync();
-        drain_until(&mut app, |a| a.last_sync.is_some());
+        drain_until(&mut app, settled);
         let private = app.catalogue.playlist_id("A-private").expect("the fixture did not sync");
         crate::state::open_detail(&mut app.core, &app.catalogue, Route::CataloguePlaylist(private.clone()));
         assert_eq!(app.core.stack.last(), Some(&Route::CataloguePlaylist(private.clone())));
@@ -2093,58 +2291,37 @@ mod tests {
         assert_eq!(home.len(), 3, "the seed playlists are gone from Home");
     }
 
-    /// A sync started for one account and landing after another opened in the
+    /// A page read for one account and landing after another opened in the
     /// same session is dropped. A dead refresh token closes the library without
     /// a new session, so the session alone cannot tell the two apart.
     #[test]
-    fn a_sync_for_another_account_is_dropped() {
-        let dir = TempDir::new("sync-other-account");
+    fn a_page_for_another_account_is_dropped() {
+        let dir = TempDir::new("page-other-account");
         let path = dir.path();
-        let mut app = signed_in("account-a", &path, tidal_rows("A"));
+        let (service, release) = Recorded::held(tidal_pages("A"));
+        let mut app = signed_in_with("account-a", &path, Arc::new(service));
         let session = app.session;
         app.sync();
+        app.drain();
+        assert!(app.pages.is_pending(), "the fixture started no page");
         app.open_library("account-b", &path);
         assert_eq!(app.session, session, "the fixture bumped the session, so it tests the wrong guard");
-        drain_until(&mut app, |a| !a.sync.is_pending());
+        release.send(()).unwrap();
+        drain_until(&mut app, |a| !a.pages.is_pending());
         app.drain();
 
-        assert!(app.core.lib.liked.is_empty(), "account A's sync landed in account B's library");
-        assert!(app.core.lib.tidal_playlists.is_empty());
-        assert_eq!(app.last_sync, None, "account B shows account A's sync result");
+        assert!(app.core.lib.liked.is_empty(), "account A's page landed in account B's library");
+        assert!(on_disk("account-b", &path).liked.is_empty(), "account A's page reached account B's rows");
     }
 
-    /// A sync does not start while the profile fetch is pending. Both may refresh
-    /// the token, and two refreshes of one refresh token race each other.
+    /// No page starts while the profile fetch is pending. That fetch may
+    /// refresh the token, and two refreshes of one refresh token race.
     #[test]
-    fn a_sync_waits_for_the_profile_fetch() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        struct Counting(AtomicUsize);
-        impl MusicService for Counting {
-            fn current_user(&self, _token: &str) -> Result<User, ServiceError> {
-                Err(ServiceError::Http("unused".to_string()))
-            }
-            fn library(&self, _token: &str, _user: &str) -> Result<LibraryRows, ServiceError> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Ok(tidal_rows("A"))
-            }
-            fn page(
-                &self,
-                _token: &str,
-                _user: &str,
-                _of: &crate::library::RemoteList,
-                _after: Option<&tidal::Cursor>,
-            ) -> Result<tidal::Page, ServiceError> {
-                Err(ServiceError::Http("unused".to_string()))
-            }
-            fn cover(&self, _token: &str, _cover: &crate::catalogue::CoverRequest) -> Result<Vec<u8>, ServiceError> {
-                Err(ServiceError::Http("unused".to_string()))
-            }
-        }
-        let dir = TempDir::new("sync-waits");
+    fn a_page_waits_for_the_profile_fetch() {
+        let dir = TempDir::new("page-waits");
         let path = dir.path();
-        let counting = Arc::new(Counting(AtomicUsize::new(0)));
-        let mut app = signed_in("account-a", &path, LibraryRows::default());
-        app.service = counting.clone();
+        let service = Arc::new(Recorded::new(Vec::new()));
+        let mut app = signed_in_with("account-a", &path, service.clone());
 
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let session = app.session;
@@ -2153,46 +2330,232 @@ mod tests {
             (session, Err(ServiceError::Http("offline".to_string())))
         });
         app.sync();
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(!app.sync.is_pending(), "a sync started while the profile fetch was pending");
-        assert_eq!(counting.0.load(Ordering::SeqCst), 0, "the library was read while the profile fetch was pending");
+        for _ in 0..50 {
+            app.drain();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!app.pages.is_pending(), "a page started while the profile fetch was pending");
+        assert!(service.tokens().is_empty(), "a page was read while the profile fetch was pending");
 
         release.send(()).unwrap();
-        drain_until(&mut app, |a| !a.profile.is_pending());
-        app.sync();
-        drain_until(&mut app, |a| a.last_sync.is_some());
-        assert_eq!(counting.0.load(Ordering::SeqCst), 1, "the sync did not start once the profile landed");
+        drain_until(&mut app, |a| !a.profile.is_pending() && settled(a));
+        assert_eq!(service.tokens().len(), 4, "the passes did not read once the profile landed");
     }
 
-    /// The library a fresh run would load for `user` from `path`.
-    fn on_disk(user: &str, path: &std::path::Path) -> Library {
-        Store::open(path).unwrap().load(user, &mut Catalogue::seed()).unwrap().unwrap().lib
-    }
-
-    /// A sync that fails changes nothing, in memory or on disk, and says so.
+    /// A later page that fails keeps every page before it, in memory and on
+    /// disk. A pass applies each page as it lands, so a halt loses nothing read.
     #[test]
-    fn a_failed_sync_leaves_the_library_and_the_file_untouched() {
-        let dir = TempDir::new("sync-fails");
+    fn a_failed_page_keeps_the_earlier_pages() {
+        let dir = TempDir::new("page-fails-late");
         let path = dir.path();
-        let mut app = signed_in("account-a", &path, LibraryRows::default());
-        app.service = Arc::new(tidal::FakeService {
-            library: Err(ServiceError::RateLimited("429 Too Many Requests".to_string())),
-            ..tidal::FakeService::default()
-        });
-        app.core.lib.toggle_like(track(4));
-        app.core.lib.tidal_playlists.insert(app.catalogue.playlist_id("seed-playlist-1").unwrap());
-        app.flush_library();
-        let before = app.core.lib.clone();
+        let limited = Err(ServiceError::RateLimited("429 Too Many Requests".to_string()));
+        let pages = vec![(RemoteList::Liked, vec![page(&["seed-track-1", "seed-track-2"]), page(&["seed-track-3"]), limited])];
+        let mut app = signed_in("account-a", &path, pages);
 
         app.sync();
-        drain_until(&mut app, |a| a.last_sync.is_some());
+        drain_until(&mut app, settled);
 
-        assert_eq!(app.core.lib, before, "a failed sync changed the library in memory");
-        assert_eq!(on_disk("account-a", &path), before, "a failed sync changed the library on disk");
-        let Some(Err(message)) = &app.last_sync else {
-            panic!("a failed sync reported {:?}", app.last_sync);
-        };
-        assert_eq!(message, "Tidal is limiting requests. Nothing changed.");
+        assert!(matches!(app.pass_status(RemoteList::Liked), PassStatus::Stalled(_)), "the fixture did not halt");
+        assert_eq!(app.core.lib.liked.to_vec(), tracks(&[1, 2, 3]), "the pages before the failure were lost");
+        assert_eq!(on_disk("account-a", &path).liked.to_vec(), tracks(&[1, 2, 3]), "the earlier pages are not on disk");
+    }
+
+    /// A pass that halts removes nothing the cache holds, whether it halts on
+    /// its first page or a later one. Only the last page may remove a row.
+    #[test]
+    fn a_halted_pass_removes_nothing() {
+        let dir = TempDir::new("page-halts");
+        let path = dir.path();
+        let limited = || Err(ServiceError::RateLimited("429 Too Many Requests".to_string()));
+        let pages = vec![
+            (RemoteList::Liked, vec![page(&["seed-track-1"]), limited()]),
+            (RemoteList::Albums, vec![limited()]),
+        ];
+        let mut app = signed_in("account-a", &path, pages);
+        app.core.lib.toggle_like(track(5));
+        app.core.lib.toggle_like(track(4));
+        let album = app.catalogue.album_id("seed-album-1").unwrap();
+        app.core.lib.toggle_save_album(album.clone());
+        app.flush_library();
+
+        app.sync();
+        drain_until(&mut app, settled);
+
+        assert_eq!(app.core.lib.liked.to_vec(), tracks(&[1, 4, 5]), "a halted pass removed a cached like");
+        assert_eq!(app.core.lib.saved_albums.to_vec(), [album], "a pass that failed on page one removed a cached album");
+        assert_eq!(on_disk("account-a", &path), app.core.lib, "the disk disagrees with the library");
+    }
+
+    /// A pass removes a cached row Tidal no longer lists only when its last
+    /// page lands. A first page alone keeps the row, because it may sit on a
+    /// later page.
+    #[test]
+    fn only_a_complete_pass_removes_a_row() {
+        let dir = TempDir::new("page-complete");
+        let path = dir.path();
+        let pages = vec![(RemoteList::Liked, vec![page(&["seed-track-1"]), page(&["seed-track-4"])])];
+        let mut app = signed_in("account-a", &path, pages);
+        app.revalidate_on_entry = true;
+        app.core.lib.toggle_like(track(5));
+        app.core.lib.toggle_like(track(4));
+        app.flush_library();
+
+        crate::state::open_section(&mut app.core, crate::state::Route::LikedSongs);
+        drain_until(&mut app, |a| settled(a) && a.core.lib.is_liked(&track(1)));
+        assert_eq!(app.core.lib.liked.to_vec(), tracks(&[1, 4, 5]), "a first page removed a row");
+
+        app.sync();
+        drain_until(&mut app, |a| settled(a) && a.pass_status(RemoteList::Liked) == PassStatus::Complete);
+        assert_eq!(app.core.lib.liked.to_vec(), tracks(&[1, 4]), "a complete pass kept a row Tidal does not list");
+        assert_eq!(on_disk("account-a", &path).liked.to_vec(), tracks(&[1, 4]));
+    }
+
+    /// The same pages read twice leave the library, the catalogue and the
+    /// file as the first read left them.
+    #[test]
+    fn a_page_applied_twice_changes_nothing() {
+        let dir = TempDir::new("page-twice");
+        let path = dir.path();
+        let mut pages = tidal_pages("A");
+        pages[0].1 = vec![page(&["seed-track-1", "seed-track-2"]), page(&["seed-track-3"])];
+        let mut app = signed_in("account-a", &path, pages);
+        app.core.lib.toggle_like(track(6));
+
+        app.sync();
+        drain_until(&mut app, settled);
+        let (once, revision) = (app.core.lib.clone(), app.catalogue.revision());
+        assert_eq!(once.liked.to_vec(), tracks(&[1, 2, 3]), "the fixture did not land");
+
+        app.sync();
+        drain_until(&mut app, |a| settled(a) && MIRRORED.iter().all(|l| a.pass_status(l.clone()) == PassStatus::Complete));
+        assert_eq!(app.core.lib, once, "reading the same pages again changed the library");
+        assert_eq!(app.catalogue.revision(), revision, "reading the same pages again changed the catalogue");
+        assert_eq!(on_disk("account-a", &path), once);
+    }
+
+    /// A page Tidal rejects forces one renewal: one refresh, one profile fetch,
+    /// and the pass resumes with the fresh token. No page reads with the
+    /// rejected token again.
+    #[test]
+    fn an_unauthorized_page_forces_one_refresh() {
+        let dir = TempDir::new("page-renews");
+        let path = dir.path();
+        let service = Arc::new(Recorded { rejects: |token| token == "fake-access", ..Recorded::new(tidal_pages("A")) });
+        let mut app = signed_in_with("account-a", &path, service.clone());
+        app.refresh = |_, token| Ok(Token { access_token: "fresh".into(), refresh_token: token.refresh_token.clone(), expires_in: 3600 });
+
+        app.sync();
+        drain_until(&mut app, |a| !a.profile.is_pending() && settled(a) && a.core.lib.is_liked(&track(0)));
+
+        assert_eq!(service.users(), 1, "the rejected page did not renew exactly once");
+        assert_eq!(service.tokens(), ["fake-access", "fresh", "fresh", "fresh", "fresh"]);
+        assert_eq!(app.tokens.load().map(|t| t.access_token), Some("fresh".to_string()), "the fresh token was not kept");
+        assert!(matches!(app.auth, Auth::SignedIn { .. }));
+    }
+
+    /// A renewed token that Tidal rejects too ends the session, the same rule
+    /// the profile fetch keeps.
+    #[test]
+    fn a_renewed_token_rejected_again_ends_the_session() {
+        let dir = TempDir::new("page-dead");
+        let path = dir.path();
+        let service = Arc::new(Recorded { rejects: |_| true, ..Recorded::new(tidal_pages("A")) });
+        let mut app = signed_in_with("account-a", &path, service.clone());
+        app.refresh = |_, token| Ok(Token { access_token: "fresh".into(), refresh_token: token.refresh_token.clone(), expires_in: 3600 });
+        app.tokens.save(&fake_token());
+
+        app.sync();
+        drain_until(&mut app, |a| a.library.is_none());
+
+        assert_eq!(service.tokens(), ["fake-access", "fresh"], "the pass did not resume once, with the fresh token");
+        assert!(app.library.is_none(), "a rejected fresh token left the library writable");
+        assert!(matches!(app.auth, Auth::Failed { .. }));
+        assert_eq!(app.tokens.load(), None, "the dead token stayed stored");
+    }
+
+    /// A page that changes only the catalogue, such as a Tidal playlist's
+    /// tracks, still reaches disk. The library is unchanged, so only the
+    /// catalogue revision says a write is owed.
+    #[test]
+    fn a_catalogue_only_change_reaches_disk() {
+        use crate::catalogue::{CatalogueRows, PlaylistRow};
+        let dir = TempDir::new("page-catalogue");
+        let path = dir.path();
+        let mut app = signed_in("account-a", &path, Vec::new());
+        app.catalogue.absorb(CatalogueRows {
+            playlists: vec![PlaylistRow {
+                id: "x-playlist".into(),
+                name: "Evening".into(),
+                description: String::new(),
+                tracks: vec!["seed-track-0".into()],
+                cover: String::new(),
+            }],
+            ..CatalogueRows::default()
+        });
+        let id = app.catalogue.playlist_id("x-playlist").unwrap();
+        app.core.lib.tidal_playlists.insert(id.clone());
+        app.flush_library();
+        let list = RemoteList::Playlist(id.clone());
+        app.service = Arc::new(Recorded::new(vec![(list.clone(), vec![page(&["seed-track-1", "seed-track-2"])])]));
+        app.revalidate_on_entry = true;
+
+        crate::state::open_detail(&mut app.core, &app.catalogue, crate::state::Route::CataloguePlaylist(id.clone()));
+        drain_until(&mut app, |a| !a.pages.is_pending() && a.pass_status(list.clone()) == PassStatus::Complete);
+        assert_eq!(app.core.lib, app.on_disk, "the fixture changed the library, so it tests the wrong dirty check");
+
+        let mut next_run = app_without_a_session();
+        next_run.open_library("account-a", &path);
+        assert_eq!(next_run.catalogue.playlist(&id).unwrap().tracks.to_vec(), tracks(&[1, 2]), "the new tracks are not on disk");
+    }
+
+    /// Entering a list's route reads its first page only. A view that shows
+    /// more rows than the pass read asks for the next page.
+    #[test]
+    fn a_larger_want_reads_the_next_page() {
+        let dir = TempDir::new("page-want");
+        let path = dir.path();
+        let pages = vec![(RemoteList::Liked, vec![page(&["seed-track-1"]), page(&["seed-track-2"])])];
+        let service = Arc::new(Recorded::new(pages));
+        let mut app = signed_in_with("account-a", &path, service.clone());
+        app.revalidate_on_entry = true;
+
+        crate::state::open_section(&mut app.core, crate::state::Route::LikedSongs);
+        drain_until(&mut app, |a| settled(a) && a.core.lib.is_liked(&track(1)));
+        for _ in 0..20 {
+            app.drain();
+        }
+        assert!(!app.pages.is_pending(), "entering the route asked for a second page");
+        assert_eq!(service.tokens().len(), 1, "entering the route read past its first page");
+
+        app.want(RemoteList::Liked, 2);
+        drain_until(&mut app, |a| settled(a) && a.pass_status(RemoteList::Liked) == PassStatus::Complete);
+        assert_eq!(app.core.lib.liked.to_vec(), tracks(&[1, 2]), "a larger want did not read the next page");
+    }
+
+    /// Entering a list's route starts one pass. Staying on it, or entering it
+    /// again while it shows, starts none.
+    #[test]
+    fn entering_a_route_starts_one_pass_and_reentering_does_not() {
+        use crate::state::Route;
+        let dir = TempDir::new("page-enter");
+        let path = dir.path();
+        let service = Arc::new(Recorded::new(Vec::new()));
+        let mut app = signed_in_with("account-a", &path, service.clone());
+        app.revalidate_on_entry = true;
+
+        crate::state::open_section(&mut app.core, Route::LikedSongs);
+        drain_until(&mut app, |a| settled(a) && a.pass_status(RemoteList::Liked) == PassStatus::Complete);
+        crate::state::open_section(&mut app.core, Route::LikedSongs);
+        for _ in 0..20 {
+            app.drain();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!app.pages.is_pending(), "entering the same route again asked for a page");
+        assert_eq!(service.tokens().len(), 1, "entering the same route again read it again");
+
+        crate::state::open_section(&mut app.core, Route::Albums);
+        drain_until(&mut app, |a| settled(a) && a.pass_status(RemoteList::Albums) == PassStatus::Complete);
+        assert_eq!(service.tokens().len(), 2, "entering another list's route did not read it once");
     }
 
     /// A sync that lands is on disk after the next frame, with the playlist name
@@ -2201,10 +2564,9 @@ mod tests {
     fn a_sync_lands_on_disk() {
         let dir = TempDir::new("sync-lands");
         let path = dir.path();
-        let mut app = signed_in("account-a", &path, tidal_rows("A"));
+        let mut app = signed_in("account-a", &path, tidal_pages("A"));
         app.sync();
-        drain_until(&mut app, |a| a.last_sync.is_some());
-        assert!(matches!(app.last_sync, Some(Ok(report)) if report.liked == 1 && report.tidal_playlists == 1));
+        drain_until(&mut app, settled);
 
         let mut next_run = app_without_a_session();
         next_run.open_library("account-a", &path);
@@ -2219,81 +2581,88 @@ mod tests {
         assert_eq!(names, ["A secret"], "the synced playlist is not on disk");
     }
 
-    /// A sync that lands after a sign-out and a new sign-in to the same account
+    /// A page that lands after a sign-out and a new sign-in to the same account
     /// belongs to the old session and is dropped.
     #[test]
     fn a_sync_for_an_earlier_session_is_dropped() {
         let dir = TempDir::new("sync-earlier-session");
         let path = dir.path();
-        let mut app = signed_in("account-a", &path, tidal_rows("A"));
+        let (service, release) = Recorded::held(tidal_pages("A"));
+        let mut app = signed_in_with("account-a", &path, Arc::new(service));
         app.sync();
+        app.drain();
+        assert!(app.pages.is_pending(), "the fixture started no page");
         app.sign_out();
         app.open_library("account-a", &path);
         app.auth = Auth::SignedIn { token: fake_token() };
-        drain_until(&mut app, |a| !a.sync.is_pending());
+        release.send(()).unwrap();
+        drain_until(&mut app, |a| !a.pages.is_pending());
         app.drain();
 
-        assert!(app.core.lib.liked.is_empty(), "a sync from the earlier session landed");
-        assert_eq!(app.last_sync, None);
+        assert!(app.core.lib.liked.is_empty(), "a page from the earlier session landed");
     }
 
-    /// A sync that lands after a dead refresh token closed the library is
+    /// A page that lands after a dead refresh token closed the library is
     /// dropped, so it cannot fill a library that has nowhere to be written.
     #[test]
     fn a_sync_for_a_closed_library_is_dropped() {
         let dir = TempDir::new("sync-closed");
         let path = dir.path();
-        let mut app = signed_in("account-a", &path, tidal_rows("A"));
+        let (service, release) = Recorded::held(tidal_pages("A"));
+        let mut app = signed_in_with("account-a", &path, Arc::new(service));
         app.sync();
+        app.drain();
+        assert!(app.pages.is_pending(), "the fixture started no page");
         app.end_dead_session(ServiceError::InvalidGrant("revoked".to_string()));
-        drain_until(&mut app, |a| !a.sync.is_pending());
+        release.send(()).unwrap();
+        drain_until(&mut app, |a| !a.pages.is_pending());
         app.drain();
 
         assert!(app.library.is_none());
-        assert_eq!(app.core.lib, Library::default(), "a sync filled a closed library");
-        assert_eq!(app.last_sync, None);
+        assert_eq!(app.core.lib, Library::default(), "a page filled a closed library");
     }
 
-    /// An edit made while a sync runs survives it. The sync replaces only the
-    /// mirrored memberships, never the whole library.
+    /// An edit made while a page is in flight survives it. A page merges only
+    /// the one list it names, never the whole library.
     ///
     /// The first version drained while it waited, so the edit was written before
     /// the result landed, and a sync that replaced the library with the disk copy
-    /// still passed. The edit now stays unwritten until the result is applied.
+    /// still passed. The edit now stays unwritten until the page is applied.
     #[test]
     fn an_edit_during_a_sync_survives_it() {
         let dir = TempDir::new("sync-edit");
         let path = dir.path();
-        let mut app = signed_in("account-a", &path, tidal_rows("A"));
+        let (service, release) = Recorded::held(tidal_pages("A"));
+        let mut app = signed_in_with("account-a", &path, Arc::new(service));
         app.sync();
+        app.drain();
+        assert!(app.pages.is_pending(), "the fixture started no page");
+        let mine = app.core.lib.create_playlist("Made while syncing".to_string()).unwrap();
+        app.core.lib.toggle_download(Catalogue::seed().album_id("seed-album-3").unwrap());
+        release.send(()).unwrap();
         for _ in 0..1_000 {
-            if !app.sync.is_pending() {
+            if !app.pages.is_pending() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let mine = app.core.lib.create_playlist("Made while syncing".to_string()).unwrap();
-        app.core.lib.toggle_download(Catalogue::seed().album_id("seed-album-3").unwrap());
-        assert_ne!(on_disk("account-a", &path), app.core.lib, "the edit was written before the sync landed");
+        assert_ne!(on_disk("account-a", &path), app.core.lib, "the edit was written before the page landed");
         app.drain();
 
         assert_eq!(app.core.lib.playlist(mine).map(|p| p.name.as_str()), Some("Made while syncing"));
-        assert_eq!(app.core.lib.downloaded.len(), 1, "the sync dropped a download made while it ran");
-        assert!(app.core.lib.is_liked(&track(0)), "the sync did not land");
+        assert_eq!(app.core.lib.downloaded.len(), 1, "the page dropped a download made while it ran");
+        assert!(app.core.lib.is_liked(&track(0)), "the page did not land");
         assert_eq!(on_disk("account-a", &path), app.core.lib);
     }
 
-    /// A dead refresh token found by the sync ends the session the same way the
+    /// A dead refresh token found by a page ends the session the same way the
     /// profile fetch does: no library, no token.
     #[test]
     fn a_dead_refresh_token_during_sync_closes_the_library() {
         let dir = TempDir::new("sync-dead-token");
         let path = dir.path();
-        let mut app = signed_in("account-a", &path, LibraryRows::default());
-        app.service = Arc::new(tidal::FakeService {
-            library: Err(ServiceError::InvalidGrant("refresh token revoked".to_string())),
-            ..tidal::FakeService::default()
-        });
+        let dead = Err(ServiceError::InvalidGrant("refresh token revoked".to_string()));
+        let mut app = signed_in("account-a", &path, vec![(RemoteList::Liked, vec![dead])]);
         app.tokens.save(&fake_token());
         app.core.lib.toggle_like(track(1));
 
@@ -2315,14 +2684,14 @@ mod tests {
         for live in [false, true] {
             let dir = TempDir::new(if live { "trigger-live" } else { "trigger-fake" });
             let path = dir.path();
-            let mut app = signed_in("account-a", &path, tidal_rows("A"));
+            let mut app = signed_in("account-a", &path, tidal_pages("A"));
             app.live = live;
             let session = app.session;
             let user = User { id: crate::tidal::UserId("account-a".to_string()), name: "Ada".to_string() };
             app.profile.request((), move |_| (session, Ok((fake_token(), user))));
-            drain_until(&mut app, |a| !a.profile.is_pending() && !a.sync.is_pending() && a.core.lib.name == "Ada");
+            drain_until(&mut app, |a| !a.profile.is_pending() && a.core.lib.name == "Ada");
             if live {
-                drain_until(&mut app, |a| a.last_sync.is_some());
+                drain_until(&mut app, |a| settled(a) && a.core.lib.is_liked(&track(0)));
             } else {
                 // Long enough for a sync the fake build must not start to land.
                 for _ in 0..50 {
@@ -2332,7 +2701,7 @@ mod tests {
             }
 
             assert_eq!(app.core.lib.is_liked(&track(0)), live, "live mode is {live}, and the sync disagreed");
-            assert_eq!(app.last_sync.is_some(), live);
+            assert_eq!(app.pass_status(RemoteList::Liked) == PassStatus::Complete, live);
         }
     }
 
@@ -2398,7 +2767,7 @@ mod tests {
     }
 
     /// A rate-limited cover goes back to wanted, so the next batch asks for it
-    /// again. An unavailable cover would wait for the next sync instead.
+    /// again. An unavailable cover would wait for the next page instead.
     #[test]
     fn a_rate_limited_cover_is_asked_for_again() {
         let dir = TempDir::new("covers-limited");
@@ -2422,9 +2791,6 @@ mod tests {
     impl MusicService for Gated {
         fn current_user(&self, token: &str) -> Result<User, ServiceError> {
             self.inner.current_user(token)
-        }
-        fn library(&self, token: &str, user: &str) -> Result<LibraryRows, ServiceError> {
-            self.inner.library(token, user)
         }
         fn page(
             &self,
@@ -2524,8 +2890,8 @@ mod tests {
         assert_eq!(cover_calls(&service), 0, "a restart fetched a cover it had on disk");
     }
 
-    /// A cover batch does not start while the profile fetch or a sync is
-    /// pending, the same guard `App::sync` has.
+    /// A cover batch does not start while the profile fetch is pending, the
+    /// same guard a page has.
     #[test]
     fn a_cover_batch_waits_for_the_profile_fetch() {
         let dir = TempDir::new("covers-wait-profile");

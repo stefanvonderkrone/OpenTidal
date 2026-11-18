@@ -289,7 +289,6 @@ impl Catalogue {
     /// Rises each time `absorb` or `merge_tracks` changes an entry, and only
     /// then, so a writer can tell whether the catalogue changed since it last
     /// looked.
-    #[cfg_attr(not(test), expect(dead_code, reason = "no writer compares revisions yet"))]
     pub fn revision(&self) -> u64 {
         self.revision
     }

@@ -7,7 +7,8 @@ use rune::tok::{self, radius, space, type_};
 use rune::{Color, El, ScrollSpec, TextEdit, col, el, oklch, row, text, text_input};
 use crate::app::{App, Cover, Covers};
 use crate::catalogue::{Album, AlbumId, Artist, ArtistId, Catalogue, CataloguePlaylist, CataloguePlaylistId, Track, TrackId};
-use crate::library::{self, PlaylistId};
+use crate::library::{self, PlaylistId, RemoteList};
+use crate::pager::PassStatus;
 use crate::state::{self, PopularTab, Route, SettingsPage, State};
 
 /// A colourful vertical gradient, the placeholder for an item with no cover.
@@ -758,28 +759,30 @@ fn account_page(app: &App, t: tok::Theme) -> El {
     }
 }
 
-/// What the last sync did, or that one is running. A failure says that nothing
-/// changed, because a failed sync applies nothing.
+/// What the passes of the four mirrored lists say. A running read wins, then
+/// a stalled one, which kept every row it had. Otherwise the counts the library
+/// holds, called synced only once every list was read to its end.
 fn sync_status(app: &App) -> String {
-    if app.sync.is_pending() {
+    let mirrored = [RemoteList::Liked, RemoteList::Albums, RemoteList::Artists, RemoteList::Playlists];
+    let status: Vec<PassStatus> = mirrored.into_iter().map(|list| app.pass_status(list)).collect();
+    if status.contains(&PassStatus::Loading) {
         return "Syncing with Tidal…".to_string();
     }
-    match &app.last_sync {
-        None => "Not synced in this session.".to_string(),
-        Some(Err(message)) => message.clone(),
-        Some(Ok(r)) => {
-            let mut line = format!(
-                "Synced {}, {}, {} and {}.",
-                count(r.liked, "track"),
-                count(r.saved_albums, "album"),
-                count(r.followed, "artist"),
-                count(r.tidal_playlists, "playlist")
-            );
-            if r.dropped > 0 {
-                line.push_str(&format!(" {} could not be read.", count(r.dropped, "item")));
-            }
-            line
-        }
+    if status.iter().any(|s| matches!(s, PassStatus::Stalled(_))) {
+        return "Showing what is saved on this Mac.".to_string();
+    }
+    let lib = &app.core.lib;
+    let counts = format!(
+        "{}, {}, {} and {}",
+        count(lib.liked.len(), "track"),
+        count(lib.saved_albums.len(), "album"),
+        count(lib.followed.len(), "artist"),
+        count(lib.tidal_playlists.len(), "playlist")
+    );
+    if status.iter().all(|s| *s == PassStatus::Complete) {
+        format!("Synced {counts}.")
+    } else {
+        format!("This Mac holds {counts}.")
     }
 }
 

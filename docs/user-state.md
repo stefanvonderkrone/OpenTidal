@@ -210,8 +210,10 @@ next start, which is the next thing that tries.
   always signs out, because it has nowhere to write and nothing to lose.
 - Refresh: token store only. No library write. This is the gain over a rotating key.
 - Profile fetch: update `user.name`.
-- Sync: replace the four mirrored memberships in memory. The next frame writes
-  the library through `Store::write`, so a sync costs one write, like any edit.
+- Page: merge one page into one mirrored list in memory. The next frame writes
+  the library through `Store::write`, so each page costs one write, like any edit.
+  A page that changes only the catalogue, such as a Tidal playlist's tracks, is
+  written too, because the catalogue revision moved.
 - Library change: one comparison per frame, not a write per operation. The app
   keeps the library as last written, and `drain` writes when the two differ. This
   replaces the earlier "write through in the same operation", which would have
@@ -261,31 +263,36 @@ answer.
 
 ## Sync
 
-A sync reads the whole Tidal library of the signed-in account, then replaces
-the mirrored memberships in one step. The mirrored memberships are likes,
-saves, follows, and Tidal playlists. A sync never touches downloads, history,
-user playlists, collections, or the name.
+A pass reads one remote list from its first page. Each page lands in the
+library as it arrives, so cached rows show at once and fill in page by page.
+The mirrored lists are likes, saves, follows, and Tidal playlists. A pass never
+touches downloads, history, user playlists, collections, or the name.
 
-A sync starts from the Sync with Tidal button on the Account screen. In live
-mode it also starts once the profile fetch lands, with the token that fetch
-proved. It never starts while the profile fetch is still pending, so two
-workers can never refresh one refresh token at the same time. Start reads the
-disk only, so a launch stays free of network work until the profile fetch.
+A sync is a complete pass of each of the four mirrored lists. It starts from
+the Sync with Tidal button on the Account screen. In live mode it also starts
+once the profile fetch lands. In the live build, opening a list's route starts a
+pass that reads the first page only. Reopening the route that shows does not
+start another. A view that needs more rows than a pass read asks for the next
+page.
 
-A sync obeys four rules.
+A pass obeys five rules.
 
-1. Fetch everything, then apply once. The read is paged. The fetch returns the
-   rows only after the last page of every list arrives. A failed page, a
-   repeated cursor, or the page cap fails the whole fetch, and nothing changes
-   in memory or on disk. There is no page-by-page merge and no `complete` flag:
-   rows that exist are complete.
-2. Replace, never merge. A complete read is the truth for the four mirrored
-   memberships, so a member Tidal no longer lists is removed.
-3. Write once. The apply changes the library in memory, and the next frame
-   writes it through `Store::write` in one transaction, like any other edit.
-4. Apply only to the account that asked. The result carries the session and the
-   user id it started under. A result for an earlier session, a closed library,
-   or another account is dropped.
+1. Apply each page as it lands. An earlier page adds and reorders members, but
+   it never removes one, because a member it omits may sit on a later page. A
+   page that fails, a repeated cursor, or the cap of 400 pages halts the pass,
+   and every row read before the halt stays in memory and on disk.
+2. Only the last page removes. A complete pass is the truth for its list, so a
+   member Tidal no longer lists is removed when the last page lands, and not
+   before. A halted pass removes nothing.
+3. A page applied twice changes nothing. Reading the same pages again leaves
+   the library, the catalogue, and the file as they were.
+4. Apply only to the account that asked. A page carries the session and the
+   user id it started under, and the passes belong to the open library. A page
+   for an earlier session, a closed library, or another account is dropped.
+5. Read one page at a time, and never while the profile fetch is pending. The
+   page worker never refreshes the token. A page Tidal rejects starts one
+   renewal through the profile fetch, and the pass resumes with the fresh
+   token. A fresh token Tidal rejects too ends the session.
 
 A Tidal playlist is a catalogue playlist, not a user playlist. Its name and
 tracks live in the catalogue, and the library holds only its id in
@@ -293,13 +300,12 @@ tracks live in the catalogue, and the library holds only its id in
 edit cannot reach a Tidal playlist. User playlists keep their slots and stay
 editable. Collections stay flat and local, and they hold user playlists only.
 
-The `download` and `history` tables are local. The sync never writes them, so a
-wrong sync cannot lose real work. A wrong removal from a mirrored membership
+The `download` and `history` tables are local. A pass never writes them, so a
+wrong pass cannot lose real work. A wrong removal from a mirrored membership
 costs one sync, because the server returns the member again.
 
-The cost of a complete fetch: a library larger than the page cap never syncs.
-The cap is 400 pages for the whole fetch. The Account screen says why the sync
-failed, and that nothing changed.
+The cost of the page cap: a list longer than 400 pages is never read to its
+end, so it keeps every row it read and removes none.
 
 The offline window is the other cost. A broken leaf stays missing until the
 first sync after the network returns. The local copy is as good as the last
@@ -423,18 +429,18 @@ names the test that covers the code path, and no hand check has happened.
 | Start needs no network | Launch with the network off, name and playlist visible | pending: no test. Start reads the disk first, then fetches the profile |
 | A library screen needs no network | Open Liked Songs offline, assert the disk rows paint | pending: no test |
 | A refresh writes no rows | Count rows before and after a refresh, `user_version` unchanged | pending: no test. A refresh writes the token store only |
-| A failed sync changes nothing | Fail the fetch, assert the library in memory and on disk are unchanged, and the message says so | test: `a_failed_sync_leaves_the_library_and_the_file_untouched` |
+| A halted pass removes nothing | Fail one list on its first page and another on its second, assert every cached row stays in memory and on disk | test: `a_halted_pass_removes_nothing` |
 | A sync lands on disk | Sync, then open the file in a new run, assert the like and the playlist name | test: `a_sync_lands_on_disk` |
 | A sync for an earlier session is dropped | Start a sync, sign out and back in, drain, assert nothing landed | test: `a_sync_for_an_earlier_session_is_dropped` |
 | A sync for a closed library is dropped | Start a sync, end the session on a dead token, drain, assert the library stays empty | test: `a_sync_for_a_closed_library_is_dropped` |
-| An edit during a sync survives it | Edit after the read lands and before it applies, assert the edit and the sync both remain | test: `an_edit_during_a_sync_survives_it` |
-| A dead token found by a sync ends the session | The read returns a dead grant, assert no library, no token, and the last edit on disk | test: `a_dead_refresh_token_during_sync_closes_the_library` |
-| A failed page fails the whole fetch | Serve an error as page 2, assert the fetch returns no rows | test: `a_failed_page_fails_the_whole_fetch` |
+| An edit during a sync survives it | Edit while a page is in flight, assert the edit and the page both remain | test: `an_edit_during_a_sync_survives_it` |
+| A dead token found by a sync ends the session | A page returns a dead grant, assert no library, no token, and the last edit on disk | test: `a_dead_refresh_token_during_sync_closes_the_library` |
+| A failed page keeps the earlier pages | Serve an error as page 3, assert pages 1 and 2 stay in memory and on disk | test: `a_failed_page_keeps_the_earlier_pages` |
 | A paged list is read to its last page | Two liked-track pages, assert all three members in order | test: `liked_tracks_follow_the_cursor_to_the_last_page` |
-| The fixtures decode into a whole library | Read every fixture, sync, assert the counts, no drop, and the playlist tracks | test: `the_fixtures_decode_into_a_whole_library` |
-| A repeated cursor ends the read | Two pages that name each other, assert the error | test: `a_repeated_cursor_fails_the_fetch` |
-| The page cap ends the read | A source with no last page, assert the error at the cap | test: `the_page_cap_fails_the_fetch` |
-| The real client reads every page with the token | A loopback server serves the fixtures, assert every page and the bearer header | test: `http_library_reads_through_a_loopback_server` |
+| The fixtures decode into a whole library | Read every fixture page, merge each, assert the counts, no drop, and the playlist tracks | test: `the_fixtures_decode_into_a_whole_library` |
+| A repeated cursor halts the pass | Two pages that name each other, assert the stall and that more demand does not retry | test: `a_repeated_cursor_stalls_the_pass_for_good` |
+| The page cap halts the pass | A list with no last page, assert the stall at the cap | test: `the_page_cap_stalls_the_pass` |
+| The real client reads one page per call with the token | A loopback server serves the fixtures, assert one request per call and the bearer header | test: `http_pages_read_one_response_per_call` |
 | The token never leaves the host | A `next` link to another host or outside the base, assert it is refused before a fetch | test: `a_next_link_to_another_host_is_refused` |
 | A version 1 file keeps what the user wrote | Migrate a version 1 file, assert the name, playlists and collections stay and every id row is gone | test: `a_version_one_file_keeps_its_playlists_and_drops_its_catalogue_rows` |
 | A migrated file has the fresh schema | Compare `sqlite_master` of a fresh and a migrated file | test: `a_fresh_and_a_migrated_schema_match` |
@@ -448,14 +454,19 @@ names the test that covers the code path, and no hand check has happened.
 | A route outside the catalogue cannot open | Open an album id from a larger catalogue, assert the stack is unchanged | test: `opening_an_unknown_album_is_refused` |
 | A track outside the catalogue cannot play | Select a track id from a larger catalogue, assert the state is unchanged | test: `selecting_an_unknown_track_is_refused` |
 | An invalid history row cannot hide a valid entry | Seed an unknown track then two distinct valid ones, assert both load | test: `an_unknown_history_row_does_not_hide_a_valid_one` |
-| The sync never touches local data | Seed a download, a history entry, a user playlist and a collection, sync, assert all remain | test: `a_sync_keeps_local_data` |
+| A merge never touches local data | Seed a download, a history entry, a user playlist and a collection, merge a partial and a complete page, assert all remain | test: `a_local_like_survives_a_partial_merge_and_only_a_complete_merge_removes_it` |
 | One account never sees another's playlist names | Sync account A, open its playlist, sign out, open account B in this run and the next, assert Home and the stack hold no name of A's | test: `account_b_never_sees_account_a_playlist_names` |
-| A sync for another account is dropped | Start a sync, open another account in the same session, drain, assert nothing landed | test: `a_sync_for_another_account_is_dropped` |
-| A sync waits for the profile fetch | Hold the profile fetch, ask for a sync, assert no read, then release and assert one | test: `a_sync_waits_for_the_profile_fetch` |
-| A sync removes what Tidal no longer lists | Sync a library to other members, assert only the new ones remain | test: `a_sync_removes_a_membership_tidal_no_longer_lists` |
-| A sync is idempotent | Apply the same rows twice, assert the library and the report are unchanged | test: `a_sync_twice_changes_nothing` |
-| A sync keeps no unresolvable member | Sync a member the catalogue lacks, assert it is counted and left out | test: `an_unresolvable_member_is_counted_not_kept` |
-| A sync cannot break the invariant | Two sync successors in the exhaustive library proof | test: `every_reachable_library_satisfies_check` |
+| A page for another account is dropped | Hold a page, open another account in the same session, release, assert nothing landed in memory or on disk | test: `a_page_for_another_account_is_dropped` |
+| A page waits for the profile fetch | Hold the profile fetch, ask for a sync, assert no page, then release and assert one page per mirrored list | test: `a_page_waits_for_the_profile_fetch` |
+| Only a complete pass removes a row | Read page one of two, assert the cached row stays, then read to the end, assert it is gone | test: `only_a_complete_pass_removes_a_row` |
+| A page applied twice changes nothing | Sync twice over the same pages, assert the library, the catalogue revision and the file are unchanged | test: `a_page_applied_twice_changes_nothing` |
+| A rejected page forces one renewal | Reject the first token, assert one profile fetch and the pass resuming with the fresh token | test: `an_unauthorized_page_forces_one_refresh` |
+| A renewed token rejected again ends the session | Reject every page token, assert one renewal, then no library and no token | test: `a_renewed_token_rejected_again_ends_the_session` |
+| A catalogue-only change reaches disk | Read a Tidal playlist's tracks, assert the library is unchanged and a new run loads the tracks | test: `a_catalogue_only_change_reaches_disk` |
+| Entering a route starts one pass | Open Liked Songs twice, assert one page, then Albums, assert one more | test: `entering_a_route_starts_one_pass_and_reentering_does_not` |
+| A larger view reads the next page | Enter a two-page list, assert one page, ask for two rows, assert both pages | test: `a_larger_want_reads_the_next_page` |
+| A merge keeps no unresolvable member | Merge a member the catalogue lacks, assert it is counted and left out | test: `an_unresolvable_member_is_counted_not_kept` |
+| A merge cannot break the invariant | Three merge successors in the exhaustive library proof | test: `every_reachable_library_satisfies_check` |
 | A bad cover never hides its album or playlist | Absorb rows with malformed covers, assert each row is kept with no cover and nothing is counted | test: `a_bad_cover_does_not_hide_its_album`, `a_bad_cover_does_not_hide_its_playlist` |
 | A row without a cover keeps the known cover | Absorb a cover, then the same album and playlist with an empty and a malformed one | test: `a_row_without_a_cover_keeps_the_known_cover` |
 | The decoder reads the cover id | Decode the synthetic fixtures, assert each album and playlist cover id | test: `the_fixtures_decode_into_a_whole_library` |
@@ -491,8 +502,8 @@ names the test that covers the code path, and no hand check has happened.
 | A real account shows a real cover | Sign in with a real account, sync, open Albums, compare a cover with the Tidal app | live: not run. The response shape is confirmed live, but a full sync of this account did not finish in the drive window, so the screen stays open. The read is covered by `a_cover_link_is_read_from_the_artwork_files`() |
 | A live next link is followed | Read a live collection page, follow its `links.next`, read the second page | live: 2026-11-18, plus `a_next_link_without_the_base_path_is_followed`() |
 | A live cover reads an artwork file | Read a live album coverArt response, pick a file, fetch the image with no token | live: 2026-11-18, plus `a_cover_link_is_read_from_the_artwork_files`() and `the_smallest_file_at_or_above_the_width_wins`() |
-| The live library needs cover includes | Read live collections with and without the coverArt include, compare the relationships | live: 2026-11-18. The include assertions are covered by `http_library_reads_through_a_loopback_server`() |
-| Tidal limits rapid requests | Send ten rapid paced-free page requests, observe `429 Too Many Requests` | live: 2026-11-18, plus `a_rate_limited_page_is_retried_and_lands`() |
+| The live library needs cover includes | Read live collections with and without the coverArt include, compare the relationships | live: 2026-11-18. The include assertions are covered by `http_pages_read_one_response_per_call`() |
+| Tidal limits rapid requests | Send ten rapid paced-free page requests, observe `429 Too Many Requests` | live: 2026-11-18, plus `a_rate_limited_page_call_is_retried_and_lands`() |
 
 ## Confirmed live
 

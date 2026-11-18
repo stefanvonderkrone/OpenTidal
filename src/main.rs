@@ -63,6 +63,7 @@ fn signed_in_stored_scene(a: &mut App) {
         expires_in: 0,
     };
     a.live = false;
+    a.revalidate_on_entry = false;
     a.service = std::sync::Arc::new(tidal::FakeService::default());
     a.tokens = std::sync::Arc::new(auth::MemoryStore::default());
     // A scratch database, so the library this scene writes cannot land in the real
@@ -109,22 +110,27 @@ fn signed_in_stored_scene(a: &mut App) {
 fn signed_in_synced_scene(a: &mut App) {
     use catalogue::{CatalogueRows, PlaylistRow};
     signed_in_stored_scene(a);
-    let library = library::LibraryRows {
-        catalogue: CatalogueRows {
-            playlists: vec![PlaylistRow {
-                id: "f6b9f0a1-6c8e-4d24-9c71-1d0e2f3a4b5c".to_string(),
-                name: "Evening Drive".to_string(),
-                description: "A playlist from Tidal".to_string(),
-                tracks: vec!["seed-track-0".to_string(), "seed-track-1".to_string()],
-                cover: String::new(),
-            }],
-            ..CatalogueRows::default()
-        },
-        liked: vec!["seed-track-3".to_string()],
-        tidal_playlists: vec!["f6b9f0a1-6c8e-4d24-9c71-1d0e2f3a4b5c".to_string()],
-        ..library::LibraryRows::default()
+    const EVENING: &str = "f6b9f0a1-6c8e-4d24-9c71-1d0e2f3a4b5c";
+    let evening = PlaylistRow {
+        id: EVENING.to_string(),
+        name: "Evening Drive".to_string(),
+        description: "A playlist from Tidal".to_string(),
+        tracks: vec!["seed-track-0".to_string(), "seed-track-1".to_string()],
+        cover: String::new(),
     };
-    a.service = std::sync::Arc::new(tidal::FakeService { library: Ok(library), ..tidal::FakeService::default() });
+    let pages = [
+        (library::RemoteList::Liked, one_page(CatalogueRows::default(), "seed-track-3")),
+        (
+            library::RemoteList::Playlists,
+            one_page(CatalogueRows { playlists: vec![evening], ..CatalogueRows::default() }, EVENING),
+        ),
+    ];
+    a.service = std::sync::Arc::new(tidal::FakeService { pages: pages.into(), ..tidal::FakeService::default() });
+}
+
+/// A list that is one last page holding one member.
+fn one_page(rows: catalogue::CatalogueRows, member: &str) -> Vec<Result<tidal::Page, tidal::ServiceError>> {
+    vec![Ok(tidal::Page { rows, members: vec![member.to_string()], next: None })]
 }
 
 /// The stored scene, with a fake service whose library saves one album with a
@@ -134,22 +140,18 @@ fn signed_in_synced_scene(a: &mut App) {
 fn signed_in_covers_scene(a: &mut App) {
     use catalogue::{AlbumRow, CatalogueRows};
     signed_in_stored_scene(a);
-    let library = library::LibraryRows {
-        catalogue: CatalogueRows {
-            albums: vec![AlbumRow {
-                id: "fixture-album-1".to_string(),
-                title: "Fixture Cover".to_string(),
-                artist: "seed-artist-0".to_string(),
-                cover: "fixture-cover-1".to_string(),
-            }],
-            ..CatalogueRows::default()
-        },
-        saved_albums: vec!["fixture-album-1".to_string()],
-        ..library::LibraryRows::default()
+    let rows = CatalogueRows {
+        albums: vec![AlbumRow {
+            id: "fixture-album-1".to_string(),
+            title: "Fixture Cover".to_string(),
+            artist: "seed-artist-0".to_string(),
+            cover: "fixture-cover-1".to_string(),
+        }],
+        ..CatalogueRows::default()
     };
     let magenta = include_bytes!("../tests/fixtures/covers/magenta.png").to_vec();
     a.service = std::sync::Arc::new(tidal::FakeService {
-        library: Ok(library),
+        pages: [(library::RemoteList::Albums, one_page(rows, "fixture-album-1"))].into(),
         covers: [("fixture-cover-1".to_string(), Ok(magenta))].into(),
         ..tidal::FakeService::default()
     });

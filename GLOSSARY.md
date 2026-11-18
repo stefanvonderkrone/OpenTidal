@@ -93,7 +93,7 @@ or saved item references an id that does not exist.
 ## Tidal
 
 The remote half, behind the `MusicService` port in `src/tidal.rs`. Read-only.
-A sync mirrors the library from Tidal. Nothing writes back.
+Passes mirror the library from Tidal. Nothing writes back.
 
 - **service.** The `MusicService` port. The app reaches Tidal only through it.
   The deterministic fake backs every proof. The real client backs
@@ -105,11 +105,20 @@ A sync mirrors the library from Tidal. Nothing writes back.
   `SignedOut`, `Authorizing`, `SignedIn`, and `Failed`, from `src/auth.rs`.
 - **token.** An OAuth access token and its refresh token. The refresh token
   persists in the token file or the macOS keychain.
-- **sync.** Read the whole Tidal library of the signed-in account, then
-  replace likes, saves, follows, and Tidal playlists in one step. `Library::sync`
-  applies it. A fetch that fails on any page changes nothing.
+- **members.** The ordered ids of one mirrored list, in Tidal's order and
+  without duplicates. In code it is `Members<T>`. Likes, saves, follows, and
+  Tidal playlists are members in `Library`, and a Tidal playlist's tracks are
+  members in its catalogue playlist.
+- **pass.** One read of one remote list from its first page. Each page merges
+  into the members as it lands. Only the last page removes a member, so a pass
+  that halts removes nothing. In code it is a `Pass` inside `Passes`, which
+  belong to the open library. A remote list is `RemoteList`, never a
+  **collection**.
+- **sync.** A complete pass of each of the four mirrored lists: likes, saves,
+  follows, and Tidal playlists. `App::sync` starts it, and `Library::merge`
+  applies each page.
 - **cover state.** Where one cover is in its life: wanted by a screen, held
-  by a batch, shown, or unavailable until the next sync. In code it is
+  by a batch, shown, or unavailable until the next page lands. In code it is
   `CoverState`, one map per open library. It is not a **slot**.
 - **ticket.** The session and user id a worker started under. In code it is
   `Ticket`, checked by `App::ticket_holds`. A result is applied only when both

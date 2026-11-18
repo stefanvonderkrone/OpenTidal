@@ -6,7 +6,7 @@
 //! This module is rune-free. It holds no network or token state in `State`; the
 //! app wraps a service in `Arc` on [`crate::app::App`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use crate::auth::{OAuthConfig, Token};
 use crate::catalogue::{AlbumRow, ArtistRow, CatalogueRows, CoverOwner, CoverRequest, PlaylistRow, TrackRow};
-use crate::library::{LibraryRows, RemoteList};
+use crate::library::RemoteList;
 
 /// A Tidal user id, an opaque string. The newtype keeps it from being mistaken
 /// for any other string. Catalogue ids have their own types in `catalogue.rs`.
@@ -91,13 +91,8 @@ pub struct Page {
 /// ignores it and the real client sends it as a bearer header.
 pub trait MusicService: Send + Sync {
     fn current_user(&self, token: &str) -> Result<User, ServiceError>;
-    /// Read every page of the account's library. A failed page, a repeated
-    /// cursor, or the page cap returns an error and no rows. This is the
-    /// whole-library path. The page worker replaces it with [`Self::page`].
-    fn library(&self, token: &str, user: &str) -> Result<LibraryRows, ServiceError>;
     /// One page of `of`. `after: None` reads the first page. The caller owns
     /// the page cap and the repeated-cursor check.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the page worker is the first caller"))]
     fn page(&self, token: &str, user: &str, of: &RemoteList, after: Option<&Cursor>) -> Result<Page, ServiceError>;
     /// The bytes of one cover, near [`COVER_PX`] wide. Unchecked: the cover
     /// cache checks them before a put.
@@ -113,10 +108,8 @@ pub const MAX_COVER_BYTES: u64 = 4 * 1024 * 1024;
 /// A fixed, deterministic service for tests and headless drives.
 pub struct FakeService {
     pub user: User,
-    /// What a sync reads. The default is an empty library.
-    pub library: Result<LibraryRows, ServiceError>,
     /// What `page` answers, per list, in order. The service sets each `next`
-    /// itself. A list with no entry answers one page made from `library`.
+    /// itself. A list with no entry answers one empty last page.
     pub pages: BTreeMap<RemoteList, Vec<Result<Page, ServiceError>>>,
     /// What `cover` answers, by artwork id. A missing id is `Http("404")`.
     pub covers: BTreeMap<String, Result<Vec<u8>, ServiceError>>,
@@ -128,7 +121,6 @@ impl Default for FakeService {
     fn default() -> Self {
         FakeService {
             user: User { id: UserId("fake-user".to_string()), name: "Fake User".to_string() },
-            library: Ok(LibraryRows::default()),
             pages: BTreeMap::new(),
             covers: BTreeMap::new(),
             cover_calls: AtomicUsize::new(0),
@@ -136,37 +128,14 @@ impl Default for FakeService {
     }
 }
 
-impl FakeService {
-    /// `of` read whole from `library`, as one page with the whole catalogue.
-    fn whole_page(&self, of: &RemoteList) -> Result<Page, ServiceError> {
-        let rows = self.library.clone()?;
-        let members = match of {
-            RemoteList::Liked => rows.liked,
-            RemoteList::Albums => rows.saved_albums,
-            RemoteList::Artists => rows.followed,
-            RemoteList::Playlists => rows.tidal_playlists,
-            RemoteList::Playlist(id) => rows
-                .catalogue
-                .playlists
-                .iter()
-                .find(|p| p.id == id.as_str())
-                .map(|p| p.tracks.clone())
-                .unwrap_or_default(),
-        };
-        Ok(Page { rows: rows.catalogue, members, next: None })
-    }
-}
-
 impl MusicService for FakeService {
     fn current_user(&self, _token: &str) -> Result<User, ServiceError> {
         Ok(self.user.clone())
     }
-    fn library(&self, _token: &str, _user: &str) -> Result<LibraryRows, ServiceError> {
-        self.library.clone()
-    }
     /// Page `n` answers the cursor whose path is `n`.
     fn page(&self, _token: &str, _user: &str, of: &RemoteList, after: Option<&Cursor>) -> Result<Page, ServiceError> {
-        let pages = self.pages.get(of).cloned().unwrap_or_else(|| vec![self.whole_page(of)]);
+        let empty = || Ok(Page { rows: CatalogueRows::default(), members: Vec::new(), next: None });
+        let pages = self.pages.get(of).cloned().unwrap_or_else(|| vec![empty()]);
         let index = match after {
             None => 0,
             Some(cursor) => cursor
@@ -373,10 +342,6 @@ impl MusicService for HttpService {
             Err(_) => "You".to_string(),
         };
         Ok(User { id: UserId(id), name })
-    }
-
-    fn library(&self, token: &str, user: &str) -> Result<LibraryRows, ServiceError> {
-        fetch_library(&mut |path: &str| self.get_doc(token, path), &self.prefix, user)
     }
 
     fn page(&self, token: &str, user: &str, of: &RemoteList, after: Option<&Cursor>) -> Result<Page, ServiceError> {
@@ -705,42 +670,8 @@ impl Document {
     }
 }
 
-/// The page budget for one whole library read, shared by every list. At about
-/// twenty items a page this is some 8000 items.
-const MAX_PAGES: usize = 400;
-
 /// One page source: a path under the service base in, a document out.
 type PageSource<'a> = dyn FnMut(&str) -> Result<Document, ServiceError> + 'a;
-
-/// Follow `links.next` from `first` until it is absent, handing each page to
-/// `each`. Every page spends one unit of `budget`. A cursor this walk already
-/// followed, an empty budget, or a failed page ends the walk with an error.
-fn walk(
-    budget: &mut usize,
-    prefix: &str,
-    get: &mut PageSource,
-    first: &str,
-    each: &mut dyn FnMut(Document),
-) -> Result<(), ServiceError> {
-    let mut seen = BTreeSet::new();
-    let mut path = first.to_owned();
-    loop {
-        if !seen.insert(path.clone()) {
-            return Err(ServiceError::Paging("repeated cursor".to_string()));
-        }
-        if *budget == 0 {
-            return Err(ServiceError::Paging("page cap".to_string()));
-        }
-        *budget -= 1;
-        let doc = get(&path)?;
-        let next = doc.links.next.clone();
-        each(doc);
-        match next {
-            None => return Ok(()),
-            Some(next) => path = under_base(prefix, &next)?,
-        }
-    }
-}
 
 /// A `next` link as a path under the service base. Tidal sends an absolute path
 /// from the host root in one of two shapes: with the base path, such as
@@ -775,43 +706,6 @@ fn owned(user: &str) -> String {
 
 fn playlist_items(id: &str) -> String {
     format!("/playlists/{id}/relationships/items?include=items,items.albums,items.artists,items.albums.coverArt")
-}
-
-/// The whole library read, over any page source. `HttpService` passes its
-/// `get_doc`, and a test passes a map from path to fixture. `prefix` is the
-/// path of the service base, which `next` links start with. The rows exist only
-/// when every page of every list arrived.
-fn fetch_library(get: &mut PageSource, prefix: &str, user: &str) -> Result<LibraryRows, ServiceError> {
-    let mut budget = MAX_PAGES;
-    let mut rows = LibraryRows::default();
-    type Members = fn(&mut LibraryRows) -> &mut Vec<String>;
-    let lists: [(String, &str, Members); 5] = [
-        (LIKED.to_owned(), "tracks", |r| &mut r.liked),
-        (SAVED.to_owned(), "albums", |r| &mut r.saved_albums),
-        (FOLLOWED.to_owned(), "artists", |r| &mut r.followed),
-        (FAVORITED.to_owned(), "playlists", |r| &mut r.tidal_playlists),
-        (owned(user), "playlists", |r| &mut r.tidal_playlists),
-    ];
-    for (first, kind, members) in lists {
-        walk(&mut budget, prefix, get, &first, &mut |doc| {
-            members(&mut rows).extend(doc.members(kind));
-            doc.add_to(&mut rows.catalogue);
-        })?;
-    }
-    let mut distinct = BTreeSet::new();
-    let playlists: Vec<String> =
-        rows.tidal_playlists.iter().filter(|id| distinct.insert(*id)).cloned().collect();
-    for id in playlists {
-        let mut tracks = Vec::new();
-        walk(&mut budget, prefix, get, &playlist_items(&id), &mut |doc| {
-            tracks.extend(doc.members("tracks"));
-            doc.add_to(&mut rows.catalogue);
-        })?;
-        for row in rows.catalogue.playlists.iter_mut().filter(|p| p.id == id) {
-            row.tracks = tracks.clone();
-        }
-    }
-    Ok(rows)
 }
 
 /// One page of `of`, over any page source. `after: None` starts at the first
@@ -937,6 +831,8 @@ fn is_email(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalogue::Catalogue;
+    use crate::library::{Library, Merge, Reach};
 
     /// A synthetic fixture from `tests/fixtures/tidal`, decoded the way
     /// `get_doc` decodes a response body.
@@ -965,50 +861,57 @@ mod tests {
         }
     }
 
-    /// The whole fixture library, read through `fetch_library`, with every path
-    /// it asked for in order.
-    fn read_fixtures(
-        mut fail: impl FnMut(&str) -> Option<ServiceError>,
-    ) -> (Result<LibraryRows, ServiceError>, Vec<String>) {
-        let mut asked = Vec::new();
-        let result = fetch_library(
-            &mut |path: &str| {
-                asked.push(path.to_owned());
-                match fail(path) {
-                    Some(error) => Err(error),
-                    None => Ok(fixture(fixture_path(path))),
+    /// Every page of `of` from the fixtures, merged into `lib` the way the app
+    /// lands a pass: each page partial, the last one complete. Returns how
+    /// many ids the merges could not keep.
+    fn read_into(lib: &mut Library, cat: &mut Catalogue, of: RemoteList) -> Result<usize, ServiceError> {
+        let mut get = |path: &str| Ok(fixture(fixture_path(path)));
+        let mut confirmed: Vec<String> = Vec::new();
+        let mut after = None;
+        let mut dropped = 0;
+        loop {
+            let page = fetch_page(&mut get, "/v2", "173210380", &of, after.as_ref())?;
+            for member in page.members {
+                if !confirmed.contains(&member) {
+                    confirmed.push(member);
                 }
-            },
-            "/v2",
-            "173210380",
-        );
-        (result, asked)
+            }
+            let reach = if page.next.is_some() { Reach::Partial } else { Reach::Complete };
+            let merge = Merge { list: of.clone(), rows: page.rows, confirmed: confirmed.clone(), reach };
+            dropped += lib.merge(cat, merge).dropped;
+            match page.next {
+                Some(next) => after = Some(next),
+                None => return Ok(dropped),
+            }
+        }
     }
 
     /// A list longer than one page is read to its last page, in order.
     #[test]
     fn liked_tracks_follow_the_cursor_to_the_last_page() {
-        let (rows, _) = read_fixtures(|_| None);
-        assert_eq!(rows.unwrap().liked, ["75413016", "12345678", "98765432"]);
+        let mut cat = Catalogue::seed();
+        let mut lib = Library::default();
+        read_into(&mut lib, &mut cat, RemoteList::Liked).unwrap();
+        let ids: Vec<&str> = lib.liked.iter().map(|t| t.as_str()).collect();
+        assert_eq!(ids, ["75413016", "12345678", "98765432"]);
     }
 
-    /// Every fixture decodes into a library the sync keeps whole: each member
+    /// Every fixture decodes into a library the merges keep whole: each member
     /// resolves, and each playlist has its tracks in order.
     #[test]
     fn the_fixtures_decode_into_a_whole_library() {
-        let (rows, asked) = read_fixtures(|_| None);
-        assert_eq!(
-            asked.iter().filter(|p| p.contains(EVENING)).count(),
-            1,
-            "a playlist both owned and favorited was read twice"
-        );
-        let mut cat = crate::catalogue::Catalogue::seed();
-        let mut lib = crate::library::Library::default();
-        let report = lib.sync(&mut cat, rows.unwrap());
-        assert_eq!(
-            report,
-            crate::library::SyncReport { liked: 3, saved_albums: 2, followed: 1, tidal_playlists: 2, dropped: 0 }
-        );
+        let mut cat = Catalogue::seed();
+        let mut lib = Library::default();
+        let mut dropped = 0;
+        for of in [RemoteList::Liked, RemoteList::Albums, RemoteList::Artists, RemoteList::Playlists] {
+            dropped += read_into(&mut lib, &mut cat, of).unwrap();
+        }
+        for raw in [EVENING, MORNING] {
+            let id = cat.playlist_id(raw).unwrap();
+            dropped += read_into(&mut lib, &mut cat, RemoteList::Playlist(id)).unwrap();
+        }
+        let counts = (lib.liked.len(), lib.saved_albums.len(), lib.followed.len(), lib.tidal_playlists.len());
+        assert_eq!((counts, dropped), ((3, 2, 1, 2), 0));
         let evening = cat.playlist(&cat.playlist_id(EVENING).unwrap()).unwrap();
         assert_eq!(evening.name, "Evening Drive");
         let titles: Vec<&str> =
@@ -1026,161 +929,46 @@ mod tests {
         assert_eq!(evening.cover.as_ref().map(|c| c.as_str()), Some("playlist-cover-1"));
     }
 
-    /// A page that fails fails the whole read. No rows exist, so nothing
-    /// partial can be applied.
-    #[test]
-    fn a_failed_page_fails_the_whole_fetch() {
-        let (rows, _) = read_fixtures(|path| {
-            path.contains("page-2").then(|| ServiceError::Http("429 Too Many Requests".to_string()))
-        });
-        assert!(matches!(rows, Err(ServiceError::Http(_))), "a failed page was skipped: {rows:?}");
-        let (rows, _) = read_fixtures(|path| {
-            (path == playlist_items(MORNING)).then(|| ServiceError::Http("500".to_string()))
-        });
-        assert!(matches!(rows, Err(ServiceError::Http(_))), "a failed playlist page was skipped: {rows:?}");
+    /// A page whose `next` is the given link, and nothing else.
+    fn linking_to(next: &str) -> Document {
+        serde_json::from_str(&format!(r#"{{"links":{{"next":"{next}"}}}}"#)).unwrap()
     }
 
-    /// A page whose `next` is a page from this walk ends the read with an error,
-    /// not a loop.
-    #[test]
-    fn a_repeated_cursor_fails_the_fetch() {
-        let mut calls = 0;
-        let mut budget = MAX_PAGES;
-        let result = walk(
-            &mut budget,
-            "/v2",
-            &mut |path: &str| {
-                calls += 1;
-                assert!(calls <= MAX_PAGES, "the walk ran past the page cap");
-                let next = if path == "/a" { "/v2/b" } else { "/v2/a" };
-                Ok(serde_json::from_str(&format!(r#"{{"links":{{"next":"{next}"}}}}"#)).unwrap())
-            },
-            "/a",
-            &mut |_| {},
-        );
-        assert_eq!(result, Err(ServiceError::Paging("repeated cursor".to_string())));
-        assert_eq!(calls, 2);
-    }
-
-    /// A source with no last page ends at the cap. The source panics past the
-    /// cap, so a broken cap fails the test instead of hanging it.
-    #[test]
-    fn the_page_cap_fails_the_fetch() {
-        let mut calls = 0;
-        let mut budget = MAX_PAGES;
-        let result = walk(
-            &mut budget,
-            "/v2",
-            &mut |_: &str| {
-                calls += 1;
-                assert!(calls <= MAX_PAGES, "the walk ran past the page cap");
-                Ok(serde_json::from_str(&format!(r#"{{"links":{{"next":"/v2/p?cursor={calls}"}}}}"#)).unwrap())
-            },
-            "/p",
-            &mut |_| {},
-        );
-        assert_eq!(result, Err(ServiceError::Paging("page cap".to_string())));
-        assert_eq!(calls, MAX_PAGES);
-    }
-
-    /// A `next` link that leaves the service is refused before it is fetched,
-    /// so the bearer token never goes to another host.
+    /// A `next` link that leaves the service is refused before it becomes a
+    /// cursor, so the bearer token never goes to another host.
     #[test]
     fn a_next_link_to_another_host_is_refused() {
         for next in ["https://evil.example/v2/x", "//evil.example/v2/x", "/v2//evil.example/x", "x", "v2/x"] {
             let mut asked = Vec::new();
-            let mut budget = MAX_PAGES;
-            let result = walk(
-                &mut budget,
-                "/v2",
+            let result = fetch_page(
                 &mut |path: &str| {
                     asked.push(path.to_owned());
-                    Ok(serde_json::from_str(&format!(r#"{{"links":{{"next":"{next}"}}}}"#)).unwrap())
+                    Ok(linking_to(next))
                 },
-                "/first",
-                &mut |_| {},
+                "/v2",
+                "173210380",
+                &RemoteList::Albums,
+                None,
             );
-            assert!(matches!(result, Err(ServiceError::Decode(_))), "{next} was followed: {result:?}");
-            assert_eq!(asked, ["/first"], "{next} was fetched");
+            assert!(matches!(result, Err(ServiceError::Decode(_))), "{next} was accepted: {result:?}");
+            assert_eq!(asked, [SAVED], "{next} was fetched");
         }
     }
 
     /// The live service sends `next` from the host root without the base path.
-    /// The walk follows it as a path under the base.
+    /// The next page reads it as a path under the base.
     #[test]
     fn a_next_link_without_the_base_path_is_followed() {
         let next = "/userCollectionAlbums/me/relationships/items?include=items&page%5Bcursor%5D=2";
         let mut asked = Vec::new();
-        let mut budget = MAX_PAGES;
-        let result = walk(
-            &mut budget,
-            "/v2",
-            &mut |path: &str| {
-                asked.push(path.to_owned());
-                let body = if path == "/first" { format!(r#"{{"links":{{"next":"{next}"}}}}"#) } else { "{}".into() };
-                Ok(serde_json::from_str(&body).unwrap())
-            },
-            "/first",
-            &mut |_| {},
-        );
-        assert_eq!(result, Ok(()));
-        assert_eq!(asked, ["/first", next]);
-    }
-
-    /// The real client reads every page over HTTP, follows `next` under the
-    /// base path, and sends the bearer token on every request.
-    #[test]
-    fn http_library_reads_through_a_loopback_server() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        // One request per connection, closed after the answer, so the server can
-        // read each request whole. Eight pages make the whole fixture library.
-        let server = std::thread::spawn(move || {
-            let mut seen = Vec::new();
-            for _ in 0..8 {
-                let (mut conn, _) = listener.accept().unwrap();
-                let mut buf = [0u8; 8192];
-                let n = conn.read(&mut buf).unwrap();
-                let request = String::from_utf8_lossy(&buf[..n]).to_string();
-                let path = request.split_whitespace().nth(1).unwrap().to_owned();
-                let bearer = request
-                    .lines()
-                    .any(|l| l.eq_ignore_ascii_case("authorization: Bearer tok"));
-                let relative = path.strip_prefix("/v2").unwrap();
-                let body = std::fs::read_to_string(format!(
-                    "{}/tests/fixtures/tidal/{}",
-                    env!("CARGO_MANIFEST_DIR"),
-                    fixture_path(relative)
-                ))
-                .unwrap();
-                let _ = conn.write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.api+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                );
-                seen.push((path, bearer));
-            }
-            seen
-        });
-        let svc = HttpService::with_clock(&format!("http://127.0.0.1:{}/v2", addr.port()), FakeClock::new());
-        let rows = svc.library("tok", "173210380").unwrap();
-        let seen = server.join().unwrap();
-        assert_eq!(rows.liked, ["75413016", "12345678", "98765432"]);
-        assert_eq!(seen.len(), 8);
-        assert!(seen.iter().all(|(_, bearer)| *bearer), "a request went without the token: {seen:?}");
-        assert!(seen[1].0.ends_with("page%5Bcursor%5D=page-2"), "the second page was not requested: {seen:?}");
-        let includes = |collection: &str| -> Vec<String> {
-            let path = &seen.iter().find(|(p, _)| p.starts_with(&format!("/v2/{collection}/"))).unwrap().0;
-            let query = path.split_once("include=").unwrap().1;
-            query.split('&').next().unwrap().split(',').map(str::to_owned).collect()
+        let mut get = |path: &str| {
+            asked.push(path.to_owned());
+            Ok(if path == SAVED { linking_to(next) } else { serde_json::from_str("{}").unwrap() })
         };
-        assert!(includes("userCollectionTracks").contains(&"items.albums.coverArt".into()), "{seen:?}");
-        assert!(includes("userCollectionAlbums").contains(&"items.coverArt".into()), "{seen:?}");
-        assert!(includes("userCollectionPlaylists").contains(&"items.coverArt".into()), "{seen:?}");
+        let first = fetch_page(&mut get, "/v2", "173210380", &RemoteList::Albums, None).unwrap();
+        let last = fetch_page(&mut get, "/v2", "173210380", &RemoteList::Albums, first.next.as_ref()).unwrap();
+        assert_eq!(last.next, None);
+        assert_eq!(asked, [SAVED, next]);
     }
 
     /// A catalogue playlist id for a Tidal playlist. Only a catalogue mints one.
@@ -1207,52 +995,13 @@ mod tests {
         rows.iter().map(id).collect()
     }
 
-    /// With no pages set, the fake answers each list from its library as one
-    /// last page with the whole catalogue.
+    /// With no pages set, the fake answers each list with one empty last page.
     #[test]
-    fn the_fake_pages_each_list_from_its_library() {
-        let catalogue = CatalogueRows {
-            artists: vec![ArtistRow { id: "1566".into(), name: "Tame Impala".into() }],
-            albums: vec![AlbumRow { id: "251380836".into(), title: "Currents".into(), artist: "1566".into(), cover: String::new() }],
-            tracks: ["75413016", "12345678"]
-                .map(|id| TrackRow {
-                    id: id.into(),
-                    title: id.into(),
-                    artist: "1566".into(),
-                    album: "251380836".into(),
-                    duration: "PT3M".into(),
-                })
-                .to_vec(),
-            playlists: vec![PlaylistRow {
-                id: EVENING.into(),
-                name: "Evening Drive".into(),
-                description: String::new(),
-                tracks: vec!["12345678".into(), "75413016".into()],
-                cover: String::new(),
-            }],
-        };
-        let svc = FakeService {
-            library: Ok(LibraryRows {
-                catalogue: catalogue.clone(),
-                liked: vec!["75413016".into(), "12345678".into()],
-                saved_albums: vec!["251380836".into()],
-                followed: vec!["1566".into()],
-                tidal_playlists: vec![EVENING.into()],
-            }),
-            ..FakeService::default()
-        };
-        let cases: [(RemoteList, &[&str]); 5] = [
-            (RemoteList::Liked, &["75413016", "12345678"]),
-            (RemoteList::Albums, &["251380836"]),
-            (RemoteList::Artists, &["1566"]),
-            (RemoteList::Playlists, &[EVENING]),
-            (RemoteList::Playlist(tidal_playlist(EVENING)), &["12345678", "75413016"]),
-        ];
-        for (of, members) in cases {
+    fn a_list_the_fake_does_not_name_is_one_empty_last_page() {
+        let svc = FakeService::default();
+        for of in [RemoteList::Liked, RemoteList::Albums, RemoteList::Playlist(tidal_playlist(EVENING))] {
             let page = svc.page("t", "u", &of, None).unwrap();
-            assert_eq!(page.members, members, "{of:?}");
-            assert_eq!(page.rows, catalogue, "{of:?}");
-            assert_eq!(page.next, None, "{of:?}");
+            assert_eq!(page, Page { rows: CatalogueRows::default(), members: Vec::new(), next: None }, "{of:?}");
         }
     }
 
@@ -1766,37 +1515,15 @@ mod tests {
         reply("429 Too Many Requests", "", "")
     }
 
-    /// A `429` with no `Retry-After` waits one second, then the same page is
-    /// asked again and the whole library lands.
-    #[test]
-    fn a_rate_limited_page_is_retried_and_lands() {
-        let (base, server) = serve(9, |index, path| {
-            if index == 0 {
-                return too_many();
-            }
-            let file = fixture_path(path.strip_prefix("/v2").unwrap());
-            let body = std::fs::read_to_string(format!("{}/tests/fixtures/tidal/{file}", env!("CARGO_MANIFEST_DIR")))
-                .unwrap();
-            reply("200 OK", "Content-Type: application/vnd.api+json\r\n", &body)
-        });
-        let clock = FakeClock::new();
-        let svc = HttpService::with_clock(&format!("{base}/v2"), clock.clone());
-        let rows = svc.library("tok", "173210380");
-        assert_eq!(rows.unwrap().liked, ["75413016", "12345678", "98765432"]);
-        let asked = server.join().unwrap();
-        assert_eq!(asked[0], asked[1], "the limited page was not asked again");
-        assert_eq!(clock.sleeps()[0], Duration::from_secs(1), "no backoff before the retry");
-    }
-
     /// A page that is limited every time gives up after four retries with a
-    /// doubling backoff, and the read returns `RateLimited` and no rows.
+    /// doubling backoff, and the read returns `RateLimited` and no page.
     #[test]
     fn a_page_limited_every_time_fails_after_the_cap() {
         let (base, server) = serve(5, |_, _| too_many());
         let clock = FakeClock::new();
         let svc = HttpService::with_clock(&format!("{base}/v2"), clock.clone());
-        let rows = svc.library("tok", "173210380");
-        assert!(matches!(rows, Err(ServiceError::RateLimited(_))), "a limited read gave {rows:?}");
+        let page = svc.page("tok", "173210380", &RemoteList::Liked, None);
+        assert!(matches!(page, Err(ServiceError::RateLimited(_))), "a limited read gave {page:?}");
         assert_eq!(server.join().unwrap().len(), 5, "the read did not stop after four retries");
         let secs: Vec<u64> = clock.sleeps().iter().map(Duration::as_secs).collect();
         assert_eq!(secs, [1, 2, 4, 8]);

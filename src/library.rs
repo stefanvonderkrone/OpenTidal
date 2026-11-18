@@ -9,6 +9,7 @@
 use std::collections::BTreeSet;
 
 use crate::catalogue::{AlbumId, ArtistId, Catalogue, CatalogueRows, CataloguePlaylistId, TrackId};
+use crate::state::Route;
 
 #[cfg(not(test))]
 pub const MAX_PLAYLISTS: usize = 32;
@@ -158,13 +159,26 @@ pub enum RemoteList {
     Artists,
     Playlists,
     /// The tracks of one Tidal playlist. Never a seed playlist.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the playlist route is the first caller"))]
     Playlist(CataloguePlaylistId),
+}
+
+impl RemoteList {
+    /// The remote list the route shows, if it shows one. A seed playlist is
+    /// not on Tidal, so it has none.
+    pub fn of(route: Option<&Route>) -> Option<RemoteList> {
+        match route? {
+            Route::LikedSongs => Some(RemoteList::Liked),
+            Route::Albums => Some(RemoteList::Albums),
+            Route::Artists => Some(RemoteList::Artists),
+            Route::Playlists => Some(RemoteList::Playlists),
+            Route::CataloguePlaylist(id) if !id.is_seed() => Some(RemoteList::Playlist(id.clone())),
+            _ => None,
+        }
+    }
 }
 
 /// One landed page of one remote list, ready to apply. `confirmed` is every
 /// member id the pass has read so far, page one first, as raw text.
-#[cfg_attr(not(test), expect(dead_code, reason = "the page worker is the first caller"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Merge {
     pub list: RemoteList,
@@ -174,7 +188,6 @@ pub struct Merge {
 }
 
 /// What one merge left in the list it named.
-#[cfg_attr(not(test), expect(dead_code, reason = "the page worker is the first caller"))]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct MergeReport {
     pub members: usize,
@@ -220,30 +233,6 @@ impl Default for Library {
             collections: Vec::new(),
         }
     }
-}
-
-/// A complete read of one account's Tidal library, as unvalidated text in the
-/// shape Tidal sends. Only a fetch that read every page returns one, so a value
-/// of this type is the proof that the read was complete.
-#[derive(Clone, Default, Debug, PartialEq, Eq)]
-pub struct LibraryRows {
-    pub catalogue: CatalogueRows,
-    pub liked: Vec<String>,
-    pub saved_albums: Vec<String>,
-    pub followed: Vec<String>,
-    pub tidal_playlists: Vec<String>,
-}
-
-/// What one sync left in the library, for the Account screen.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub struct SyncReport {
-    pub liked: usize,
-    pub saved_albums: usize,
-    pub followed: usize,
-    pub tidal_playlists: usize,
-    /// Catalogue rows that absorb dropped, plus members that name nothing the
-    /// catalogue holds after the absorb.
-    pub dropped: usize,
 }
 
 /// The members of one list that the catalogue resolves, in order. Each one it
@@ -463,37 +452,13 @@ impl Library {
         }
     }
 
-    // --- Sync -------------------------------------------------------------
-
-    /// Absorb the rows into `cat`, then replace likes, saves, follows and Tidal
-    /// playlists with the members that resolve. Downloads, history, user
-    /// playlists, collections and the name are untouched. The same rows applied
-    /// twice change nothing. A member that does not resolve is counted, not kept.
-    pub fn sync(&mut self, cat: &mut Catalogue, rows: LibraryRows) -> SyncReport {
-        let mut dropped = cat.absorb(rows.catalogue);
-        let liked = resolve(rows.liked, |raw| cat.track_id(raw), &mut dropped);
-        self.liked.merge(&liked, Reach::Complete);
-        let saved_albums = resolve(rows.saved_albums, |raw| cat.album_id(raw), &mut dropped);
-        self.saved_albums.merge(&saved_albums, Reach::Complete);
-        let followed = resolve(rows.followed, |raw| cat.artist_id(raw), &mut dropped);
-        self.followed.merge(&followed, Reach::Complete);
-        let tidal_playlists = resolve(rows.tidal_playlists, |raw| cat.playlist_id(raw), &mut dropped);
-        self.tidal_playlists.merge(&tidal_playlists, Reach::Complete);
-        SyncReport {
-            liked: self.liked.len(),
-            saved_albums: self.saved_albums.len(),
-            followed: self.followed.len(),
-            tidal_playlists: self.tidal_playlists.len(),
-            dropped,
-        }
-    }
+    // --- Merge ------------------------------------------------------------
 
     /// Absorb the page's rows into `cat`, then merge the confirmed ids that
     /// resolve into the one list `m.list` names. The tracks of a Tidal
     /// playlist live in the catalogue, so `RemoteList::Playlist` merges there.
     /// Downloads, history, user playlists, collections and the name are
     /// untouched. A confirmed id that does not resolve is counted, not kept.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the page worker is the first caller"))]
     pub fn merge(&mut self, cat: &mut Catalogue, m: Merge) -> MergeReport {
         fn into<T: Ord + Clone>(
             members: &mut Members<T>,
@@ -642,8 +607,8 @@ mod tests {
 
     /// Every library operation, with a fixed id set and fixed names so the
     /// state space stays finite under the `cfg(test)` bounds.
-    /// A track the seed lacks, with its parents, so a sync successor proves that
-    /// a member a sync brings in is a member of the catalogue the check reads.
+    /// A track the seed lacks, with its parents, so a merge successor proves that
+    /// a member a page brings in is a member of the catalogue the check reads.
     fn fetched_rows() -> CatalogueRows {
         CatalogueRows {
             artists: vec![ArtistRow { id: "x-artist".into(), name: "X".into() }],
@@ -662,20 +627,21 @@ mod tests {
     fn successors(l: &Library, ids: &Ids, cat: &mut Catalogue) -> Vec<Library> {
         let Ids { t0, t1, album, artist } = ids;
         let mut out = Vec::new();
-        let mut synced = l.clone();
-        synced.sync(
-            cat,
-            LibraryRows {
-                catalogue: fetched_rows(),
-                liked: vec!["seed-track-1".into(), "x-track".into()],
-                tidal_playlists: vec!["seed-playlist-0".into()],
-                ..LibraryRows::default()
-            },
-        );
-        out.push(synced);
-        let mut emptied = l.clone();
-        emptied.sync(cat, LibraryRows::default());
-        out.push(emptied);
+        let merge = |list: RemoteList, rows: CatalogueRows, confirmed: &[&str], reach: Reach| Merge {
+            list,
+            rows,
+            confirmed: confirmed.iter().map(|id| id.to_string()).collect(),
+            reach,
+        };
+        for page in [
+            merge(RemoteList::Liked, fetched_rows(), &["seed-track-1", "x-track"], Reach::Complete),
+            merge(RemoteList::Playlists, CatalogueRows::default(), &["seed-playlist-0"], Reach::Partial),
+            merge(RemoteList::Liked, CatalogueRows::default(), &[], Reach::Complete),
+        ] {
+            let mut merged = l.clone();
+            merged.merge(cat, page);
+            out.push(merged);
+        }
         out.push(applying(|x| x.toggle_like(t0.clone()), l));
         out.push(applying(|x| x.toggle_like(t1.clone()), l));
         out.push(applying(|x| x.toggle_save_album(album.clone()), l));
@@ -837,84 +803,22 @@ mod tests {
         lib
     }
 
-    /// A sync replaces only what Tidal owns. Downloads, history, user playlists,
-    /// collections and the name are local, and Tidal cannot return them.
-    #[test]
-    fn a_sync_keeps_local_data() {
-        let mut cat = Catalogue::seed();
-        let before = full_library(&cat);
-        let mut lib = before.clone();
-        lib.sync(&mut cat, LibraryRows::default());
-        assert_eq!(lib.name, before.name, "the sync changed the name");
-        assert_eq!(lib.downloaded, before.downloaded, "the sync touched the downloads");
-        assert_eq!(lib.history, before.history, "the sync touched the history");
-        assert_eq!(lib.playlists, before.playlists, "the sync touched a user playlist");
-        assert_eq!(lib.collections, before.collections, "the sync touched a collection");
-    }
-
-    /// A complete read is the truth for the mirrored memberships, so a member
-    /// Tidal no longer lists is removed, and one it lists is kept.
-    #[test]
-    fn a_sync_removes_a_membership_tidal_no_longer_lists() {
-        let mut cat = Catalogue::seed();
-        let mut lib = full_library(&cat);
-        let report = lib.sync(
-            &mut cat,
-            LibraryRows {
-                liked: vec!["seed-track-1".into()],
-                saved_albums: vec!["seed-album-1".into()],
-                followed: vec!["seed-artist-1".into()],
-                tidal_playlists: vec!["seed-playlist-2".into()],
-                ..LibraryRows::default()
-            },
-        );
-        assert_eq!(lib.liked, Members::from_ordered([cat.track_id("seed-track-1").unwrap()]));
-        assert_eq!(lib.saved_albums, Members::from_ordered([cat.album_id("seed-album-1").unwrap()]));
-        assert_eq!(lib.followed, Members::from_ordered([cat.artist_id("seed-artist-1").unwrap()]));
-        assert_eq!(lib.tidal_playlists, Members::from_ordered([cat.playlist_id("seed-playlist-2").unwrap()]));
-        assert_eq!(
-            report,
-            SyncReport { liked: 1, saved_albums: 1, followed: 1, tidal_playlists: 1, dropped: 0 }
-        );
-    }
-
-    /// The same rows applied twice leave the same library, so a retried sync is
-    /// harmless.
-    #[test]
-    fn a_sync_twice_changes_nothing() {
-        let mut cat = Catalogue::seed();
-        let rows = LibraryRows {
-            catalogue: fetched_rows(),
-            liked: vec!["seed-track-1".into(), "x-track".into()],
-            saved_albums: vec!["x-album".into()],
-            followed: vec!["x-artist".into()],
-            tidal_playlists: vec!["seed-playlist-1".into()],
-        };
-        let mut lib = full_library(&cat);
-        let first = lib.sync(&mut cat, rows.clone());
-        let once = lib.clone();
-        let second = lib.sync(&mut cat, rows);
-        assert_eq!(lib, once, "a second sync with the same rows changed the library");
-        assert_eq!(first, second);
-        assert_eq!(lib.liked.len(), 2);
-    }
-
     /// A member the catalogue cannot resolve is counted and left out, so the
     /// library never holds an id outside the catalogue.
     #[test]
     fn an_unresolvable_member_is_counted_not_kept() {
         let mut cat = Catalogue::seed();
         let mut lib = Library::default();
-        let report = lib.sync(
-            &mut cat,
-            LibraryRows {
-                liked: vec!["seed-track-0".into(), "404".into()],
-                tidal_playlists: vec!["gone".into()],
-                ..LibraryRows::default()
-            },
-        );
-        assert_eq!(report.dropped, 2, "an unresolvable member was not counted");
-        assert_eq!(report.liked, 1);
+        let page = |list: RemoteList, confirmed: &[&str]| Merge {
+            list,
+            rows: CatalogueRows::default(),
+            confirmed: confirmed.iter().map(|id| id.to_string()).collect(),
+            reach: Reach::Complete,
+        };
+        let liked = lib.merge(&mut cat, page(RemoteList::Liked, &["seed-track-0", "404"]));
+        let playlists = lib.merge(&mut cat, page(RemoteList::Playlists, &["gone"]));
+        assert_eq!(liked.dropped + playlists.dropped, 2, "an unresolvable member was not counted");
+        assert_eq!(lib.liked.len(), 1);
         assert!(lib.tidal_playlists.is_empty());
         assert_eq!(lib.check(&cat), Ok(()));
     }

@@ -5,7 +5,6 @@
 //! through `atomic::replace`, and only after the bytes pass the image check. A
 //! file that fails the check later reads as a miss and is removed, so a
 //! damaged entry converges to a refetch.
-#![cfg_attr(not(test), expect(dead_code, reason = "the app reads the cover cache from unit 9"))]
 
 use std::{
     ffi::OsStr,

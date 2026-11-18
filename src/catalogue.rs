@@ -109,7 +109,7 @@ pub struct CataloguePlaylist {
 
 /// Whose `coverArt` relationship names a cover. A fetch needs the owner,
 /// because the pinned spec has no third-party read of an artwork by its id.
-#[cfg_attr(not(test), expect(dead_code, reason = "the cover worker reads it from unit 9"))]
+#[cfg_attr(not(test), expect(dead_code, reason = "the screens draw covers from unit 10"))]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum CoverOwner {
     Album(AlbumId),
@@ -118,7 +118,6 @@ pub enum CoverOwner {
 
 /// One cover to show: the artwork and the owner whose relationship reads it.
 /// Built only from an `Album` or a `CataloguePlaylist` that has a cover.
-#[cfg_attr(not(test), expect(dead_code, reason = "the cover worker reads it from unit 9"))]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CoverRequest {
     pub artwork: ArtworkId,
@@ -126,7 +125,7 @@ pub struct CoverRequest {
 }
 
 impl Album {
-    #[cfg_attr(not(test), expect(dead_code, reason = "the cover worker reads it from unit 9"))]
+    #[cfg_attr(not(test), expect(dead_code, reason = "the screens draw covers from unit 10"))]
     pub fn cover_request(&self) -> Option<CoverRequest> {
         let artwork = self.cover.clone()?;
         Some(CoverRequest { artwork, owner: CoverOwner::Album(self.id.clone()) })
@@ -134,7 +133,7 @@ impl Album {
 }
 
 impl CataloguePlaylist {
-    #[cfg_attr(not(test), expect(dead_code, reason = "the cover worker reads it from unit 9"))]
+    #[cfg_attr(not(test), expect(dead_code, reason = "the screens draw covers from unit 10"))]
     pub fn cover_request(&self) -> Option<CoverRequest> {
         let artwork = self.cover.clone()?;
         Some(CoverRequest { artwork, owner: CoverOwner::Playlist(self.id.clone()) })

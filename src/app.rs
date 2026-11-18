@@ -7,12 +7,16 @@
 //! deterministic [`FakeService`]; set `OPENTIDAL_LIVE=1` to use the real
 //! [`HttpService`] and the macOS keychain.
 
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use rune::{Latest, TextEdit, Waker};
+use rune::{Image, ImageCache, Latest, TextEdit, Waker};
 use serde::Deserialize;
 use crate::auth::{self, Auth, OAuthConfig, Token, TokenStore};
-use crate::catalogue::Catalogue;
+use crate::catalogue::{Album, ArtworkId, Catalogue, CataloguePlaylist, CoverOwner, CoverRequest};
+use crate::covers::{self, CoverCache, CoverOutcome};
 use crate::library::{Library, LibraryRows, SyncReport};
 use crate::state::State;
 use crate::store::Store;
@@ -77,6 +81,19 @@ pub struct App {
     pub sync: Latest<SyncFetch>,
     /// The outcome of the last sync for this account. `None` before the first one.
     pub last_sync: Option<Result<SyncReport, String>>,
+    /// The process's image cache, made in `setup` with the waker. `None` before
+    /// setup, so nothing decodes on the startup path.
+    images: Option<ImageCache>,
+    /// The cover worker. One batch at a time: a batch starts only when none is
+    /// pending, so `Latest` never replaces one.
+    pub cover_fetch: Latest<CoverFetch>,
+    /// Where cover caches live when it is not `covers::cover_root()`. A scene
+    /// or a test sets it, beside `db_override`.
+    pub(crate) cover_root_override: Option<PathBuf>,
+    /// Block on each cover decode as it lands. Only the `signed-in-covers` scene
+    /// sets it, so the decode is done before a headless snap. An interactive
+    /// app relies on the image cache's waker instead.
+    pub(crate) wait_for_decode: bool,
 }
 
 /// The session and the account a worker started under. The result is applied
@@ -97,7 +114,46 @@ struct OpenLibrary {
     /// failed. The next flush writes the row before anything else, so one
     /// transient error does not disable saving for the whole session.
     row_pending: bool,
+    /// This account's covers, or `None` when no cover root can be named.
+    /// Dropping the open library drops every shown image and the cache handle,
+    /// so no cover outlives its account in memory.
+    covers: Option<AccountCovers>,
 }
+
+/// One account's covers. `states` is the only record of what the view wants,
+/// what a batch holds, and what is shown. The view and `drain` both run on the
+/// UI thread and never overlap, so a `RefCell` is enough.
+struct AccountCovers {
+    cache: CoverCache,
+    states: RefCell<BTreeMap<ArtworkId, CoverState>>,
+    /// How many shown images had decoded at the last drain, so a drain can
+    /// tell that a decode landed and the screen must redraw.
+    ready: Cell<usize>,
+}
+
+/// One cover's place in its life. One enum in one map, so a cover cannot be
+/// both queued and shown. Named state, not slot, because **slot** is a user
+/// playlist position.
+enum CoverState {
+    /// The view drew it and no batch took it yet.
+    Wanted(CoverOwner),
+    /// A batch holds it. The owner returns it to `Wanted` when the batch gives
+    /// it no outcome, because the batch reached its fetch cap first.
+    Fetching(CoverOwner),
+    /// `ImageCache::file` returned this handle. The handle keeps the decoded
+    /// pixels alive, because the image cache holds only weak references.
+    Shown(Image),
+    /// No cover for now. A landed sync clears it, so the next frame asks again.
+    Unavailable,
+}
+
+/// A finished cover batch, tagged with its ticket.
+type CoverFetch = (Ticket, Vec<(ArtworkId, CoverOutcome)>);
+
+/// The size a cover decodes at: the 200 pt hero at 2x. The 168 pt cards use
+/// the same handle.
+const COVER_PT: f32 = 200.0;
+const COVER_SCALE: f32 = 2.0;
 
 /// A finished sign-in exchange, tagged with the session it ran under.
 type AuthFlow = (u64, Result<Token, String>);
@@ -124,6 +180,8 @@ impl App {
         self.auth_flow.set_waker(waker.clone());
         self.profile.set_waker(waker.clone());
         self.sync.set_waker(waker.clone());
+        self.cover_fetch.set_waker(waker.clone());
+        self.images = Some(ImageCache::new(waker.clone()));
         self.waker = Some(waker);
         if self.auth == Auth::SignedOut
             && let Some(token) = self.tokens.load()
@@ -228,6 +286,7 @@ impl App {
                     user_id: user_id.to_string(),
                     store,
                     row_pending,
+                    covers: self.account_covers(user_id),
                 });
                 return;
             }
@@ -245,7 +304,117 @@ impl App {
             user_id: user_id.to_string(),
             store,
             row_pending: false,
+            covers: self.account_covers(user_id),
         });
+    }
+
+    /// The covers of a newly opened account, under the override root or the
+    /// XDG cache root. Does no I/O, so it is safe on the startup path.
+    fn account_covers(&self, user_id: &str) -> Option<AccountCovers> {
+        let root = self.cover_root_override.clone().or_else(|| {
+            let home = std::env::var_os("HOME");
+            covers::cover_root(std::env::var_os("XDG_CACHE_HOME").as_deref(), home.as_deref().map(std::path::Path::new))
+        })?;
+        let cache = CoverCache::for_account(&root, user_id)?;
+        Some(AccountCovers { cache, states: RefCell::new(BTreeMap::new()), ready: Cell::new(0) })
+    }
+
+    /// The view-facing covers. With no open library every cover is a gradient.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the screens draw covers from unit 10"))]
+    pub fn covers(&self) -> Covers<'_> {
+        Covers {
+            open: self.library.as_ref().and_then(|open| open.covers.as_ref()),
+            waker: self.waker.as_ref(),
+        }
+    }
+
+    /// Land a cover batch, settle decoded images, then start the next batch.
+    /// Returns true when the screen must redraw.
+    fn drain_covers(&mut self) -> bool {
+        let mut changed = false;
+        let landed = self.cover_fetch.take();
+        let holds = landed.as_ref().is_some_and(|(ticket, _)| self.ticket_holds(ticket));
+        let Some(open) = self.library.as_ref().and_then(|open| open.covers.as_ref()) else {
+            return false;
+        };
+        let mut states = open.states.borrow_mut();
+        if let Some((_, outcomes)) = landed {
+            if holds {
+                changed = true;
+                for (id, outcome) in outcomes {
+                    let state = match (outcome, &self.images) {
+                        (CoverOutcome::Ready(path), Some(images)) => {
+                            let image = images.file(path, COVER_PT, COVER_SCALE);
+                            if self.wait_for_decode {
+                                let _ = image.wait();
+                            }
+                            CoverState::Shown(image)
+                        }
+                        _ => CoverState::Unavailable,
+                    };
+                    states.insert(id, state);
+                }
+            }
+            // A cover the batch gave no outcome waits for the next one. A stale
+            // batch gives none, so its covers go back to wanted as well.
+            for state in states.values_mut() {
+                if let CoverState::Fetching(owner) = state {
+                    *state = CoverState::Wanted(owner.clone());
+                }
+            }
+        }
+        let mut ready = 0;
+        for (id, state) in states.iter_mut() {
+            let CoverState::Shown(image) = state else { continue };
+            if image.error().is_some() {
+                // A file that will not decode is removed, so a later batch
+                // fetches it again rather than serving it as a hit.
+                open.cache.evict(id);
+                *state = CoverState::Unavailable;
+                changed = true;
+            } else if image.is_ready() {
+                ready += 1;
+            }
+        }
+        if open.ready.replace(ready) != ready {
+            changed = true;
+        }
+        let idle = !self.cover_fetch.is_pending() && !self.token_in_use() && self.images.is_some();
+        let (Some(library), Auth::SignedIn { token }) = (&self.library, &self.auth) else {
+            return changed;
+        };
+        if !idle {
+            return changed;
+        }
+        let requests: Vec<CoverRequest> = states
+            .iter_mut()
+            .filter_map(|(id, state)| {
+                let CoverState::Wanted(owner) = state else { return None };
+                let owner = owner.clone();
+                *state = CoverState::Fetching(owner.clone());
+                Some(CoverRequest { artwork: id.clone(), owner })
+            })
+            .collect();
+        drop(states);
+        if requests.is_empty() {
+            return changed;
+        }
+        let ticket = Ticket { session: self.session, user_id: library.user_id.clone() };
+        let cache = open.cache.clone();
+        let token = (!auth::token_expired(token)).then(|| token.access_token.clone());
+        let service = self.service.clone();
+        self.cover_fetch.request(requests, move |requests| {
+            (ticket, covers::resolve(&cache, &*service, token.as_deref(), requests))
+        });
+        changed
+    }
+
+    /// Clear every unavailable cover after a sync lands, so the next frame asks
+    /// for it again. A cover never retries on a timer.
+    fn rearm_covers(&self) {
+        if let Some(open) = self.library.as_ref().and_then(|open| open.covers.as_ref()) {
+            open.states.borrow_mut().retain(|_, state| !matches!(state, CoverState::Unavailable));
+        }
     }
 
     /// Write the library when it differs from what is on disk. This runs at the
@@ -563,6 +732,7 @@ impl App {
                 Ok((token, rows)) => {
                     self.keep_token(token);
                     self.last_sync = Some(Ok(self.core.lib.sync(&mut self.catalogue, rows)));
+                    self.rearm_covers();
                 }
                 Err(e @ ServiceError::InvalidGrant(_)) => self.end_dead_session(e),
                 Err(e) => {
@@ -571,6 +741,7 @@ impl App {
                 }
             }
         }
+        changed |= self.drain_covers();
         self.flush_library();
         changed
     }
@@ -762,7 +933,77 @@ impl Default for App {
             profile: Latest::default(),
             sync: Latest::default(),
             last_sync: None,
+            images: None,
+            cover_fetch: Latest::default(),
+            cover_root_override: None,
+            wait_for_decode: false,
         }
+    }
+}
+
+/// A borrow of the open account's covers for one frame.
+#[cfg_attr(not(test), expect(dead_code, reason = "the screens draw covers from unit 10"))]
+#[derive(Clone, Copy)]
+pub struct Covers<'a> {
+    open: Option<&'a AccountCovers>,
+    waker: Option<&'a Waker>,
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "the screens draw covers from unit 10"))]
+impl Covers<'_> {
+    /// The cover of an album. A new artwork id is recorded as wanted, and the
+    /// loop is woken once so `drain` starts a batch. A known id costs one map
+    /// lookup.
+    pub fn album(self, album: &Album) -> Cover {
+        self.cover(album.cover_request(), album.id.as_str())
+    }
+
+    #[expect(dead_code, reason = "the screens draw covers from unit 10")]
+    pub fn playlist(self, playlist: &CataloguePlaylist) -> Cover {
+        self.cover(playlist.cover_request(), playlist.id.as_str())
+    }
+
+    fn cover(self, request: Option<CoverRequest>, seed: &str) -> Cover {
+        let image = match (self.open, request) {
+            (Some(open), Some(request)) => {
+                let mut states = open.states.borrow_mut();
+                match states.get(&request.artwork) {
+                    Some(CoverState::Shown(image)) => Some(image.clone()),
+                    Some(_) => None,
+                    None => {
+                        states.insert(request.artwork, CoverState::Wanted(request.owner));
+                        if let Some(waker) = self.waker {
+                            waker();
+                        }
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        Cover { image, seed: seed.to_string() }
+    }
+}
+
+/// What a screen draws: a decoded image, or the gradient its seed picks.
+#[cfg_attr(not(test), expect(dead_code, reason = "the screens draw covers from unit 10"))]
+pub struct Cover {
+    image: Option<Image>,
+    #[cfg_attr(test, expect(dead_code, reason = "the screens draw covers from unit 10"))]
+    seed: String,
+}
+
+impl Cover {
+    /// The image only when it decoded with no error.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the screens draw covers from unit 10"))]
+    pub fn ready(&self) -> Option<&Image> {
+        self.image.as_ref().filter(|image| image.is_ready() && image.error().is_none())
+    }
+
+    /// The text the placeholder gradient is picked from: the owner's id.
+    #[expect(dead_code, reason = "the screens draw covers from unit 10")]
+    pub fn seed(&self) -> &str {
+        &self.seed
     }
 }
 
@@ -1128,6 +1369,11 @@ mod tests {
             app.db_override.as_ref(),
             Some(&db),
             "the scene ignored the database path it was given"
+        );
+        assert_eq!(
+            app.cover_root_override.as_deref(),
+            Some(dir.join("covers").as_path()),
+            "the scene's covers would land in the user's cache"
         );
         drop(app);
         std::fs::remove_file(&db).ok();
@@ -2072,6 +2318,225 @@ mod tests {
             assert_eq!(app.core.lib.is_liked(&track(0)), live, "live mode is {live}, and the sync disagreed");
             assert_eq!(app.last_sync.is_some(), live);
         }
+    }
+
+    /// An app signed in to `user` on the file at `path`, with covers under `root`.
+    /// Its catalogue holds `n` albums with covers `art-0` and up, and its fake
+    /// service answers each with the magenta PNG.
+    fn covered_app(user: &str, path: &std::path::Path, root: &std::path::Path, n: usize) -> (App, Arc<tidal::FakeService>) {
+        use crate::catalogue::{AlbumRow, CatalogueRows};
+        let mut app = app_without_a_session();
+        app.setup(Arc::new(|| ()));
+        app.cover_root_override = Some(root.to_path_buf());
+        let service = Arc::new(tidal::FakeService {
+            covers: (0..n).map(|i| (format!("art-{i}"), Ok(crate::covers::tests::magenta()))).collect(),
+            ..tidal::FakeService::default()
+        });
+        app.service = service.clone();
+        app.catalogue.absorb(CatalogueRows {
+            albums: (0..n)
+                .map(|i| AlbumRow {
+                    id: format!("album-{i}"),
+                    title: format!("Album {i}"),
+                    artist: "seed-artist-0".into(),
+                    cover: format!("art-{i}"),
+                })
+                .collect(),
+            ..CatalogueRows::default()
+        });
+        app.open_library(user, path);
+        app.auth = Auth::SignedIn { token: fake_token() };
+        (app, service)
+    }
+
+    /// Draw every album cover the catalogue names, the way a screen does.
+    fn want_covers(app: &App) {
+        for album in app.catalogue.albums().filter(|a| a.cover.is_some()) {
+            app.covers().album(album);
+        }
+    }
+
+    fn shown(app: &App) -> usize {
+        app.library
+            .as_ref()
+            .and_then(|open| open.covers.as_ref())
+            .map_or(0, |c| c.states.borrow().values().filter(|s| matches!(s, CoverState::Shown(_))).count())
+    }
+
+    fn cover_calls(service: &tidal::FakeService) -> usize {
+        service.cover_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// More covers than one batch fetches all arrive. A cover past the fetch
+    /// cap waits for the next batch instead of being dropped.
+    #[test]
+    fn every_wanted_cover_is_fetched_across_batches() {
+        let dir = TempDir::new("covers-batches");
+        let wanted = crate::covers::MAX_FETCHES + 6;
+        let (mut app, service) = covered_app("173210380", &dir.path(), &dir.0.join("covers"), wanted);
+        want_covers(&app);
+        drain_until(&mut app, |a| shown(a) == wanted);
+
+        assert_eq!(shown(&app), wanted, "a wanted cover never arrived");
+        assert_eq!(cover_calls(&service), wanted, "a cover was fetched twice or not at all");
+    }
+
+    /// A service whose cover call waits for a release, so a test can act while
+    /// a batch is in flight.
+    struct Gated {
+        inner: Arc<tidal::FakeService>,
+        gate: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl MusicService for Gated {
+        fn current_user(&self, token: &str) -> Result<User, ServiceError> {
+            self.inner.current_user(token)
+        }
+        fn library(&self, token: &str, user: &str) -> Result<LibraryRows, ServiceError> {
+            self.inner.library(token, user)
+        }
+        fn cover(&self, token: &str, cover: &crate::catalogue::CoverRequest) -> Result<Vec<u8>, ServiceError> {
+            let _ = self.gate.lock().unwrap().recv();
+            self.inner.cover(token, cover)
+        }
+    }
+
+    fn gate(app: &mut App, inner: Arc<tidal::FakeService>) -> std::sync::mpsc::Sender<()> {
+        let (release, wait) = std::sync::mpsc::channel();
+        app.service = Arc::new(Gated { inner, gate: std::sync::Mutex::new(wait) });
+        release
+    }
+
+    /// A cover the view asks for while a batch runs is fetched by the next one.
+    #[test]
+    fn a_cover_wanted_during_a_batch_is_fetched_next() {
+        let dir = TempDir::new("covers-during");
+        let (mut app, service) = covered_app("173210380", &dir.path(), &dir.0.join("covers"), 2);
+        let release = gate(&mut app, service.clone());
+        let first = app.catalogue.album(&app.catalogue.album_id("album-0").unwrap()).unwrap().clone();
+        let second = app.catalogue.album(&app.catalogue.album_id("album-1").unwrap()).unwrap().clone();
+        app.covers().album(&first);
+        app.drain();
+        assert!(app.cover_fetch.is_pending(), "the fixture started no batch");
+        app.covers().album(&second);
+        app.drain();
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        drain_until(&mut app, |a| shown(a) == 2);
+        assert_eq!(shown(&app), 2, "the cover wanted during a batch never arrived");
+    }
+
+    /// A batch started for one account and landing after another opened is
+    /// dropped. Account B shows none of account A's covers, and B's directory
+    /// holds none of A's files.
+    #[test]
+    fn a_cover_batch_from_another_account_is_dropped() {
+        let dir = TempDir::new("covers-other-account");
+        let root = dir.0.join("covers");
+        let (mut app, service) = covered_app("account-a", &dir.path(), &root, 1);
+        let release = gate(&mut app, service.clone());
+        want_covers(&app);
+        app.drain();
+        assert!(app.cover_fetch.is_pending(), "the fixture started no batch");
+        let session = app.session;
+        app.open_library("account-b", &dir.path());
+        assert_eq!(app.session, session, "the fixture bumped the session, so it tests the wrong guard");
+        release.send(()).unwrap();
+        drain_until(&mut app, |a| !a.cover_fetch.is_pending());
+        app.drain();
+
+        assert_eq!(shown(&app), 0, "account A's cover landed in account B");
+        let b_dir = root.join("account-b");
+        assert!(std::fs::read_dir(&b_dir).map_or(true, |mut d| d.next().is_none()), "account B's cache holds a file");
+    }
+
+    /// Sign-out drops every shown cover with the library that owned it.
+    #[test]
+    fn sign_out_forgets_the_shown_covers() {
+        let dir = TempDir::new("covers-sign-out");
+        let (mut app, _) = covered_app("173210380", &dir.path(), &dir.0.join("covers"), 1);
+        want_covers(&app);
+        drain_until(&mut app, |a| shown(a) == 1);
+        assert_eq!(shown(&app), 1, "the fixture showed no cover");
+
+        app.sign_out();
+        let album = app.catalogue.album(&app.catalogue.album_id("album-0").unwrap()).unwrap().clone();
+        assert!(app.covers().album(&album).ready().is_none(), "a cover outlived sign-out");
+        app.open_library("173210380", &dir.path());
+        assert_eq!(shown(&app), 0, "the next session inherited the shown covers");
+    }
+
+    /// A second run over the same cover root shows every cover with no fetch.
+    #[test]
+    fn a_cover_restart_fetches_nothing() {
+        let dir = TempDir::new("covers-restart");
+        let root = dir.0.join("covers");
+        let (mut first, _) = covered_app("173210380", &dir.path(), &root, 3);
+        want_covers(&first);
+        drain_until(&mut first, |a| shown(a) == 3);
+        assert_eq!(shown(&first), 3);
+        drop(first);
+
+        let (mut second, service) = covered_app("173210380", &dir.path(), &root, 3);
+        want_covers(&second);
+        drain_until(&mut second, |a| shown(a) == 3);
+        assert_eq!(shown(&second), 3, "a restart lost a cover");
+        assert_eq!(cover_calls(&service), 0, "a restart fetched a cover it had on disk");
+    }
+
+    /// A cover batch does not start while the profile fetch or a sync is
+    /// pending, the same guard `App::sync` has.
+    #[test]
+    fn a_cover_batch_waits_for_the_profile_fetch() {
+        let dir = TempDir::new("covers-wait-profile");
+        let (mut app, _) = covered_app("173210380", &dir.path(), &dir.0.join("covers"), 1);
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let session = app.session;
+        app.profile.request((), move |_| {
+            let _ = wait.recv();
+            (session, Err(ServiceError::Http("offline".to_string())))
+        });
+        want_covers(&app);
+        app.drain();
+        assert!(!app.cover_fetch.is_pending(), "a cover batch started while the profile fetch was pending");
+
+        release.send(()).unwrap();
+        drain_until(&mut app, |a| shown(a) == 1);
+        assert_eq!(shown(&app), 1, "the cover batch did not start once the profile landed");
+    }
+
+    /// Restoring a session in `setup` does no cover work: no fetch, no batch,
+    /// and no cover directory, until a screen draws a cover.
+    #[test]
+    fn no_cover_work_runs_at_setup() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let dir = TempDir::new("covers-setup");
+        let root = dir.0.join("covers");
+        let service = Arc::new(tidal::FakeService::default());
+        let mut app = app_without_a_session();
+        app.service = service.clone();
+        app.db_override = Some(dir.path());
+        app.cover_root_override = Some(root.clone());
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"uid":173210380,"exp":4102444800}"#);
+        app.tokens.save(&Token { access_token: format!("h.{payload}.sig"), refresh_token: "r".into(), expires_in: 0 });
+
+        app.setup(Arc::new(|| ()));
+        assert!(app.library.is_some(), "the fixture restored no session");
+        app.drain();
+
+        assert!(!app.cover_fetch.is_pending(), "setup started a cover batch");
+        assert_eq!(cover_calls(&service), 0);
+        assert!(!root.exists(), "setup touched the cover root");
+    }
+
+    /// The bytes a fetch puts decode through Rune to the fixture's pixels. The
+    /// app and the cover scene show covers through this same call.
+    #[test]
+    fn a_ready_cover_decodes_to_its_pixels() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = CoverCache::for_account(root.path(), "173210380").unwrap();
+        let path = cache.put(&crate::covers::tests::artwork("art-0"), &crate::covers::tests::magenta()).unwrap();
+        let image = ImageCache::new(Arc::new(|| ())).file(&path, COVER_PT, COVER_SCALE);
+        assert_eq!(image.wait(), Ok([16, 16]));
     }
 
     /// The fake token carries no `uid` claim, so the headless build never

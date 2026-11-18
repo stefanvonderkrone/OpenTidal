@@ -83,6 +83,11 @@ fn signed_in_stored_scene(a: &mut App) {
     if let Some(dir) = db.parent() {
         std::fs::create_dir_all(dir).ok();
     }
+    // The covers this scene fetches go beside its database, never into the
+    // user's cache, unless a test already named a root.
+    if a.cover_root_override.is_none() {
+        a.cover_root_override = db.parent().map(|dir| dir.join("covers"));
+    }
     a.db_override = Some(db);
     // A driven scene must never write a fabricated token into the real keychain. The
     // assignment above is the fix; this refuses the drive if it ever stops working,

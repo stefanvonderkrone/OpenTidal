@@ -54,16 +54,13 @@ pub trait MusicService: Send + Sync {
     fn library(&self, token: &str, user: &str) -> Result<LibraryRows, ServiceError>;
     /// The bytes of one cover, near [`COVER_PX`] wide. Unchecked: the cover
     /// cache checks them before a put.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
     fn cover(&self, token: &str, cover: &CoverRequest) -> Result<Vec<u8>, ServiceError>;
 }
 
 /// The width a cover fetch asks for: 168 pt cards and 200 pt heroes at 2x.
-#[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
 pub const COVER_PX: u64 = 640;
 
 /// The largest image body a cover fetch accepts.
-#[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
 pub const MAX_COVER_BYTES: u64 = 4 * 1024 * 1024;
 
 /// A fixed, deterministic service for tests and headless drives.
@@ -71,10 +68,8 @@ pub struct FakeService {
     pub user: User,
     /// What a sync reads. The default is an empty library.
     pub library: Result<LibraryRows, ServiceError>,
-    #[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
     /// What `cover` answers, by artwork id. A missing id is `Http("404")`.
     pub covers: BTreeMap<String, Result<Vec<u8>, ServiceError>>,
-    #[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
     /// How many times `cover` ran, so a test proves a hit made no fetch.
     pub cover_calls: AtomicUsize,
 }
@@ -149,7 +144,6 @@ impl HttpService {
     /// GET an image with no `Authorization` header, a 15 s timeout, and a body
     /// cap of [`MAX_COVER_BYTES`]. It takes no token, so the token cannot reach
     /// the image host.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
     fn get_image(&self, url: &reqwest::Url) -> Result<Vec<u8>, ServiceError> {
         use std::io::Read;
         let resp = self
@@ -621,7 +615,6 @@ fn fetch_library(get: &mut PageSource, prefix: &str, user: &str) -> Result<Libra
 
 /// The `coverArt` relationship read of a cover's owner, with the artwork
 /// included. These are the two pinned third-party endpoints in the manifest.
-#[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
 fn cover_path(owner: &CoverOwner) -> String {
     match owner {
         CoverOwner::Album(id) => format!("/albums/{}/relationships/coverArt?include=coverArt", id.as_str()),
@@ -636,7 +629,6 @@ fn cover_path(owner: &CoverOwner) -> String {
 /// The response shape is synthetic: the included artwork is matched by id
 /// only, because its type is `coverArts` in the library fixtures and
 /// `artworks` in the spec, and neither is proven live.
-#[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
 fn fetch_cover(
     get_doc: &mut PageSource,
     get_image: &mut dyn FnMut(&reqwest::Url) -> Result<Vec<u8>, ServiceError>,
@@ -659,7 +651,6 @@ fn fetch_cover(
 
 /// The href of the smallest file at least [`COVER_PX`] wide, else the widest.
 /// A file with no href or no width is skipped.
-#[cfg_attr(not(test), expect(dead_code, reason = "the cover worker calls it from unit 9"))]
 fn pick_file(attributes: Option<&Value>) -> Option<String> {
     let files = attributes?.get("files")?.as_array()?;
     let sized = files.iter().filter_map(|f| {

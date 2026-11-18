@@ -416,12 +416,16 @@ fn upsert<I: Ord + Clone, T>(
 /// this only stops a damaged row from becoming a key.
 const MAX_ID_LEN: usize = 64;
 
-/// The text of a new id, when it has the shape of one: ASCII letters, digits and
-/// hyphens, from one to 64 bytes.
+/// Whether text has the shape of an id: ASCII letters, digits and hyphens, from
+/// one to 64 bytes. Such text is also a safe single path component, which the
+/// cover cache relies on for user ids and artwork ids.
+pub fn is_id_shaped(raw: &str) -> bool {
+    (1..=MAX_ID_LEN).contains(&raw.len()) && raw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// The text of a new id, when it has the shape of one.
 fn mint(raw: &str) -> Option<Arc<str>> {
-    let shaped = (1..=MAX_ID_LEN).contains(&raw.len())
-        && raw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
-    shaped.then(|| Arc::from(raw))
+    is_id_shaped(raw).then(|| Arc::from(raw))
 }
 
 /// Seconds from an ISO 8601 duration such as `PT3M26S`, the shape Tidal sends.

@@ -6,6 +6,7 @@ mod app;
 mod atomic;
 mod auth;
 mod catalogue;
+mod covers;
 mod library;
 mod screens;
 mod state;

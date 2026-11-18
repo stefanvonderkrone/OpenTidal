@@ -250,7 +250,7 @@ fn all_artists_grid(cat: &Catalogue, t: tok::Theme) -> El {
 /// Tidal playlists of every account that synced in this run or wrote to this
 /// file, so listing them all would show one account's private names to another.
 pub fn home_playlists(cat: &Catalogue) -> impl Iterator<Item = &CataloguePlaylist> {
-    cat.playlists().filter(|p| p.id.is_seed())
+    cat.seed_playlists()
 }
 
 pub fn home(cat: &Catalogue, t: tok::Theme) -> El {

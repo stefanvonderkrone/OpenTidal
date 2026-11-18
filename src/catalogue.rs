@@ -248,6 +248,14 @@ impl Catalogue {
     pub fn tracks(&self) -> impl Iterator<Item = &Track> {
         self.tracks.iter()
     }
+    /// Only the seed playlists. A Tidal playlist belongs to one account, so a
+    /// screen must never list every catalogue playlist. Tests use `playlists`
+    /// below to inspect the whole catalogue.
+    pub fn seed_playlists(&self) -> impl Iterator<Item = &CataloguePlaylist> {
+        self.playlists.iter().filter(|p| p.id.is_seed())
+    }
+
+    #[cfg(test)]
     pub fn playlists(&self) -> impl Iterator<Item = &CataloguePlaylist> {
         self.playlists.iter()
     }
@@ -520,6 +528,25 @@ mod tests {
             assert!(p.tracks.iter().all(|t| cat.track(t).is_some()));
         }
         assert_eq!(cat.track(&cat.track_id("seed-track-0").unwrap()).unwrap().duration, 466);
+    }
+
+    /// A Tidal playlist in the catalogue never appears on the seed shelf, so one
+    /// account's playlist names cannot reach another account's Home.
+    #[test]
+    fn seed_playlists_exclude_tidal_playlists() {
+        let mut cat = Catalogue::seed();
+        cat.absorb(CatalogueRows {
+            playlists: vec![PlaylistRow {
+                id: "private-playlist".into(),
+                name: "Private".into(),
+                description: String::new(),
+                tracks: Vec::new(),
+            }],
+            ..Default::default()
+        });
+        assert_eq!(cat.playlists().count(), 4);
+        assert_eq!(cat.seed_playlists().count(), 3);
+        assert!(cat.seed_playlists().all(|p| p.id.is_seed()));
     }
 
     /// A row whose parent the catalogue lacks is dropped and counted, so no entry

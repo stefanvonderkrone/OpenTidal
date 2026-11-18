@@ -8,6 +8,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -43,6 +45,8 @@ pub enum ServiceError {
     Decode(String),
     /// A paged read hit the page cap or a cursor it had already followed.
     Paging(String),
+    /// The service kept answering `429` after every retry the pacer allows.
+    RateLimited(String),
 }
 
 /// The read-only music port. Every method takes the access token, so the fake
@@ -101,16 +105,113 @@ impl MusicService for FakeService {
     }
 }
 
+/// The time source the pacer waits on. Tests pass a fake, so no test sleeps.
+trait Clock: Send + Sync {
+    fn now(&self) -> Instant;
+    fn sleep(&self, duration: Duration);
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+/// The least time between two requests. Tidal answered `429` on the tenth
+/// unpaced page request of a live sync.
+const MIN_GAP: Duration = Duration::from_millis(300);
+/// The wait after the first `429` that names no `Retry-After`. It doubles on
+/// each retry.
+const FIRST_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_RETRIES: u32 = 4;
+/// The most one request waits on `429` answers before it gives up.
+const MAX_WAIT: Duration = Duration::from_secs(60);
+
+/// Spaces every request of one service by [`MIN_GAP`] and retries a `429`.
+/// The service and the cover worker share it, so a `429` on one thread holds
+/// back the other as well.
+struct Pacer {
+    clock: Arc<dyn Clock>,
+    /// The earliest time the next request may start.
+    next: Mutex<Option<Instant>>,
+}
+
+impl Pacer {
+    /// Wait for the next free slot, then take it.
+    fn wait_turn(&self) {
+        let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(at) = *next {
+            let now = self.clock.now();
+            if at > now {
+                self.clock.sleep(at - now);
+            }
+        }
+        *next = Some(self.clock.now() + MIN_GAP);
+    }
+
+    /// Hold every request back until `delay` has passed.
+    fn back_off(&self, delay: Duration) {
+        let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
+        let until = self.clock.now() + delay;
+        *next = Some(next.map_or(until, |at| at.max(until)));
+    }
+
+    /// Send through `attempt`, retrying a `429` after its `Retry-After`, or
+    /// after a doubling backoff when it names none. `what` names the request in
+    /// the error.
+    fn send(
+        &self,
+        what: &str,
+        mut attempt: impl FnMut() -> Result<reqwest::blocking::Response, ServiceError>,
+    ) -> Result<reqwest::blocking::Response, ServiceError> {
+        let mut retries = 0;
+        let mut waited = Duration::ZERO;
+        let mut backoff = FIRST_BACKOFF;
+        loop {
+            self.wait_turn();
+            let resp = attempt()?;
+            if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Ok(resp);
+            }
+            let delay = retry_after(resp.headers()).unwrap_or(backoff);
+            if retries == MAX_RETRIES || waited + delay > MAX_WAIT {
+                return Err(ServiceError::RateLimited(format!("429 Too Many Requests for {what} after {retries} retries")));
+            }
+            retries += 1;
+            waited += delay;
+            backoff *= 2;
+            self.back_off(delay);
+        }
+    }
+}
+
+/// A `Retry-After` in seconds. The HTTP-date form is read as absent, so the
+/// backoff applies.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    value.trim().parse().ok().map(Duration::from_secs)
+}
+
 /// The real client over the Tidal JSON:API (`https://openapi.tidal.com/v2`).
 pub struct HttpService {
     client: reqwest::blocking::Client,
     base: String,
     /// The path of `base`, such as `/v2`. A `next` link starts with it.
     prefix: String,
+    pacer: Pacer,
 }
 
 impl HttpService {
     pub fn new(base: &str) -> Self {
+        Self::with_clock(base, Arc::new(SystemClock))
+    }
+
+    fn with_clock(base: &str, clock: Arc<dyn Clock>) -> Self {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -119,18 +220,19 @@ impl HttpService {
         let prefix = reqwest::Url::parse(&base)
             .map(|url| url.path().trim_end_matches('/').to_string())
             .unwrap_or_default();
-        HttpService { client, base, prefix }
+        HttpService { client, base, prefix, pacer: Pacer { clock, next: Mutex::new(None) } }
     }
 
     fn get_doc(&self, token: &str, path: &str) -> Result<Document, ServiceError> {
         let url = format!("{}{}", self.base, path);
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(token)
-            .header("accept", "application/vnd.api+json")
-            .send()
-            .map_err(|e| ServiceError::Http(e.to_string()))?;
+        let resp = self.pacer.send(path, || {
+            self.client
+                .get(&url)
+                .bearer_auth(token)
+                .header("accept", "application/vnd.api+json")
+                .send()
+                .map_err(|e| ServiceError::Http(e.to_string()))
+        })?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(ServiceError::Unauthorized);
@@ -146,12 +248,13 @@ impl HttpService {
     /// the image host.
     fn get_image(&self, url: &reqwest::Url) -> Result<Vec<u8>, ServiceError> {
         use std::io::Read;
-        let resp = self
-            .client
-            .get(url.clone())
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .map_err(|e| ServiceError::Http(e.to_string()))?;
+        let resp = self.pacer.send("a cover image", || {
+            self.client
+                .get(url.clone())
+                .timeout(std::time::Duration::from_secs(15))
+                .send()
+                .map_err(|e| ServiceError::Http(e.to_string()))
+        })?;
         let status = resp.status();
         if !status.is_success() {
             return Err(ServiceError::Http(format!("{status} for a cover image")));
@@ -945,7 +1048,7 @@ mod tests {
             }
             seen
         });
-        let svc = HttpService::new(&format!("http://127.0.0.1:{}/v2", addr.port()));
+        let svc = HttpService::with_clock(&format!("http://127.0.0.1:{}/v2", addr.port()), FakeClock::new());
         let rows = svc.library("tok", "173210380").unwrap();
         let seen = server.join().unwrap();
         assert_eq!(rows.liked, ["75413016", "12345678", "98765432"]);
@@ -1087,7 +1190,7 @@ mod tests {
             }
             authorized
         });
-        let svc = HttpService::new(&format!("http://127.0.0.1:{}/v2", addr.port()));
+        let svc = HttpService::with_clock(&format!("http://127.0.0.1:{}/v2", addr.port()), FakeClock::new());
         let url = reqwest::Url::parse(&format!("http://127.0.0.1:{}/image.jpg", addr.port())).unwrap();
         assert_eq!(svc.get_image(&url), Ok(vec![0xAB; 16]));
         assert!(matches!(svc.get_image(&url), Err(ServiceError::Http(_))), "an over-cap body was accepted");
@@ -1262,5 +1365,141 @@ mod tests {
         let token = format!("h.{payload}.sig");
         assert_eq!(svc.current_user(&token).unwrap().name, "server-name");
         server.join().unwrap();
+    }
+
+    /// A clock that moves only when told to, and records every sleep.
+    struct FakeClock {
+        start: Instant,
+        elapsed: Mutex<Duration>,
+        sleeps: Mutex<Vec<Duration>>,
+    }
+
+    impl FakeClock {
+        fn new() -> Arc<Self> {
+            Arc::new(FakeClock { start: Instant::now(), elapsed: Mutex::default(), sleeps: Mutex::default() })
+        }
+        fn advance(&self, by: Duration) {
+            *self.elapsed.lock().unwrap() += by;
+        }
+        fn sleeps(&self) -> Vec<Duration> {
+            self.sleeps.lock().unwrap().clone()
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now(&self) -> Instant {
+            self.start + *self.elapsed.lock().unwrap()
+        }
+        fn sleep(&self, duration: Duration) {
+            self.advance(duration);
+            self.sleeps.lock().unwrap().push(duration);
+        }
+    }
+
+    /// A loopback server that answers `count` requests, one per connection,
+    /// with `answer(index, path)`, and returns the paths it was asked for.
+    fn serve(
+        count: usize,
+        answer: impl Fn(usize, &str) -> String + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = std::thread::spawn(move || {
+            let mut asked = Vec::new();
+            for index in 0..count {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let n = conn.read(&mut buf).unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap().to_owned();
+                let _ = conn.write_all(answer(index, &path).as_bytes());
+                asked.push(path);
+            }
+            asked
+        });
+        (base, server)
+    }
+
+    fn reply(status: &str, headers: &str, body: &str) -> String {
+        format!("HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+    }
+
+    fn too_many() -> String {
+        reply("429 Too Many Requests", "", "")
+    }
+
+    /// A `429` with no `Retry-After` waits one second, then the same page is
+    /// asked again and the whole library lands.
+    #[test]
+    fn a_rate_limited_page_is_retried_and_lands() {
+        let (base, server) = serve(9, |index, path| {
+            if index == 0 {
+                return too_many();
+            }
+            let file = fixture_path(path.strip_prefix("/v2").unwrap());
+            let body = std::fs::read_to_string(format!("{}/tests/fixtures/tidal/{file}", env!("CARGO_MANIFEST_DIR")))
+                .unwrap();
+            reply("200 OK", "Content-Type: application/vnd.api+json\r\n", &body)
+        });
+        let clock = FakeClock::new();
+        let svc = HttpService::with_clock(&format!("{base}/v2"), clock.clone());
+        let rows = svc.library("tok", "173210380");
+        assert_eq!(rows.unwrap().liked, ["75413016", "12345678", "98765432"]);
+        let asked = server.join().unwrap();
+        assert_eq!(asked[0], asked[1], "the limited page was not asked again");
+        assert_eq!(clock.sleeps()[0], Duration::from_secs(1), "no backoff before the retry");
+    }
+
+    /// A page that is limited every time gives up after four retries with a
+    /// doubling backoff, and the read returns `RateLimited` and no rows.
+    #[test]
+    fn a_page_limited_every_time_fails_after_the_cap() {
+        let (base, server) = serve(5, |_, _| too_many());
+        let clock = FakeClock::new();
+        let svc = HttpService::with_clock(&format!("{base}/v2"), clock.clone());
+        let rows = svc.library("tok", "173210380");
+        assert!(matches!(rows, Err(ServiceError::RateLimited(_))), "a limited read gave {rows:?}");
+        assert_eq!(server.join().unwrap().len(), 5, "the read did not stop after four retries");
+        let secs: Vec<u64> = clock.sleeps().iter().map(Duration::as_secs).collect();
+        assert_eq!(secs, [1, 2, 4, 8]);
+    }
+
+    /// A `Retry-After` header sets the wait before the retry.
+    #[test]
+    fn a_retry_after_header_sets_the_wait() {
+        let (base, server) = serve(2, |index, _| match index {
+            0 => reply("429 Too Many Requests", "Retry-After: 7\r\n", ""),
+            _ => reply("200 OK", "Content-Type: application/vnd.api+json\r\n", r#"{"data":[]}"#),
+        });
+        let clock = FakeClock::new();
+        let svc = HttpService::with_clock(&format!("{base}/v2"), clock.clone());
+        assert!(svc.get_doc("tok", "/users/me").is_ok());
+        server.join().unwrap();
+        assert_eq!(clock.sleeps(), [Duration::from_secs(7)]);
+    }
+
+    /// Requests start at least the minimum gap apart, counting the time the
+    /// previous request took. Cover images go through the same pacer.
+    #[test]
+    fn the_pacer_keeps_its_minimum_gap() {
+        let clock = FakeClock::new();
+        let server_clock = clock.clone();
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let seen = started.clone();
+        let (base, server) = serve(3, move |_, _| {
+            seen.lock().unwrap().push(server_clock.now());
+            server_clock.advance(Duration::from_millis(100));
+            reply("200 OK", "", "img")
+        });
+        let svc = HttpService::with_clock(&format!("{base}/v2"), clock.clone());
+        let url = reqwest::Url::parse(&format!("{base}/image.jpg")).unwrap();
+        for _ in 0..3 {
+            assert_eq!(svc.get_image(&url), Ok(b"img".to_vec()));
+        }
+        server.join().unwrap();
+        let started = started.lock().unwrap();
+        let gaps: Vec<Duration> = started.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(gaps, [MIN_GAP, MIN_GAP], "requests went closer than the minimum gap");
     }
 }

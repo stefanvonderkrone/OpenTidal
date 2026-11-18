@@ -341,6 +341,11 @@ impl App {
             if holds {
                 changed = true;
                 for (id, outcome) in outcomes {
+                    // A deferred cover stays `Fetching`, and the sweep below
+                    // returns it to `Wanted` with the owner it holds.
+                    if outcome == CoverOutcome::Deferred {
+                        continue;
+                    }
                     let state = match (outcome, &self.images) {
                         (CoverOutcome::Ready(path), Some(images)) => {
                             let image = images.file(path, COVER_PT, COVER_SCALE);
@@ -804,6 +809,7 @@ fn sync_error_text(error: &ServiceError) -> String {
         ServiceError::Paging(_) => "Your Tidal library is too large to read in one sync.",
         ServiceError::Decode(_) => "Tidal sent something this version cannot read.",
         ServiceError::Http(_) => "Could not reach Tidal.",
+        ServiceError::RateLimited(_) => "Tidal is limiting requests.",
     };
     format!("{reason} Nothing changed.")
 }
@@ -2152,7 +2158,7 @@ mod tests {
         let path = dir.path();
         let mut app = signed_in("account-a", &path, LibraryRows::default());
         app.service = Arc::new(tidal::FakeService {
-            library: Err(ServiceError::Http("429 Too Many Requests".to_string())),
+            library: Err(ServiceError::RateLimited("429 Too Many Requests".to_string())),
             ..tidal::FakeService::default()
         });
         app.core.lib.toggle_like(track(4));
@@ -2168,7 +2174,7 @@ mod tests {
         let Some(Err(message)) = &app.last_sync else {
             panic!("a failed sync reported {:?}", app.last_sync);
         };
-        assert!(message.ends_with("Nothing changed."), "the message does not say nothing changed: {message}");
+        assert_eq!(message, "Tidal is limiting requests. Nothing changed.");
     }
 
     /// A sync that lands is on disk after the next frame, with the playlist name
@@ -2371,6 +2377,22 @@ mod tests {
 
         assert_eq!(shown(&app), wanted, "a wanted cover never arrived");
         assert_eq!(cover_calls(&service), wanted, "a cover was fetched twice or not at all");
+    }
+
+    /// A rate-limited cover goes back to wanted, so the next batch asks for it
+    /// again. An unavailable cover would wait for the next sync instead.
+    #[test]
+    fn a_rate_limited_cover_is_asked_for_again() {
+        let dir = TempDir::new("covers-limited");
+        let (mut app, _) = covered_app("173210380", &dir.path(), &dir.0.join("covers"), 1);
+        let service = Arc::new(tidal::FakeService {
+            covers: BTreeMap::from([("art-0".to_string(), Err(ServiceError::RateLimited("429".to_string())))]),
+            ..tidal::FakeService::default()
+        });
+        app.service = service.clone();
+        want_covers(&app);
+        drain_until(&mut app, |_| cover_calls(&service) >= 2);
+        assert!(cover_calls(&service) >= 2, "a rate-limited cover was not asked for again");
     }
 
     /// A service whose cover call waits for a release, so a test can act while

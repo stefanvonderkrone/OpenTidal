@@ -145,6 +145,8 @@ pub enum CoverOutcome {
     /// the put failed, or there is no usable token. The app asks again after
     /// the next sync lands.
     Unavailable,
+    /// Tidal is limiting requests. The app asks again in the next batch.
+    Deferred,
 }
 
 /// The cover worker body. It first sweeps leftover temporary files. Then, for
@@ -187,11 +189,15 @@ pub fn resolve(
                 }
             },
             Err(error) => {
-                if error == ServiceError::Unauthorized {
-                    rejected = true;
-                }
                 eprintln!("opentidal: cannot fetch cover {}: {error:?}", request.artwork.as_str());
-                CoverOutcome::Unavailable
+                match error {
+                    ServiceError::RateLimited(_) => CoverOutcome::Deferred,
+                    ServiceError::Unauthorized => {
+                        rejected = true;
+                        CoverOutcome::Unavailable
+                    }
+                    _ => CoverOutcome::Unavailable,
+                }
             }
         };
         outcomes.push((request.artwork, outcome));
@@ -468,6 +474,26 @@ pub(crate) mod tests {
         assert_eq!(outcomes[0], (artwork("first"), CoverOutcome::Unavailable));
         assert_eq!(outcomes[1], (artwork("hit"), CoverOutcome::Ready(cache.path(&artwork("hit")))));
         assert_eq!(outcomes[2], (artwork("second"), CoverOutcome::Unavailable));
+    }
+
+    /// A rate-limited cover is deferred, not unavailable, and the batch keeps
+    /// fetching the rest with the same token.
+    #[test]
+    fn a_rate_limited_cover_is_deferred() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(root.path());
+        let svc = service(&[
+            ("limited", Err(ServiceError::RateLimited("429".to_string()))),
+            ("next", Ok(magenta())),
+        ]);
+        let outcomes = resolve(&cache, &svc, Some("tok"), vec![request("limited"), request("next")]);
+        assert_eq!(
+            outcomes,
+            [
+                (artwork("limited"), CoverOutcome::Deferred),
+                (artwork("next"), CoverOutcome::Ready(cache.path(&artwork("next")))),
+            ]
+        );
     }
 
     /// With no usable token, hits are still served and misses are unavailable.

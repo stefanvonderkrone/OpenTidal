@@ -419,7 +419,11 @@ nothing there is a test.
 | A route outside the catalogue cannot open | Open an album id from a larger catalogue, assert the stack is unchanged | test: `opening_an_unknown_album_is_refused` |
 | A track outside the catalogue cannot play | Select a track id from a larger catalogue, assert the state is unchanged | test: `selecting_an_unknown_track_is_refused` |
 | An invalid history row cannot hide a valid entry | Seed an unknown track then two distinct valid ones, assert both load | test: `an_unknown_history_row_does_not_hide_a_valid_one` |
-| The sync never touches local data | Seed a download, a history entry, a user playlist and a collection, sync, assert all remain | pending: sync PR |
+| The sync never touches local data | Seed a download, a history entry, a user playlist and a collection, sync, assert all remain | test: `a_sync_keeps_local_data` |
+| A sync removes what Tidal no longer lists | Sync a library to other members, assert only the new ones remain | test: `a_sync_removes_a_membership_tidal_no_longer_lists` |
+| A sync is idempotent | Apply the same rows twice, assert the library and the report are unchanged | test: `a_sync_twice_changes_nothing` |
+| A sync keeps no unresolvable member | Sync a member the catalogue lacks, assert it is counted and left out | test: `an_unresolvable_member_is_counted_not_kept` |
+| A sync cannot break the invariant | Two sync successors in the exhaustive library proof | test: `every_reachable_library_satisfies_check` |
 
 ## Confirmed live
 

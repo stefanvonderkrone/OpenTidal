@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::catalogue::{AlbumId, ArtistId, Catalogue, CataloguePlaylistId, TrackId};
+use crate::catalogue::{AlbumId, ArtistId, Catalogue, CatalogueRows, CataloguePlaylistId, TrackId};
 
 #[cfg(not(test))]
 pub const MAX_PLAYLISTS: usize = 32;
@@ -90,6 +90,48 @@ impl Default for Library {
             collections: Vec::new(),
         }
     }
+}
+
+/// A complete read of one account's Tidal library, as unvalidated text in the
+/// shape Tidal sends. Only a fetch that read every page returns one, so a value
+/// of this type is the proof that the read was complete.
+#[cfg_attr(not(test), expect(dead_code, reason = "App::sync applies it once the worker lands"))]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct LibraryRows {
+    pub catalogue: CatalogueRows,
+    pub liked: Vec<String>,
+    pub saved_albums: Vec<String>,
+    pub followed: Vec<String>,
+    pub tidal_playlists: Vec<String>,
+}
+
+/// What one sync left in the library, for the Account screen.
+#[cfg_attr(not(test), expect(dead_code, reason = "App::sync applies it once the worker lands"))]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct SyncReport {
+    pub liked: usize,
+    pub saved_albums: usize,
+    pub followed: usize,
+    pub tidal_playlists: usize,
+    /// Catalogue rows that absorb dropped, plus members that name nothing the
+    /// catalogue holds after the absorb.
+    pub dropped: usize,
+}
+
+/// The members of one list that the catalogue resolves. Each one it cannot
+/// resolve is counted in `dropped`.
+#[cfg_attr(not(test), expect(dead_code, reason = "App::sync applies it once the worker lands"))]
+fn resolve<T: Ord>(raw: Vec<String>, id: impl Fn(&str) -> Option<T>, dropped: &mut usize) -> BTreeSet<T> {
+    let mut set = BTreeSet::new();
+    for member in raw {
+        match id(&member) {
+            Some(id) => {
+                set.insert(id);
+            }
+            None => *dropped += 1,
+        }
+    }
+    set
 }
 
 /// A safety violation, named so the random-walk test reports what broke.
@@ -301,6 +343,28 @@ impl Library {
         }
     }
 
+    // --- Sync -------------------------------------------------------------
+
+    /// Absorb the rows into `cat`, then replace likes, saves, follows and Tidal
+    /// playlists with the members that resolve. Downloads, history, user
+    /// playlists, collections and the name are untouched. The same rows applied
+    /// twice change nothing. A member that does not resolve is counted, not kept.
+    #[cfg_attr(not(test), expect(dead_code, reason = "App::sync applies it once the worker lands"))]
+    pub fn sync(&mut self, cat: &mut Catalogue, rows: LibraryRows) -> SyncReport {
+        let mut dropped = cat.absorb(rows.catalogue);
+        self.liked = resolve(rows.liked, |raw| cat.track_id(raw), &mut dropped);
+        self.saved_albums = resolve(rows.saved_albums, |raw| cat.album_id(raw), &mut dropped);
+        self.followed = resolve(rows.followed, |raw| cat.artist_id(raw), &mut dropped);
+        self.tidal_playlists = resolve(rows.tidal_playlists, |raw| cat.playlist_id(raw), &mut dropped);
+        SyncReport {
+            liked: self.liked.len(),
+            saved_albums: self.saved_albums.len(),
+            followed: self.followed.len(),
+            tidal_playlists: self.tidal_playlists.len(),
+            dropped,
+        }
+    }
+
     // --- Profile ----------------------------------------------------------
 
     pub fn set_name(&mut self, name: String) {
@@ -412,9 +476,40 @@ mod tests {
 
     /// Every library operation, with a fixed id set and fixed names so the
     /// state space stays finite under the `cfg(test)` bounds.
-    fn successors(l: &Library, ids: &Ids) -> Vec<Library> {
+    /// A track the seed lacks, with its parents, so a sync successor proves that
+    /// a member a sync brings in is a member of the catalogue the check reads.
+    fn fetched_rows() -> CatalogueRows {
+        CatalogueRows {
+            artists: vec![ArtistRow { id: "x-artist".into(), name: "X".into() }],
+            albums: vec![AlbumRow { id: "x-album".into(), title: "X".into(), artist: "x-artist".into() }],
+            tracks: vec![TrackRow {
+                id: "x-track".into(),
+                title: "X".into(),
+                artist: "x-artist".into(),
+                album: "x-album".into(),
+                duration: "PT1M".into(),
+            }],
+            playlists: Vec::new(),
+        }
+    }
+
+    fn successors(l: &Library, ids: &Ids, cat: &mut Catalogue) -> Vec<Library> {
         let Ids { t0, t1, album, artist } = ids;
         let mut out = Vec::new();
+        let mut synced = l.clone();
+        synced.sync(
+            cat,
+            LibraryRows {
+                catalogue: fetched_rows(),
+                liked: vec!["seed-track-1".into(), "x-track".into()],
+                tidal_playlists: vec!["seed-playlist-0".into()],
+                ..LibraryRows::default()
+            },
+        );
+        out.push(synced);
+        let mut emptied = l.clone();
+        emptied.sync(cat, LibraryRows::default());
+        out.push(emptied);
         out.push(applying(|x| x.toggle_like(t0.clone()), l));
         out.push(applying(|x| x.toggle_like(t1.clone()), l));
         out.push(applying(|x| x.toggle_save_album(album.clone()), l));
@@ -483,7 +578,7 @@ mod tests {
     /// proves the nav half.
     #[test]
     fn every_reachable_library_satisfies_check() {
-        let cat = Catalogue::seed();
+        let mut cat = Catalogue::seed();
         let ids = Ids::new(&cat);
         let mut seen = HashSet::new();
         let mut queue = VecDeque::new();
@@ -493,7 +588,7 @@ mod tests {
         queue.push_back(init);
         while let Some(l) = queue.pop_front() {
             assert_eq!(l.check(&cat), Ok(()), "library broke the invariant: {l:?}");
-            for next in successors(&l, &ids) {
+            for next in successors(&l, &ids, &mut cat) {
                 if seen.insert(next.clone()) {
                     queue.push_back(next);
                 }
@@ -556,6 +651,105 @@ mod tests {
         let id = l.create_playlist("X".to_string()).unwrap();
         l.add_track(id, track);
         assert_eq!(l.check(&seed), Err(Violation::PlaylistTrackNotInCatalogue));
+    }
+
+    /// A library with a row in every local field and every mirrored one.
+    fn full_library(cat: &Catalogue) -> Library {
+        let mut lib = Library::default();
+        lib.set_name("Ada".to_string());
+        lib.toggle_download(cat.album_id("seed-album-2").unwrap());
+        lib.record_play(cat.track_id("seed-track-5").unwrap());
+        let id = lib.create_playlist("Mine".to_string()).unwrap();
+        lib.add_track(id, cat.track_id("seed-track-6").unwrap());
+        lib.create_collection("Folder".to_string());
+        lib.add_to_collection(0, id);
+        lib.toggle_like(cat.track_id("seed-track-0").unwrap());
+        lib.toggle_save_album(cat.album_id("seed-album-0").unwrap());
+        lib.toggle_follow(cat.artist_id("seed-artist-0").unwrap());
+        lib.tidal_playlists.insert(cat.playlist_id("seed-playlist-0").unwrap());
+        lib
+    }
+
+    /// A sync replaces only what Tidal owns. Downloads, history, user playlists,
+    /// collections and the name are local, and Tidal cannot return them.
+    #[test]
+    fn a_sync_keeps_local_data() {
+        let mut cat = Catalogue::seed();
+        let before = full_library(&cat);
+        let mut lib = before.clone();
+        lib.sync(&mut cat, LibraryRows::default());
+        assert_eq!(lib.name, before.name, "the sync changed the name");
+        assert_eq!(lib.downloaded, before.downloaded, "the sync touched the downloads");
+        assert_eq!(lib.history, before.history, "the sync touched the history");
+        assert_eq!(lib.playlists, before.playlists, "the sync touched a user playlist");
+        assert_eq!(lib.collections, before.collections, "the sync touched a collection");
+    }
+
+    /// A complete read is the truth for the mirrored memberships, so a member
+    /// Tidal no longer lists is removed, and one it lists is kept.
+    #[test]
+    fn a_sync_removes_a_membership_tidal_no_longer_lists() {
+        let mut cat = Catalogue::seed();
+        let mut lib = full_library(&cat);
+        let report = lib.sync(
+            &mut cat,
+            LibraryRows {
+                liked: vec!["seed-track-1".into()],
+                saved_albums: vec!["seed-album-1".into()],
+                followed: vec!["seed-artist-1".into()],
+                tidal_playlists: vec!["seed-playlist-2".into()],
+                ..LibraryRows::default()
+            },
+        );
+        assert_eq!(lib.liked, BTreeSet::from([cat.track_id("seed-track-1").unwrap()]));
+        assert_eq!(lib.saved_albums, BTreeSet::from([cat.album_id("seed-album-1").unwrap()]));
+        assert_eq!(lib.followed, BTreeSet::from([cat.artist_id("seed-artist-1").unwrap()]));
+        assert_eq!(lib.tidal_playlists, BTreeSet::from([cat.playlist_id("seed-playlist-2").unwrap()]));
+        assert_eq!(
+            report,
+            SyncReport { liked: 1, saved_albums: 1, followed: 1, tidal_playlists: 1, dropped: 0 }
+        );
+    }
+
+    /// The same rows applied twice leave the same library, so a retried sync is
+    /// harmless.
+    #[test]
+    fn a_sync_twice_changes_nothing() {
+        let mut cat = Catalogue::seed();
+        let rows = LibraryRows {
+            catalogue: fetched_rows(),
+            liked: vec!["seed-track-1".into(), "x-track".into()],
+            saved_albums: vec!["x-album".into()],
+            followed: vec!["x-artist".into()],
+            tidal_playlists: vec!["seed-playlist-1".into()],
+        };
+        let mut lib = full_library(&cat);
+        let first = lib.sync(&mut cat, rows.clone());
+        let once = lib.clone();
+        let second = lib.sync(&mut cat, rows);
+        assert_eq!(lib, once, "a second sync with the same rows changed the library");
+        assert_eq!(first, second);
+        assert_eq!(lib.liked.len(), 2);
+    }
+
+    /// A member the catalogue cannot resolve is counted and left out, so the
+    /// library never holds an id outside the catalogue.
+    #[test]
+    fn an_unresolvable_member_is_counted_not_kept() {
+        let mut cat = Catalogue::seed();
+        let mut lib = Library::default();
+        let report = lib.sync(
+            &mut cat,
+            LibraryRows {
+                liked: vec!["seed-track-0".into(), "404".into()],
+                tidal_playlists: vec!["gone".into()],
+                ..LibraryRows::default()
+            },
+        );
+        assert_eq!(report.dropped, 2, "an unresolvable member was not counted");
+        assert_eq!(report.liked, 1);
+        assert!(lib.tidal_playlists.is_empty());
+        assert_eq!(lib.check(&cat), Ok(()));
     }
 
     /// Renaming actually changes the name. The invariant does not constrain

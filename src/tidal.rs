@@ -417,7 +417,7 @@ impl Resource {
                 id,
                 title: self.text("title").unwrap_or_default(),
                 artist: self.first("artists"),
-                cover: String::new(),
+                cover: self.first("coverArt"),
             }),
             "tracks" => rows.tracks.push(TrackRow {
                 id,
@@ -431,7 +431,7 @@ impl Resource {
                 name: self.text("name").unwrap_or_default(),
                 description: self.text("description").unwrap_or_default(),
                 tracks: Vec::new(),
-                cover: String::new(),
+                cover: self.first("coverArt"),
             }),
             _ => {}
         }
@@ -683,6 +683,13 @@ mod tests {
         let morning = cat.playlist(&cat.playlist_id(MORNING).unwrap()).unwrap();
         assert_eq!(morning.tracks.len(), 1);
         assert_eq!(lib.check(&cat), Ok(()));
+        let cover = |title: &str| {
+            let album = cat.albums().find(|a| a.title == title && !a.id.as_str().starts_with("seed-")).unwrap();
+            album.cover.as_ref().map(|c| c.as_str().to_owned())
+        };
+        assert_eq!(cover("Currents").as_deref(), Some("251380836-large"));
+        assert_eq!(cover("In Rainbows").as_deref(), Some("108043637-large"));
+        assert_eq!(evening.cover.as_ref().map(|c| c.as_str()), Some("playlist-cover-1"));
     }
 
     /// A page that fails fails the whole read. No rows exist, so nothing

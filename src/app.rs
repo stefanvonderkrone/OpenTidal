@@ -13,7 +13,7 @@ use rune::{Latest, TextEdit, Waker};
 use serde::Deserialize;
 use crate::auth::{self, Auth, OAuthConfig, Token, TokenStore};
 use crate::catalogue::Catalogue;
-use crate::library::Library;
+use crate::library::{Library, LibraryRows, SyncReport};
 use crate::state::State;
 use crate::store::Store;
 use crate::tidal::{self, MusicService, ServiceError, User};
@@ -72,6 +72,20 @@ pub struct App {
     /// The profile fetch after sign-in, drained by `poll`. Carries the session
     /// it was started under and the possibly-refreshed token to persist.
     pub profile: Latest<ProfileFetch>,
+    /// The library read, drained by `poll`. Running is `sync.is_pending()`, never a
+    /// second flag.
+    pub sync: Latest<SyncFetch>,
+    /// The outcome of the last sync for this account. `None` before the first one.
+    pub last_sync: Option<Result<SyncReport, String>>,
+}
+
+/// The session and the account a sync started under. The result is applied only
+/// when both still match. The session alone is not enough: a dead refresh token
+/// closes the library without a new session.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SyncTicket {
+    session: u64,
+    user_id: String,
 }
 
 /// One account's open library. The account id and the handle are one value, so a
@@ -92,6 +106,9 @@ type AuthFlow = (u64, Result<Token, String>);
 /// persist.
 type ProfileFetch = (u64, Result<(Token, User), ServiceError>);
 
+/// A finished library read, tagged with its ticket, carrying the token to persist.
+type SyncFetch = (SyncTicket, Result<(Token, LibraryRows), ServiceError>);
+
 /// A dummy token for the deterministic sign-in, so the fake path exercises the
 /// same `SignedIn` state without a network.
 fn fake_token() -> Token {
@@ -106,6 +123,7 @@ impl App {
     pub fn setup(&mut self, waker: Waker) {
         self.auth_flow.set_waker(waker.clone());
         self.profile.set_waker(waker.clone());
+        self.sync.set_waker(waker.clone());
         self.waker = Some(waker);
         if self.auth == Auth::SignedOut
             && let Some(token) = self.tokens.load()
@@ -365,13 +383,20 @@ impl App {
         // The message belongs to the account that just closed. It must not follow
         // the next account onto its own Account screen.
         self.write_error = None;
+        self.last_sync = None;
         self.core.lib = Library::default();
         // A playlist screen for the old account names a playlist that no longer
         // exists, which the state invariant forbids. Drop those routes and keep
         // the stack non-empty, the same way `state::delete_playlist` does.
-        self.core
-            .stack
-            .retain(|route| !matches!(route, crate::state::Route::UserPlaylist(_)));
+        //
+        // A Tidal playlist still resolves, because the catalogue never forgets, but
+        // its name belongs to the old account. The next account must not find it
+        // one Back away.
+        self.core.stack.retain(|route| match route {
+            crate::state::Route::UserPlaylist(_) => false,
+            crate::state::Route::CataloguePlaylist(id) => id.is_seed(),
+            _ => true,
+        });
         if self.core.stack.is_empty() {
             self.core.stack.push(crate::state::Route::Home);
         }
@@ -391,6 +416,7 @@ impl App {
         // A new session starts with no fetch history, so a message about the previous
         // one's failed fetch must not follow it onto the Account screen.
         self.profile_error = None;
+        self.last_sync = None;
         self.restore_library(&user_id);
         self.auth = Auth::SignedIn { token: token.clone() };
         self.fetch_profile(token);
@@ -404,8 +430,53 @@ impl App {
         let config = self.oauth.clone();
         let session = self.session;
         self.profile.request(token, move |t| {
-            (session, resolve_user(&service, &config, t))
+            (session, with_fresh_token(&|t| refresh(&config, t), t, &|access| service.current_user(access)))
         });
+    }
+
+    /// Start a sync for the open account. A no-op with no open library, with no
+    /// signed-in token, or with a sync already running. It also waits for a
+    /// pending profile fetch: both workers may refresh the token, and two
+    /// refreshes of one refresh token race each other.
+    pub fn sync(&mut self) {
+        if self.profile.is_pending() || self.sync.is_pending() {
+            return;
+        }
+        let (Some(open), Auth::SignedIn { token }) = (&self.library, &self.auth) else {
+            return;
+        };
+        let ticket = SyncTicket { session: self.session, user_id: open.user_id.clone() };
+        let service = self.service.clone();
+        let config = self.oauth.clone();
+        self.sync.request(token.clone(), move |t| {
+            let user = ticket.user_id.clone();
+            let result =
+                with_fresh_token(&|t| refresh(&config, t), t, &|access| service.library(access, &user));
+            (ticket, result)
+        });
+    }
+
+    /// Persist a token a worker used, and make it the session's token.
+    fn keep_token(&mut self, token: Token) {
+        self.tokens.save(&token);
+        if let Auth::SignedIn { token: held } = &mut self.auth {
+            *held = token;
+        }
+    }
+
+    /// End a session whose refresh token is dead. The rows stay on disk for a
+    /// later sign-in, but the library in memory must not survive, or the next
+    /// account to sign in would inherit it and save it under its own id.
+    fn end_dead_session(&mut self, error: ServiceError) {
+        let _ = self.tokens.clear();
+        // Say so when the last edits could not be written, rather than dropping
+        // them in silence.
+        if !self.forget_session() {
+            eprintln!(
+                "opentidal: the dead token ended the session before the library was written, so the last edits are lost"
+            );
+        }
+        self.auth = Auth::Failed { message: format!("{error:?}") };
     }
 
     /// Drain any landed auth or profile result. Returns true when state changed.
@@ -429,32 +500,22 @@ impl App {
             changed = true;
             match result {
                 Ok((token, user)) => {
-                    self.tokens.save(&token);
-                    if let Auth::SignedIn { token: held } = &mut self.auth {
-                        *held = token;
-                    }
+                    self.keep_token(token);
                     self.core.lib.set_name(user.name);
                     // The fetch landed, so the reason an earlier one did not is out
                     // of date. Leaving it would show "could not reach Tidal" over a
                     // name that just arrived.
                     self.profile_error = None;
+                    // The live build syncs once the token is proven. The fake build
+                    // syncs from the Account screen only, so a scene or a test that
+                    // fetches the profile never replaces its library by surprise.
+                    if self.live {
+                        self.sync();
+                    }
                 }
                 Err(e) => {
-                    // A dead refresh token means no session at all. The rows stay
-                    // on disk for a later sign-in, but the library in memory must
-                    // not survive, or the next account to sign in would inherit
-                    // it and save it under its own id.
                     if matches!(&e, ServiceError::InvalidGrant(_)) {
-                        let _ = self.tokens.clear();
-                        // The token is dead, so the session cannot continue and the
-                        // library has to go. Say so when its last edits could not be
-                        // written, rather than dropping them in silence.
-                        if !self.forget_session() {
-                            eprintln!(
-                                "opentidal: the dead token ended the session before the library was written, so the last edits are lost"
-                            );
-                        }
-                        self.auth = Auth::Failed { message: format!("{e:?}") };
+                        self.end_dead_session(e);
                     } else {
                         // A transport error is not a lost session. The disk holds the
                         // name and the library, so the launch stays signed in and the
@@ -477,6 +538,23 @@ impl App {
                                 .to_string(),
                         });
                     }
+                }
+            }
+        }
+        if let Some((ticket, result)) = self.sync.take()
+            && ticket.session == self.session
+            && self.library.as_ref().is_some_and(|open| open.user_id == ticket.user_id)
+        {
+            changed = true;
+            match result {
+                Ok((token, rows)) => {
+                    self.keep_token(token);
+                    self.last_sync = Some(Ok(self.core.lib.sync(&mut self.catalogue, rows)));
+                }
+                Err(e @ ServiceError::InvalidGrant(_)) => self.end_dead_session(e),
+                Err(e) => {
+                    eprintln!("opentidal: the sync failed, nothing changed: {e:?}");
+                    self.last_sync = Some(Err(sync_error_text(&e)));
                 }
             }
         }
@@ -533,27 +611,34 @@ impl App {
     }
 }
 
-/// Resolve the current user for a token, refreshing it first when it is expired
-/// or when the service rejects it. Returns the token actually used, so the
-/// caller can persist a renewed one. A refresh the endpoint rejects outright
-/// (for example `invalid_grant`) surfaces as [`ServiceError::InvalidGrant`],
-/// which the caller maps to clearing the stored token.
-fn resolve_user(
-    service: &Arc<dyn MusicService>,
-    config: &OAuthConfig,
-    token: Token,
-) -> Result<(Token, User), ServiceError> {
-    resolve_user_with(service, &|t| refresh(config, t), token)
+/// The reason a sync failed, for the Account screen. Every message says that
+/// nothing changed, because a failed sync applies nothing.
+fn sync_error_text(error: &ServiceError) -> String {
+    let reason = match error {
+        ServiceError::Unauthorized | ServiceError::Auth(_) | ServiceError::InvalidGrant(_) => {
+            "Tidal would not accept this session. Sign out and sign in again."
+        }
+        ServiceError::Paging(_) => "Your Tidal library is too large to read in one sync.",
+        ServiceError::Decode(_) => "Tidal sent something this version cannot read.",
+        ServiceError::Http(_) => "Could not reach Tidal.",
+    };
+    format!("{reason} Nothing changed.")
 }
 
-/// `resolve_user`, with the refresh as a parameter. A test needs to count the refreshes
-/// and make them fail on demand, which the network call cannot do without a server.
-/// Production passes the real one, so the logic below is the same code in both.
-fn resolve_user_with(
-    service: &Arc<dyn MusicService>,
+/// Run `call` with a fresh token, refreshing it first when it is expired or when
+/// the service rejects it. Returns the token actually used, so the caller can
+/// persist a renewed one. A refresh the endpoint rejects outright (for example
+/// `invalid_grant`) surfaces as [`ServiceError::InvalidGrant`], which the caller
+/// maps to clearing the stored token. The profile fetch and the sync both use it.
+///
+/// The refresh is a parameter. A test needs to count the refreshes and make them
+/// fail on demand, which the network call cannot do without a server. Production
+/// passes the real one, so the logic below is the same code in both.
+fn with_fresh_token<T>(
     refresh: &dyn Fn(&Token) -> Result<Token, ServiceError>,
     token: Token,
-) -> Result<(Token, User), ServiceError> {
+    call: &dyn Fn(&str) -> Result<T, ServiceError>,
+) -> Result<(Token, T), ServiceError> {
     // Whether this call already refreshed for expiry decides how a rejection reads.
     // A token that was expired and refreshed, then rejected anyway, is rejected in its
     // freshest form: refreshing again cannot help, and a transport failure on that
@@ -565,14 +650,16 @@ fn resolve_user_with(
     } else {
         token
     };
-    match service.current_user(&token.access_token) {
-        Ok(user) => Ok((token, user)),
+    match call(&token.access_token) {
+        Ok(answer) => Ok((token, answer)),
         // The one refresh-and-retry for a token that was still current. It is worth
-        // trying once: the API rejects a token whose clock it disagrees with.
+        // trying once: the API rejects a token whose clock it disagrees with. A sync
+        // rejected on page nine reads again from page one, which is safe because
+        // nothing was applied.
         Err(ServiceError::Unauthorized) if !expired => {
             let fresh = refresh(&token)?;
-            let user = after_refresh(service.current_user(&fresh.access_token))?;
-            Ok((fresh, user))
+            let answer = after_refresh(call(&fresh.access_token))?;
+            Ok((fresh, answer))
         }
         Err(ServiceError::Unauthorized) => {
             Err(ServiceError::InvalidGrant("a fresh token was rejected".to_string()))
@@ -586,7 +673,7 @@ fn resolve_user_with(
 /// that the network is down, so it is reported as a dead grant. Left as
 /// `Unauthorized` it would read as retryable, and the session would stay signed in
 /// with a token that can never work.
-fn after_refresh(result: Result<User, ServiceError>) -> Result<User, ServiceError> {
+fn after_refresh<T>(result: Result<T, ServiceError>) -> Result<T, ServiceError> {
     match result {
         Err(ServiceError::Unauthorized) => {
             Err(ServiceError::InvalidGrant("a fresh token was rejected".to_string()))
@@ -660,6 +747,8 @@ impl Default for App {
             session: 0,
             auth_flow: Latest::default(),
             profile: Latest::default(),
+            sync: Latest::default(),
+            last_sync: None,
         }
     }
 }
@@ -1044,7 +1133,7 @@ mod tests {
         };
         assert!(
             matches!(
-                after_refresh(Err(ServiceError::Unauthorized)),
+                after_refresh::<User>(Err(ServiceError::Unauthorized)),
                 Err(ServiceError::InvalidGrant(_))
             ),
             "a rejected fresh token was left retryable"
@@ -1052,11 +1141,11 @@ mod tests {
         // Every other answer is passed through: a network error must stay a network
         // error, and a good answer must stay good.
         assert!(matches!(
-            after_refresh(Err(ServiceError::Http("offline".to_string()))),
+            after_refresh::<User>(Err(ServiceError::Http("offline".to_string()))),
             Err(ServiceError::Http(_))
         ));
         assert!(matches!(
-            after_refresh(Err(ServiceError::InvalidGrant("revoked".to_string()))),
+            after_refresh::<User>(Err(ServiceError::InvalidGrant("revoked".to_string()))),
             Err(ServiceError::InvalidGrant(_))
         ));
         assert_eq!(after_refresh(Ok(user.clone())).unwrap().name, user.name);
@@ -1094,7 +1183,7 @@ mod tests {
             refresh_token: "r".to_string(),
             expires_in: 0,
         };
-        let result = resolve_user_with(&service, &refresh, expired);
+        let result = with_fresh_token(&refresh, expired, &|access| service.current_user(access));
 
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the token was refreshed more than once");
         assert!(
@@ -1110,7 +1199,7 @@ mod tests {
             refresh_token: "r".to_string(),
             expires_in: 3600,
         };
-        let result = resolve_user_with(&service, &refresh, current);
+        let result = with_fresh_token(&refresh, current, &|access| service.current_user(access));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the retry refresh did not happen");
         assert!(matches!(result, Err(ServiceError::InvalidGrant(_))));
     }
@@ -1654,6 +1743,143 @@ mod tests {
         app.wake_if_dirty();
         assert_eq!(count.load(Ordering::SeqCst), 1, "a change did not wake the loop");
 
+    }
+
+    /// Drain until `done` holds, or give up after a second. The workers run on
+    /// other threads, so a result lands some time after the request.
+    fn drain_until(app: &mut App, done: impl Fn(&App) -> bool) {
+        for _ in 0..1_000 {
+            app.drain();
+            if done(app) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// A Tidal library with one liked track and one private playlist, for the
+    /// account the name says.
+    fn tidal_rows(name: &str) -> LibraryRows {
+        use crate::catalogue::{CatalogueRows, PlaylistRow};
+        LibraryRows {
+            catalogue: CatalogueRows {
+                playlists: vec![PlaylistRow {
+                    id: format!("{name}-private"),
+                    name: format!("{name} secret"),
+                    description: String::new(),
+                    tracks: vec!["seed-track-0".into()],
+                }],
+                ..CatalogueRows::default()
+            },
+            liked: vec!["seed-track-0".into()],
+            tidal_playlists: vec![format!("{name}-private")],
+            ..LibraryRows::default()
+        }
+    }
+
+    /// An app signed in to `user` on the file at `path`, whose fake service reads
+    /// `rows` on a sync.
+    fn signed_in(user: &str, path: &std::path::Path, rows: LibraryRows) -> App {
+        let mut app = app_without_a_session();
+        app.service = Arc::new(tidal::FakeService { library: Ok(rows), ..tidal::FakeService::default() });
+        app.open_library(user, path);
+        app.auth = Auth::SignedIn { token: fake_token() };
+        app
+    }
+
+    /// Account A's private playlist names never reach account B. The catalogue
+    /// keeps every playlist any account synced, in memory and on disk, so the
+    /// Home shelf and the back stack are the two places a name could leak.
+    #[test]
+    fn account_b_never_sees_account_a_playlist_names() {
+        use crate::state::Route;
+        let dir = TempDir::new("cross-account-names");
+        let path = dir.path();
+
+        let mut app = signed_in("account-a", &path, tidal_rows("A"));
+        app.sync();
+        drain_until(&mut app, |a| a.last_sync.is_some());
+        let private = app.catalogue.playlist_id("A-private").expect("the fixture did not sync");
+        crate::state::open_detail(&mut app.core, &app.catalogue, Route::CataloguePlaylist(private.clone()));
+        assert_eq!(app.core.stack.last(), Some(&Route::CataloguePlaylist(private.clone())));
+        app.sign_out();
+
+        assert!(
+            !app.core.stack.contains(&Route::CataloguePlaylist(private.clone())),
+            "account A's playlist screen stayed one Back away after sign-out"
+        );
+        app.open_library("account-b", &path);
+        let home: Vec<&str> = crate::screens::home_playlists(&app.catalogue).map(|p| p.name.as_str()).collect();
+        assert!(!home.contains(&"A secret"), "account B's Home shows account A's playlist: {home:?}");
+        assert!(app.core.lib.tidal_playlists.is_empty(), "account B holds account A's playlist");
+
+        // A later run for account B reads every stored catalogue row, A's too.
+        let mut next_run = app_without_a_session();
+        next_run.open_library("account-b", &path);
+        assert!(next_run.catalogue.playlist(&private).is_some(), "the fixture does not exercise the leak");
+        let home: Vec<&str> =
+            crate::screens::home_playlists(&next_run.catalogue).map(|p| p.name.as_str()).collect();
+        assert!(!home.contains(&"A secret"), "a restart shows account A's playlist on B's Home: {home:?}");
+        assert_eq!(home.len(), 3, "the seed playlists are gone from Home");
+    }
+
+    /// A sync started for one account and landing after another opened in the
+    /// same session is dropped. A dead refresh token closes the library without
+    /// a new session, so the session alone cannot tell the two apart.
+    #[test]
+    fn a_sync_for_another_account_is_dropped() {
+        let dir = TempDir::new("sync-other-account");
+        let path = dir.path();
+        let mut app = signed_in("account-a", &path, tidal_rows("A"));
+        let session = app.session;
+        app.sync();
+        app.open_library("account-b", &path);
+        assert_eq!(app.session, session, "the fixture bumped the session, so it tests the wrong guard");
+        drain_until(&mut app, |a| !a.sync.is_pending());
+        app.drain();
+
+        assert!(app.core.lib.liked.is_empty(), "account A's sync landed in account B's library");
+        assert!(app.core.lib.tidal_playlists.is_empty());
+        assert_eq!(app.last_sync, None, "account B shows account A's sync result");
+    }
+
+    /// A sync does not start while the profile fetch is pending. Both may refresh
+    /// the token, and two refreshes of one refresh token race each other.
+    #[test]
+    fn a_sync_waits_for_the_profile_fetch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counting(AtomicUsize);
+        impl MusicService for Counting {
+            fn current_user(&self, _token: &str) -> Result<User, ServiceError> {
+                Err(ServiceError::Http("unused".to_string()))
+            }
+            fn library(&self, _token: &str, _user: &str) -> Result<LibraryRows, ServiceError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(tidal_rows("A"))
+            }
+        }
+        let dir = TempDir::new("sync-waits");
+        let path = dir.path();
+        let counting = Arc::new(Counting(AtomicUsize::new(0)));
+        let mut app = signed_in("account-a", &path, LibraryRows::default());
+        app.service = counting.clone();
+
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let session = app.session;
+        app.profile.request((), move |_| {
+            let _ = wait.recv();
+            (session, Err(ServiceError::Http("offline".to_string())))
+        });
+        app.sync();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!app.sync.is_pending(), "a sync started while the profile fetch was pending");
+        assert_eq!(counting.0.load(Ordering::SeqCst), 0, "the library was read while the profile fetch was pending");
+
+        release.send(()).unwrap();
+        drain_until(&mut app, |a| !a.profile.is_pending());
+        app.sync();
+        drain_until(&mut app, |a| a.last_sync.is_some());
+        assert_eq!(counting.0.load(Ordering::SeqCst), 1, "the sync did not start once the profile landed");
     }
 
     /// The fake token carries no `uid` claim, so the headless build never

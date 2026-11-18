@@ -50,7 +50,6 @@ pub trait MusicService: Send + Sync {
     fn current_user(&self, token: &str) -> Result<User, ServiceError>;
     /// Read every page of the account's library. A failed page, a repeated
     /// cursor, or the page cap returns an error and no rows.
-    #[cfg_attr(not(test), expect(dead_code, reason = "App::sync calls it once the worker lands"))]
     fn library(&self, token: &str, user: &str) -> Result<LibraryRows, ServiceError>;
 }
 

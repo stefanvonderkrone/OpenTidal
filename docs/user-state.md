@@ -426,6 +426,9 @@ nothing there is a test.
 | A track outside the catalogue cannot play | Select a track id from a larger catalogue, assert the state is unchanged | test: `selecting_an_unknown_track_is_refused` |
 | An invalid history row cannot hide a valid entry | Seed an unknown track then two distinct valid ones, assert both load | test: `an_unknown_history_row_does_not_hide_a_valid_one` |
 | The sync never touches local data | Seed a download, a history entry, a user playlist and a collection, sync, assert all remain | test: `a_sync_keeps_local_data` |
+| One account never sees another's playlist names | Sync account A, open its playlist, sign out, open account B in this run and the next, assert Home and the stack hold no name of A's | test: `account_b_never_sees_account_a_playlist_names` |
+| A sync for another account is dropped | Start a sync, open another account in the same session, drain, assert nothing landed | test: `a_sync_for_another_account_is_dropped` |
+| A sync waits for the profile fetch | Hold the profile fetch, ask for a sync, assert no read, then release and assert one | test: `a_sync_waits_for_the_profile_fetch` |
 | A sync removes what Tidal no longer lists | Sync a library to other members, assert only the new ones remain | test: `a_sync_removes_a_membership_tidal_no_longer_lists` |
 | A sync is idempotent | Apply the same rows twice, assert the library and the report are unchanged | test: `a_sync_twice_changes_nothing` |
 | A sync keeps no unresolvable member | Sync a member the catalogue lacks, assert it is counted and left out | test: `an_unresolvable_member_is_counted_not_kept` |

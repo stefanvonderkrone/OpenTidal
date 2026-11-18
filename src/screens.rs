@@ -246,9 +246,16 @@ fn all_artists_grid(cat: &Catalogue, t: tok::Theme) -> El {
 
 // --- Section screens -----------------------------------------------------
 
+/// The playlists the Home shelf shows: the seed's only. The catalogue holds the
+/// Tidal playlists of every account that synced in this run or wrote to this
+/// file, so listing them all would show one account's private names to another.
+pub fn home_playlists(cat: &Catalogue) -> impl Iterator<Item = &CataloguePlaylist> {
+    cat.playlists().filter(|p| p.id.is_seed())
+}
+
 pub fn home(cat: &Catalogue, t: tok::Theme) -> El {
     let rec: Vec<El> = cat.albums().take(5).enumerate().map(|(i, a)| album_card(i, a, cat, t)).collect();
-    let edits: Vec<El> = cat.playlists().enumerate().map(|(i, p)| seed_playlist_card(i, p, t)).collect();
+    let edits: Vec<El> = home_playlists(cat).enumerate().map(|(i, p)| seed_playlist_card(i, p, t)).collect();
     page("Home", "Your music, your way", t,
         col().gap(space::S6)
             .child(shelf("Recommended for you", t, rec))

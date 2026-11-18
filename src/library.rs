@@ -105,7 +105,6 @@ pub struct LibraryRows {
 }
 
 /// What one sync left in the library, for the Account screen.
-#[cfg_attr(not(test), expect(dead_code, reason = "App::sync applies it once the worker lands"))]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct SyncReport {
     pub liked: usize,
@@ -119,7 +118,6 @@ pub struct SyncReport {
 
 /// The members of one list that the catalogue resolves. Each one it cannot
 /// resolve is counted in `dropped`.
-#[cfg_attr(not(test), expect(dead_code, reason = "App::sync applies it once the worker lands"))]
 fn resolve<T: Ord>(raw: Vec<String>, id: impl Fn(&str) -> Option<T>, dropped: &mut usize) -> BTreeSet<T> {
     let mut set = BTreeSet::new();
     for member in raw {
@@ -348,7 +346,6 @@ impl Library {
     /// playlists with the members that resolve. Downloads, history, user
     /// playlists, collections and the name are untouched. The same rows applied
     /// twice change nothing. A member that does not resolve is counted, not kept.
-    #[cfg_attr(not(test), expect(dead_code, reason = "App::sync applies it once the worker lands"))]
     pub fn sync(&mut self, cat: &mut Catalogue, rows: LibraryRows) -> SyncReport {
         let mut dropped = cat.absorb(rows.catalogue);
         self.liked = resolve(rows.liked, |raw| cat.track_id(raw), &mut dropped);

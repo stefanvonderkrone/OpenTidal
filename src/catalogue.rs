@@ -55,6 +55,18 @@ id!(
     CataloguePlaylistId
 );
 
+impl CataloguePlaylistId {
+    /// Whether the seed holds this playlist. Every other catalogue playlist came
+    /// from a Tidal account, so its name is that account's to see.
+    pub fn is_seed(&self) -> bool {
+        self.0.starts_with(SEED_PREFIX)
+    }
+}
+
+/// The prefix of every seed id. A Tidal id is a number or a UUID, so it never
+/// starts with this.
+const SEED_PREFIX: &str = "seed-";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Artist {
     pub id: ArtistId,

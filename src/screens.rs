@@ -6,7 +6,7 @@
 use rune::tok::{self, radius, space, type_};
 use rune::{Color, El, ScrollSpec, TextEdit, col, el, oklch, row, text, text_input};
 use crate::app::App;
-use crate::catalog::{self, Album, Artist, EditorialPlaylistId, Track, TrackId};
+use crate::catalogue::{Album, AlbumId, Artist, ArtistId, Catalogue, EditorialPlaylist, EditorialPlaylistId, Track, TrackId};
 use crate::library::{self, PlaylistId};
 use crate::state::{self, PopularTab, Route, SettingsPage, State};
 
@@ -14,6 +14,24 @@ use crate::state::{self, PopularTab, Route, SettingsPage, State};
 pub fn cover(i: usize) -> (Color, Color) {
     let hue = (i as f32 * 37.0 + 14.0) % 360.0;
     (oklch(0.62, 0.16, hue), oklch(0.34, 0.15, hue))
+}
+
+/// A cover seed from an id, so an item has one colour on every screen and
+/// across restarts. FNV-1a, because the std hasher may change between releases.
+fn cover_seed(id: &str) -> usize {
+    let hash = id.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    (hash % 360) as usize
+}
+
+/// A duration in seconds as the screen shows it, such as `3:26`.
+fn clock(seconds: u32) -> String {
+    format!("{}:{:02}", seconds / 60, seconds % 60)
+}
+
+/// An artist's name, or nothing for an id the catalogue lacks, which the
+/// invariant says never happens.
+fn artist_name<'a>(cat: &'a Catalogue, id: &ArtistId) -> &'a str {
+    cat.artist(id).map_or("", |a| a.name.as_str())
 }
 
 // --- Cards ---------------------------------------------------------------
@@ -26,7 +44,7 @@ fn card(key: &str, seed: usize, title: &str, subtitle: &str, route: Route, t: to
         .gap(space::S2)
         .on_press(move |a: &mut App| {
             a.rename.clear();
-            state::open_detail(&mut a.core, route)
+            state::open_detail(&mut a.core, &a.catalogue, route.clone())
         })
         .child(
             el().key("cover")
@@ -39,19 +57,21 @@ fn card(key: &str, seed: usize, title: &str, subtitle: &str, route: Route, t: to
         .child(text(subtitle).key("subtitle").font(type_::LABEL).color(t.text_secondary))
 }
 
-fn album_card(a: Album, t: tok::Theme) -> El {
-    card(&format!("album-{}", a.id.0), a.id.0 as usize, a.title, catalog::artist(a.artist).name, Route::Album(a.id), t)
+/// Keys are positions on the screen, so a script taps the same visible card
+/// whatever the catalogue holds.
+fn album_card(pos: usize, a: &Album, cat: &Catalogue, t: tok::Theme) -> El {
+    card(&format!("album-{pos}"), cover_seed(a.id.as_str()), &a.title, artist_name(cat, &a.artist), Route::Album(a.id.clone()), t)
 }
 
-fn artist_card(a: Artist, t: tok::Theme) -> El {
-    let id = a.id;
-    let (top, bottom) = cover(a.id.0 as usize + 3);
-    col().key(format!("artist-{}", a.id.0))
+fn artist_card(pos: usize, a: &Artist, t: tok::Theme) -> El {
+    let id = a.id.clone();
+    let (top, bottom) = cover(cover_seed(a.id.as_str()));
+    col().key(format!("artist-{pos}"))
         .w(120.0)
         .gap(space::S2)
         .on_press(move |app: &mut App| {
             app.rename.clear();
-            state::open_detail(&mut app.core, Route::Artist(id))
+            state::open_detail(&mut app.core, &app.catalogue, Route::Artist(id.clone()))
         })
         .child(
             el().key("cover")
@@ -60,12 +80,11 @@ fn artist_card(a: Artist, t: tok::Theme) -> El {
                 .gradient(top, bottom)
                 .shadow(2.0, 12.0, t.shadow_soft),
         )
-        .child(text(a.name).key("name").font(type_::BODY).color(t.text).center())
+        .child(text(&a.name).key("name").font(type_::BODY).color(t.text).center())
 }
 
-fn editorial_card(id: EditorialPlaylistId, t: tok::Theme) -> El {
-    let p = catalog::editorial_playlist(id);
-    card(&format!("editorial-{}", id.0), id.0 as usize + 6, p.name, p.description, Route::EditorialPlaylist(id), t)
+fn editorial_card(pos: usize, p: &EditorialPlaylist, t: tok::Theme) -> El {
+    card(&format!("editorial-{pos}"), cover_seed(p.id.as_str()), &p.name, &p.description, Route::EditorialPlaylist(p.id.clone()), t)
 }
 
 fn playlist_card(id: PlaylistId, name: &str, t: tok::Theme) -> El {
@@ -106,12 +125,13 @@ fn grid(cards: Vec<El>, per: usize) -> El {
 
 // --- Track rows ----------------------------------------------------------
 
-fn track_row(tr: Track, selected: bool, t: tok::Theme) -> El {
-    row().key(format!("track-{}", tr.id.0))
+fn track_row(pos: usize, tr: &Track, selected: bool, cat: &Catalogue, t: tok::Theme) -> El {
+    let id = tr.id.clone();
+    row().key(format!("track-{pos}"))
         .checked(selected)
         .fill(if selected { t.hover } else { Color::TRANSPARENT })
         .focusable(true)
-        .on_press(move |a: &mut App| state::select_track(&mut a.core, tr.id))
+        .on_press(move |a: &mut App| state::select_track(&mut a.core, &a.catalogue, id.clone()))
         .h(44.0)
         .px(space::S2)
         .radius(radius::MD)
@@ -120,16 +140,16 @@ fn track_row(tr: Track, selected: bool, t: tok::Theme) -> El {
         .hover(t.hover)
         .child(
             col().grow(1.0).gap(2.0)
-                .child(text(tr.title).key("title").font(type_::BODY).color(t.text))
-                .child(text(catalog::artist(tr.artist).name).key("track-artist").font(type_::LABEL).color(t.text_secondary)),
+                .child(text(&tr.title).key("title").font(type_::BODY).color(t.text))
+                .child(text(artist_name(cat, &tr.artist)).key("track-artist").font(type_::LABEL).color(t.text_secondary)),
         )
-        .child(text(tr.duration).key("duration").font(type_::LABEL).color(t.text_secondary))
+        .child(text(clock(tr.duration)).key("duration").font(type_::LABEL).color(t.text_secondary))
 }
 
-fn track_list(tracks: Vec<Track>, selected: Option<TrackId>, t: tok::Theme) -> El {
+fn track_list(tracks: Vec<&Track>, selected: Option<&TrackId>, cat: &Catalogue, t: tok::Theme) -> El {
     let mut l = col().key("tracks").gap(space::S1);
-    for tr in tracks {
-        l = l.child(track_row(tr, selected == Some(tr.id), t));
+    for (pos, tr) in tracks.into_iter().enumerate() {
+        l = l.child(track_row(pos, tr, selected == Some(&tr.id), cat, t));
     }
     l
 }
@@ -139,7 +159,8 @@ fn empty(msg: &str, t: tok::Theme) -> El {
 }
 
 /// A track row inside a user playlist: selectable, with Remove, Up and Down.
-fn playlist_track_row(pid: PlaylistId, pos: usize, len: usize, tr: Track, selected: bool, t: tok::Theme) -> El {
+fn playlist_track_row(pid: PlaylistId, pos: usize, len: usize, tr: &Track, selected: bool, cat: &Catalogue, t: tok::Theme) -> El {
+    let id = tr.id.clone();
     let mut actions = row().gap(space::S1);
     actions = actions.child(
         el().key(format!("up-{}-{}", pid.0, pos)).label("Move up")
@@ -161,17 +182,20 @@ fn playlist_track_row(pid: PlaylistId, pos: usize, len: usize, tr: Track, select
     actions = actions.child(
         el().key(format!("rm-{}-{}", pid.0, pos)).label("Remove")
             .h(28.0).px(space::S2).radius(radius::SM).center_y().hover(t.hover).focusable(true)
-            .on_press(move |a: &mut App| {
-                a.core.lib.remove_track(pid, tr.id);
+            .on_press({
+                let id = id.clone();
+                move |a: &mut App| {
+                    a.core.lib.remove_track(pid, &id);
+                }
             })
             .child(text("Remove").key("label").font(type_::LABEL).color(t.text_secondary)),
     );
 
-    row().key(format!("track-{}", tr.id.0))
+    row().key(format!("track-{pos}"))
         .checked(selected)
         .fill(if selected { t.hover } else { Color::TRANSPARENT })
         .focusable(true)
-        .on_press(move |a: &mut App| state::select_track(&mut a.core, tr.id))
+        .on_press(move |a: &mut App| state::select_track(&mut a.core, &a.catalogue, id.clone()))
         .h(44.0)
         .px(space::S2)
         .radius(radius::MD)
@@ -180,10 +204,10 @@ fn playlist_track_row(pid: PlaylistId, pos: usize, len: usize, tr: Track, select
         .hover(t.hover)
         .child(
             col().grow(1.0).gap(2.0)
-                .child(text(tr.title).key("title").font(type_::BODY).color(t.text))
-                .child(text(catalog::artist(tr.artist).name).key("track-artist").font(type_::LABEL).color(t.text_secondary)),
+                .child(text(&tr.title).key("title").font(type_::BODY).color(t.text))
+                .child(text(artist_name(cat, &tr.artist)).key("track-artist").font(type_::LABEL).color(t.text_secondary)),
         )
-        .child(text(tr.duration).key("duration").font(type_::LABEL).color(t.text_secondary))
+        .child(text(clock(tr.duration)).key("duration").font(type_::LABEL).color(t.text_secondary))
         .child(actions)
 }
 
@@ -210,21 +234,21 @@ fn page(title: &str, subtitle: &str, t: tok::Theme, body: El) -> El {
         )
 }
 
-fn all_albums_grid(t: tok::Theme) -> El {
-    let cards: Vec<El> = catalog::ALBUMS.iter().map(|a| album_card(*a, t)).collect();
+fn all_albums_grid(cat: &Catalogue, t: tok::Theme) -> El {
+    let cards: Vec<El> = cat.albums().enumerate().map(|(i, a)| album_card(i, a, cat, t)).collect();
     grid(cards, 5)
 }
 
-fn all_artists_grid(t: tok::Theme) -> El {
-    let cards: Vec<El> = catalog::ARTISTS.iter().map(|a| artist_card(*a, t)).collect();
+fn all_artists_grid(cat: &Catalogue, t: tok::Theme) -> El {
+    let cards: Vec<El> = cat.artists().enumerate().map(|(i, a)| artist_card(i, a, t)).collect();
     grid(cards, 6)
 }
 
 // --- Section screens -----------------------------------------------------
 
-pub fn home(t: tok::Theme) -> El {
-    let rec: Vec<El> = catalog::ALBUMS[0..5].iter().map(|a| album_card(*a, t)).collect();
-    let edits: Vec<El> = catalog::EDITORIAL_PLAYLISTS.iter().map(|p| editorial_card(p.id, t)).collect();
+pub fn home(cat: &Catalogue, t: tok::Theme) -> El {
+    let rec: Vec<El> = cat.albums().take(5).enumerate().map(|(i, a)| album_card(i, a, cat, t)).collect();
+    let edits: Vec<El> = cat.editorials().enumerate().map(|(i, p)| editorial_card(i, p, t)).collect();
     page("Home", "Your music, your way", t,
         col().gap(space::S6)
             .child(shelf("Recommended for you", t, rec))
@@ -250,15 +274,15 @@ pub fn feed(t: tok::Theme) -> El {
     page("Feed", "Activity from artists you follow", t, rows)
 }
 
-pub fn popular(s: &State, t: tok::Theme) -> El {
+pub fn popular(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
     let tabs = row().gap(space::S2).pb(space::S3)
         .child(tab("Artists", PopularTab::Artists, s, t))
         .child(tab("Albums", PopularTab::Albums, s, t))
         .child(tab("Tracks", PopularTab::Tracks, s, t));
     let body = match s.popular_tab {
-        PopularTab::Artists => all_artists_grid(t),
-        PopularTab::Albums => all_albums_grid(t),
-        PopularTab::Tracks => track_list(catalog::TRACKS.to_vec(), s.now_playing, t),
+        PopularTab::Artists => all_artists_grid(cat, t),
+        PopularTab::Albums => all_albums_grid(cat, t),
+        PopularTab::Tracks => track_list(cat.tracks().collect(), s.now_playing.as_ref(), cat, t),
     };
     page("Popular", "Global charts", t,
         col().gap(space::S3).child(tabs).child(body))
@@ -278,41 +302,43 @@ fn tab(label: &str, tab: PopularTab, s: &State, t: tok::Theme) -> El {
         .child(text(label).key("label").font(type_::BODY).color(if active { t.bg } else { t.text }))
 }
 
-pub fn for_you(t: tok::Theme) -> El {
-    let a: Vec<El> = catalog::ALBUMS.iter().take(5).map(|x| album_card(*x, t)).collect();
-    let b: Vec<El> = catalog::ALBUMS.iter().skip(5).map(|x| album_card(*x, t)).collect();
+pub fn for_you(cat: &Catalogue, t: tok::Theme) -> El {
+    // One position count across both shelves, so no two cards share a key.
+    let mut cards: Vec<El> = cat.albums().enumerate().map(|(i, x)| album_card(i, x, cat, t)).collect();
+    let b = cards.split_off(cards.len().min(5));
+    let a = cards;
     page("For You", "Built from what you play", t,
         col().gap(space::S6)
             .child(shelf("New releases for you", t, a))
             .child(shelf("From your genres", t, b)))
 }
 
-pub fn liked_songs(s: &State, t: tok::Theme) -> El {
-    let tracks: Vec<Track> = catalog::TRACKS.iter().filter(|tr| s.lib.is_liked(tr.id)).copied().collect();
+pub fn liked_songs(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
+    let tracks: Vec<&Track> = cat.tracks().filter(|tr| s.lib.is_liked(&tr.id)).collect();
     let body = if tracks.is_empty() {
         empty("Nothing liked yet. Tap the heart on the now-playing bar.", t)
     } else {
-        track_list(tracks, s.now_playing, t)
+        track_list(tracks, s.now_playing.as_ref(), cat, t)
     };
     page("Liked Songs", "Tracks you liked", t, body)
 }
 
-pub fn albums(s: &State, t: tok::Theme) -> El {
-    let saved: Vec<Album> = catalog::ALBUMS.iter().filter(|a| s.lib.is_saved_album(a.id)).copied().collect();
+pub fn albums(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
+    let saved: Vec<&Album> = cat.albums().filter(|a| s.lib.is_saved_album(&a.id)).collect();
     let body = if saved.is_empty() {
         empty("No saved albums yet. Open an album and tap Save.", t)
     } else {
-        grid(saved.into_iter().map(|a| album_card(a, t)).collect(), 5)
+        grid(saved.into_iter().enumerate().map(|(i, a)| album_card(i, a, cat, t)).collect(), 5)
     };
     page("Albums", "Albums you saved", t, body)
 }
 
-pub fn artists(s: &State, t: tok::Theme) -> El {
-    let followed: Vec<Artist> = catalog::ARTISTS.iter().filter(|a| s.lib.is_following(a.id)).copied().collect();
+pub fn artists(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
+    let followed: Vec<&Artist> = cat.artists().filter(|a| s.lib.is_following(&a.id)).collect();
     let body = if followed.is_empty() {
         empty("No artists yet. Open an artist and tap Follow.", t)
     } else {
-        grid(followed.into_iter().map(|a| artist_card(a, t)).collect(), 6)
+        grid(followed.into_iter().enumerate().map(|(i, a)| artist_card(i, a, t)).collect(), 6)
     };
     page("Artists", "Artists you follow", t, body)
 }
@@ -421,38 +447,38 @@ pub fn collections(app: &App, t: tok::Theme) -> El {
     page("Collections", "Folders of playlists", t, body)
 }
 
-pub fn local(s: &State, t: tok::Theme) -> El {
-    let mut tracks: Vec<Track> = Vec::new();
-    for a in catalog::ALBUMS {
-        if s.lib.is_downloaded(a.id) {
-            tracks.extend(catalog::tracks_of_album(a.id));
+pub fn local(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
+    let mut tracks: Vec<&Track> = Vec::new();
+    for a in cat.albums() {
+        if s.lib.is_downloaded(&a.id) {
+            tracks.extend(cat.tracks_of_album(&a.id));
         }
     }
     let body = if tracks.is_empty() {
         empty("Nothing on this device. Download an album first.", t)
     } else {
-        track_list(tracks, s.now_playing, t)
+        track_list(tracks, s.now_playing.as_ref(), cat, t)
     };
     page("On this device", "Music you downloaded", t, body)
 }
 
-pub fn history(s: &State, t: tok::Theme) -> El {
-    let tracks: Vec<Track> = s.lib.history.iter().map(|&id| catalog::track(id)).collect();
+pub fn history(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
+    let tracks: Vec<&Track> = s.lib.history.iter().filter_map(|id| cat.track(id)).collect();
     let body = if tracks.is_empty() {
         empty("Nothing played yet.", t)
     } else {
-        track_list(tracks, s.now_playing, t)
+        track_list(tracks, s.now_playing.as_ref(), cat, t)
     };
     page("History", "Recently played", t, body)
 }
 
-pub fn stats(s: &State, t: tok::Theme) -> El {
-    let (recent_artist, recent_track) = recent_artist_and_track(s);
+pub fn stats(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
+    let (recent_artist, recent_track) = recent_artist_and_track(s, cat);
     let playlists = s.lib.playlists.iter().filter(|p| p.is_some()).count();
     let stats: [(&str, String); 6] = [
-        ("Liked tracks", s.lib.liked.count_ones().to_string()),
-        ("Saved albums", s.lib.saved_albums.count_ones().to_string()),
-        ("Followed artists", s.lib.followed.count_ones().to_string()),
+        ("Liked tracks", s.lib.liked.len().to_string()),
+        ("Saved albums", s.lib.saved_albums.len().to_string()),
+        ("Followed artists", s.lib.followed.len().to_string()),
         ("Playlists", playlists.to_string()),
         ("Recent artist", recent_artist),
         ("Recent track", recent_track),
@@ -471,33 +497,30 @@ pub fn stats(s: &State, t: tok::Theme) -> El {
 
 /// The artist and track at the front of history. History is duplicate-free, so
 /// it cannot rank by play frequency; the front is the honest "most recent".
-fn recent_artist_and_track(s: &State) -> (String, String) {
-    let artist = s.lib.history.first()
-        .map(|&id| catalog::artist(catalog::track(id).artist).name.to_string())
-        .unwrap_or_else(|| "—".into());
-    let track = s.lib.history.first()
-        .map(|&id| catalog::track(id).title.to_string())
-        .unwrap_or_else(|| "—".into());
-    (artist, track)
+fn recent_artist_and_track(s: &State, cat: &Catalogue) -> (String, String) {
+    match s.lib.history.first().and_then(|id| cat.track(id)) {
+        Some(tr) => (artist_name(cat, &tr.artist).to_string(), tr.title.clone()),
+        None => ("—".into(), "—".into()),
+    }
 }
 
-pub fn downloads(s: &State, t: tok::Theme) -> El {
-    let downloaded: Vec<Album> = catalog::ALBUMS.iter().filter(|a| s.lib.is_downloaded(a.id)).copied().collect();
+pub fn downloads(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
+    let downloaded: Vec<&Album> = cat.albums().filter(|a| s.lib.is_downloaded(&a.id)).collect();
     let mut rows = col().gap(space::S1);
     if downloaded.is_empty() {
         rows = rows.child(empty("No downloads yet. Open an album and tap Download.", t));
     }
-    for a in downloaded {
-        let id = a.id;
+    for (pos, a) in downloaded.into_iter().enumerate() {
+        let id = a.id.clone();
         rows = rows.child(
-            row().key(format!("dl-{}", a.id.0)).h(44.0).px(space::S2).radius(radius::MD).center_y().gap(space::S3).hover(t.hover)
-                .child(text(a.title).key("title").font(type_::BODY).color(t.text).grow(1.0))
-                .child(text(catalog::artist(a.artist).name).key("artist").font(type_::LABEL).color(t.text_secondary))
+            row().key(format!("dl-{pos}")).h(44.0).px(space::S2).radius(radius::MD).center_y().gap(space::S3).hover(t.hover)
+                .child(text(&a.title).key("title").font(type_::BODY).color(t.text).grow(1.0))
+                .child(text(artist_name(cat, &a.artist)).key("artist").font(type_::LABEL).color(t.text_secondary))
                 .child(text("Done").key("state").font(type_::LABEL).color(t.text_secondary))
-                .child(el().key(format!("rm-dl-{}", a.id.0)).label("Remove")
+                .child(el().key(format!("rm-dl-{pos}")).label("Remove")
                     .h(28.0).px(space::S2).radius(radius::SM).center_y().hover(t.hover).focusable(true)
                     .on_press(move |app: &mut App| {
-                        app.core.lib.remove_download(id);
+                        app.core.lib.remove_download(&id);
                     })
                     .child(text("Remove").key("label").font(type_::LABEL).color(t.text_secondary))),
         );
@@ -505,21 +528,22 @@ pub fn downloads(s: &State, t: tok::Theme) -> El {
     page("Downloads", "Your download queue", t, rows)
 }
 
-pub fn search(t: tok::Theme, edit: &TextEdit) -> El {
+pub fn search(cat: &Catalogue, t: tok::Theme, edit: &TextEdit) -> El {
     let query = edit.text.trim();
     let results = if query.is_empty() {
-        all_albums_grid(t)
+        all_albums_grid(cat, t)
     } else {
         let q = query.to_lowercase();
-        let albums: Vec<El> = catalog::ALBUMS.iter()
-            .filter(|a| a.title.to_lowercase().contains(&q) || catalog::artist(a.artist).name.to_lowercase().contains(&q))
-            .map(|a| album_card(*a, t)).collect();
-        let artists: Vec<El> = catalog::ARTISTS.iter()
-            .filter(|a| a.name.to_lowercase().contains(&q))
-            .map(|a| artist_card(*a, t)).collect();
-        let tracks: Vec<El> = catalog::TRACKS.iter()
-            .filter(|tr| tr.title.to_lowercase().contains(&q) || catalog::artist(tr.artist).name.to_lowercase().contains(&q))
-            .map(|tr| track_row(*tr, false, t)).collect();
+        let matches = |s: &str| s.to_lowercase().contains(&q);
+        let albums: Vec<El> = cat.albums()
+            .filter(|a| matches(&a.title) || matches(artist_name(cat, &a.artist)))
+            .enumerate().map(|(i, a)| album_card(i, a, cat, t)).collect();
+        let artists: Vec<El> = cat.artists()
+            .filter(|a| matches(&a.name))
+            .enumerate().map(|(i, a)| artist_card(i, a, t)).collect();
+        let tracks: Vec<El> = cat.tracks()
+            .filter(|tr| matches(&tr.title) || matches(artist_name(cat, &tr.artist)))
+            .enumerate().map(|(i, tr)| track_row(i, tr, false, cat, t)).collect();
         if albums.is_empty() && artists.is_empty() && tracks.is_empty() {
             text(format!("No results for \"{query}\""))
                 .key("search-empty").font(type_::BODY).color(t.text_secondary)
@@ -579,7 +603,7 @@ pub fn settings(t: tok::Theme) -> El {
                 .focusable(true)
                 .on_press(move |a: &mut App| {
                     a.rename.clear();
-                    state::open_detail(&mut a.core, Route::SettingsPage(p))
+                    state::open_detail(&mut a.core, &a.catalogue, Route::SettingsPage(p))
                 })
                 .child(text(p.label()).key("label").font(type_::BODY).color(t.text))
                 .child(text(">").key("chevron").font(type_::BODY).color(t.text_secondary)),
@@ -760,88 +784,100 @@ fn cover_el(seed: usize, size: f32, round: f32, t: tok::Theme) -> El {
 
 /// A detail screen. The route variant selects the subject; the back affordance
 /// lives in the top bar, not here.
-pub fn detail(route: Route, app: &App, accent: Color, t: tok::Theme) -> El {
+pub fn detail(route: &Route, app: &App, accent: Color, t: tok::Theme) -> El {
     let s = &app.core;
+    let cat = &app.catalogue;
     match route {
-        Route::Album(id) => album_detail(id, s, accent, t),
-        Route::Artist(id) => artist_detail(id, s, accent, t),
-        Route::EditorialPlaylist(id) => editorial_detail(id, s, accent, t),
-        Route::UserPlaylist(id) => user_playlist_detail(id, app, accent, t),
+        Route::Album(id) => album_detail(id, s, cat, accent, t),
+        Route::Artist(id) => artist_detail(id, s, cat, accent, t),
+        Route::EditorialPlaylist(id) => editorial_detail(id, s, cat, accent, t),
+        Route::UserPlaylist(id) => user_playlist_detail(*id, app, accent, t),
         _ => page("Detail", "", t, el()),
     }
 }
 
-fn album_detail(id: catalog::AlbumId, s: &State, accent: Color, t: tok::Theme) -> El {
-    let a = catalog::album(id);
+/// Select the first track of a list the catalogue derives, at the time of the
+/// press, so the button plays what the screen shows.
+fn play_first(first: impl Fn(&Catalogue) -> Option<TrackId> + 'static) -> impl Fn(&mut App) + 'static {
+    move |a: &mut App| {
+        if let Some(track) = first(&a.catalogue) {
+            state::select_track(&mut a.core, &a.catalogue, track);
+        }
+    }
+}
+
+fn album_detail(id: &AlbumId, s: &State, cat: &Catalogue, accent: Color, t: tok::Theme) -> El {
+    let Some(a) = cat.album(id) else {
+        return page("Album", "This album is gone", t, el());
+    };
     let saved = s.lib.is_saved_album(id);
     let downloaded = s.lib.is_downloaded(id);
-    let artist = catalog::artist(a.artist).name;
-    let tracks: Vec<Track> = catalog::tracks_of_album(id).collect();
+    let artist = artist_name(cat, &a.artist);
+    let tracks: Vec<&Track> = cat.tracks_of_album(id).collect();
 
+    let play = id.clone();
+    let save = id.clone();
+    let download = id.clone();
     let actions = vec![
-        action_button("play", "Play", accent, true, t, move |a: &mut App| {
-            if let Some(first) = catalog::tracks_of_album(id).next() {
-                state::select_track(&mut a.core, first.id);
-            }
-        }),
+        action_button("play", "Play", accent, true, t, play_first(move |cat| cat.tracks_of_album(&play).next().map(|tr| tr.id.clone()))),
         action_button("save", if saved { "Remove" } else { "Save" }, accent, false, t, move |a: &mut App| {
-            a.core.lib.toggle_save_album(id);
+            a.core.lib.toggle_save_album(save.clone());
         }),
         action_button("download", if downloaded { "Remove download" } else { "Download" }, accent, false, t, move |a: &mut App| {
-            a.core.lib.toggle_download(id);
+            a.core.lib.toggle_download(download.clone());
         }),
     ];
 
     col().grow(1.0).min_h(0.0)
-        .child(hero(cover_el(id.0 as usize, 200.0, radius::MD, t), a.title, &format!("Album by {artist}"), t, actions))
-        .child(detail_body(track_list(tracks, s.now_playing, t)))
+        .child(hero(cover_el(cover_seed(id.as_str()), 200.0, radius::MD, t), &a.title, &format!("Album by {artist}"), t, actions))
+        .child(detail_body(track_list(tracks, s.now_playing.as_ref(), cat, t)))
 }
 
-fn artist_detail(id: catalog::ArtistId, s: &State, accent: Color, t: tok::Theme) -> El {
-    let a = catalog::artist(id);
+fn artist_detail(id: &ArtistId, s: &State, cat: &Catalogue, accent: Color, t: tok::Theme) -> El {
+    let Some(a) = cat.artist(id) else {
+        return page("Artist", "This artist is gone", t, el());
+    };
     let following = s.lib.is_following(id);
-    let tracks: Vec<Track> = catalog::tracks_of_artist(id).collect();
+    let tracks: Vec<&Track> = cat.tracks_of_artist(id).collect();
 
+    let play = id.clone();
+    let follow = id.clone();
     let actions = vec![
-        action_button("play", "Play", accent, true, t, move |a: &mut App| {
-            if let Some(first) = catalog::tracks_of_artist(id).next() {
-                state::select_track(&mut a.core, first.id);
-            }
-        }),
+        action_button("play", "Play", accent, true, t, play_first(move |cat| cat.tracks_of_artist(&play).next().map(|tr| tr.id.clone()))),
         action_button("follow", if following { "Following" } else { "Follow" }, accent, false, t, move |a: &mut App| {
-            a.core.lib.toggle_follow(id);
+            a.core.lib.toggle_follow(follow.clone());
         }),
     ];
 
     col().grow(1.0).min_h(0.0)
-        .child(hero(cover_el(id.0 as usize + 3, 200.0, 100.0, t), a.name, "Artist", t, actions))
-        .child(detail_body(track_list(tracks, s.now_playing, t)))
+        .child(hero(cover_el(cover_seed(id.as_str()), 200.0, 100.0, t), &a.name, "Artist", t, actions))
+        .child(detail_body(track_list(tracks, s.now_playing.as_ref(), cat, t)))
 }
 
-fn editorial_detail(id: EditorialPlaylistId, s: &State, accent: Color, t: tok::Theme) -> El {
-    let p = catalog::editorial_playlist(id);
-    let tracks: Vec<Track> = p.tracks.iter().map(|&tid| catalog::track(tid)).collect();
+fn editorial_detail(id: &EditorialPlaylistId, s: &State, cat: &Catalogue, accent: Color, t: tok::Theme) -> El {
+    let Some(p) = cat.editorial(id) else {
+        return page("Playlist", "This playlist is gone", t, el());
+    };
+    let tracks: Vec<&Track> = p.tracks.iter().filter_map(|tid| cat.track(tid)).collect();
 
+    let play = id.clone();
     let actions = vec![
-        action_button("play", "Play", accent, true, t, move |a: &mut App| {
-            if let Some(&first) = catalog::editorial_playlist(id).tracks.first() {
-                state::select_track(&mut a.core, first);
-            }
-        }),
+        action_button("play", "Play", accent, true, t, play_first(move |cat| cat.editorial(&play).and_then(|p| p.tracks.first().cloned()))),
     ];
 
     col().grow(1.0).min_h(0.0)
-        .child(hero(cover_el(id.0 as usize + 6, 200.0, radius::MD, t), p.name, p.description, t, actions))
-        .child(detail_body(track_list(tracks, s.now_playing, t)))
+        .child(hero(cover_el(cover_seed(id.as_str()), 200.0, radius::MD, t), &p.name, &p.description, t, actions))
+        .child(detail_body(track_list(tracks, s.now_playing.as_ref(), cat, t)))
 }
 
 fn user_playlist_detail(id: PlaylistId, app: &App, accent: Color, t: tok::Theme) -> El {
     let s = &app.core;
+    let cat = &app.catalogue;
     let Some(p) = s.lib.playlist(id) else {
         return page("Playlist", "", t, el());
     };
     let name = p.name.clone();
-    let tracks: Vec<Track> = p.tracks.iter().map(|&tid| catalog::track(tid)).collect();
+    let tracks: Vec<&Track> = p.tracks.iter().filter_map(|tid| cat.track(tid)).collect();
     let len = tracks.len();
 
     let rename_field = text_input(&app.rename, type_::BODY)
@@ -857,7 +893,7 @@ fn user_playlist_detail(id: PlaylistId, app: &App, accent: Color, t: tok::Theme)
 
     let actions = vec![
         action_button("add", "Add playing track", accent, true, t, move |a: &mut App| {
-            if let Some(tr) = a.core.now_playing {
+            if let Some(tr) = a.core.now_playing.clone() {
                 a.core.lib.add_track(id, tr);
             }
         }),
@@ -884,7 +920,7 @@ fn user_playlist_detail(id: PlaylistId, app: &App, accent: Color, t: tok::Theme)
     } else {
         let mut list = col().key("tracks").gap(space::S1);
         for (pos, tr) in tracks.iter().enumerate() {
-            list = list.child(playlist_track_row(id, pos, len, *tr, s.now_playing == Some(tr.id), t));
+            list = list.child(playlist_track_row(id, pos, len, tr, s.now_playing.as_ref() == Some(&tr.id), cat, t));
         }
         body = body.child(list);
     }

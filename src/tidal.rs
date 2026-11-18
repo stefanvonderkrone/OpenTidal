@@ -11,9 +11,8 @@ use serde_json::Value;
 
 use crate::auth::{OAuthConfig, Token};
 
-/// A Tidal id. Tidal ids are opaque strings, not the contiguous `u8` ids the
-/// placeholder catalogue used. The newtype keeps an id from being mistaken for
-/// any other string.
+/// A Tidal user id, an opaque string. The newtype keeps it from being mistaken
+/// for any other string. Catalogue ids have their own types in `catalogue.rs`.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct UserId(pub String);
 

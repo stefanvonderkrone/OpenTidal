@@ -9,11 +9,11 @@
 //! Together they mean that an id that exists names a member of the catalogue
 //! that minted it, for the life of that catalogue.
 
-#![allow(dead_code)]
-
 use std::borrow::Borrow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+
+use crate::library::Library;
 
 macro_rules! id {
     ($(#[$doc:meta])* $name:ident) => {
@@ -210,9 +210,6 @@ impl Catalogue {
     pub fn track_id(&self, raw: &str) -> Option<TrackId> {
         self.track_at.get_key_value(raw).map(|(id, _)| id.clone())
     }
-    pub fn editorial_id(&self, raw: &str) -> Option<EditorialPlaylistId> {
-        self.editorial_at.get_key_value(raw).map(|(id, _)| id.clone())
-    }
 
     pub fn artist(&self, id: &ArtistId) -> Option<&Artist> {
         self.artist_at.get(id).map(|&i| &self.artists[i])
@@ -238,6 +235,58 @@ impl Catalogue {
     }
     pub fn editorials(&self) -> impl Iterator<Item = &EditorialPlaylist> {
         self.editorial.iter()
+    }
+
+    /// The rows for everything a library names, closed over parents: a track
+    /// brings its album and artist, and an album brings its artist. `Store::write`
+    /// stores these before the library rows that name them.
+    pub fn rows_for(&self, lib: &Library) -> CatalogueRows {
+        let tracks: BTreeSet<&TrackId> = lib
+            .liked
+            .iter()
+            .chain(&lib.history)
+            .chain(lib.playlists.iter().flatten().flat_map(|p| &p.tracks))
+            .collect();
+        let tracks: Vec<&Track> = tracks.into_iter().filter_map(|id| self.track(id)).collect();
+        let albums: BTreeSet<&AlbumId> = lib
+            .saved_albums
+            .iter()
+            .chain(&lib.downloaded)
+            .chain(tracks.iter().map(|t| &t.album))
+            .collect();
+        let albums: Vec<&Album> = albums.into_iter().filter_map(|id| self.album(id)).collect();
+        let artists: BTreeSet<&ArtistId> = lib
+            .followed
+            .iter()
+            .chain(albums.iter().map(|a| &a.artist))
+            .chain(tracks.iter().map(|t| &t.artist))
+            .collect();
+        CatalogueRows {
+            artists: artists
+                .into_iter()
+                .filter_map(|id| self.artist(id))
+                .map(|a| ArtistRow { id: a.id.as_str().into(), name: a.name.clone() })
+                .collect(),
+            albums: albums
+                .iter()
+                .map(|a| AlbumRow {
+                    id: a.id.as_str().into(),
+                    title: a.title.clone(),
+                    artist: a.artist.as_str().into(),
+                })
+                .collect(),
+            tracks: tracks
+                .iter()
+                .map(|t| TrackRow {
+                    id: t.id.as_str().into(),
+                    title: t.title.clone(),
+                    artist: t.artist.as_str().into(),
+                    album: t.album.as_str().into(),
+                    duration: iso_duration(t.duration),
+                })
+                .collect(),
+            editorial: Vec::new(),
+        }
     }
 
     /// Every track on an album, in catalogue order.
@@ -467,7 +516,7 @@ mod tests {
         assert!(cat.track_id("101").is_none(), "a track with an unknown album got in");
         assert!(cat.track_id("102").is_none(), "a track with an unknown artist got in");
         assert!(cat.track_id("100").is_some());
-        let e = cat.editorial(&cat.editorial_id("e").unwrap()).unwrap();
+        let e = cat.editorials().find(|p| p.id.as_str() == "e").unwrap();
         assert_eq!(e.tracks, vec![cat.track_id("100").unwrap()]);
     }
 
@@ -514,6 +563,27 @@ mod tests {
         assert!(cat.artist_id("has space").is_none());
         assert!(cat.artist_id(&long).is_none());
         assert_eq!(cat.artists().count(), 10);
+    }
+
+    /// The rows for a library hold every entry it names and their parents, and
+    /// nothing else. Absorbed into an empty catalogue, they resolve the library.
+    #[test]
+    fn rows_for_closes_over_parents() {
+        let cat = Catalogue::seed();
+        let mut lib = Library::default();
+        lib.toggle_like(cat.track_id("seed-track-3").unwrap());
+        lib.toggle_follow(cat.artist_id("seed-artist-9").unwrap());
+        lib.toggle_save_album(cat.album_id("seed-album-5").unwrap());
+        let rows = cat.rows_for(&lib);
+        let tracks: Vec<&str> = rows.tracks.iter().map(|t| t.id.as_str()).collect();
+        let albums: Vec<&str> = rows.albums.iter().map(|a| a.id.as_str()).collect();
+        let artists: Vec<&str> = rows.artists.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(tracks, ["seed-track-3"]);
+        assert_eq!(albums, ["seed-album-1", "seed-album-5"]);
+        assert_eq!(artists, ["seed-artist-1", "seed-artist-5", "seed-artist-9"]);
+        let mut fresh = Catalogue::default();
+        assert_eq!(fresh.absorb(rows), 0);
+        assert_eq!(lib.check(&fresh), Ok(()));
     }
 
     /// Tidal sends a duration as ISO 8601. A track whose duration does not parse

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use rune::{Latest, TextEdit, Waker};
 use serde::Deserialize;
 use crate::auth::{self, Auth, OAuthConfig, Token, TokenStore};
+use crate::catalogue::Catalogue;
 use crate::library::Library;
 use crate::state::State;
 use crate::store::Store;
@@ -19,6 +20,10 @@ use crate::tidal::{self, MusicService, ServiceError, User};
 
 pub struct App {
     pub core: State,
+    /// The one catalogue. It starts from the seed and only grows: a load absorbs
+    /// the catalogue rows the file holds. `State` holds ids only, so the proof
+    /// never hashes the catalogue.
+    pub catalogue: Catalogue,
     pub search: TextEdit,
     /// The rename buffer, shared by the playlist and profile rename fields.
     pub rename: TextEdit,
@@ -170,7 +175,7 @@ impl App {
         };
         // A missing row means a new account, so the in-memory library must not
         // carry the previous account's rows into this one.
-        match store.load(user_id) {
+        match store.load(user_id, &mut self.catalogue) {
             Ok(Some(loaded)) => {
                 if loaded.dropped > 0 {
                     eprintln!(
@@ -191,7 +196,7 @@ impl App {
                 // from the library, so the next frame retries. Closing the store
                 // here would disable saving for the rest of the session after one
                 // transient error, and the user would lose every edit.
-                let row_pending = match store.write(user_id, &self.core.lib) {
+                let row_pending = match store.write(user_id, &self.core.lib, &self.catalogue) {
                     Ok(()) => {
                         self.on_disk = self.core.lib.clone();
                         false
@@ -243,7 +248,7 @@ impl App {
         // still equal `on_disk`, so this has to be checked before that
         // comparison, or the row is never written.
         if open.row_pending {
-            match open.store.write(&open.user_id, &self.core.lib) {
+            match open.store.write(&open.user_id, &self.core.lib, &self.catalogue) {
                 Ok(()) => {
                     open.row_pending = false;
                     self.on_disk = self.core.lib.clone();
@@ -266,7 +271,7 @@ impl App {
             self.write_error = None;
             return true;
         }
-        match open.store.write(&open.user_id, &self.core.lib) {
+        match open.store.write(&open.user_id, &self.core.lib, &self.catalogue) {
             Ok(()) => {
                 self.on_disk = self.core.lib.clone();
                 self.write_failed = false;
@@ -634,8 +639,10 @@ impl Default for App {
             env_or("TIDAL_REDIRECT_URI", &file.redirect_uri),
             env_or("TIDAL_SCOPE", &file.scope),
         );
+        let catalogue = Catalogue::seed();
         App {
-            core: State::default(),
+            core: State::new(&catalogue),
+            catalogue,
             search: TextEdit::new(""),
             rename: TextEdit::new(""),
             auth: Auth::default(),
@@ -795,7 +802,13 @@ fn token_store_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::TrackId;
+    use crate::catalogue::{Catalogue, TrackId};
+
+    /// A seed track. Ids compare by text, so this equals the id the app's own
+    /// catalogue mints.
+    fn track(n: usize) -> TrackId {
+        Catalogue::seed().track_id(&format!("seed-track-{n}")).unwrap()
+    }
 
     #[test]
     fn the_default_token_store_is_the_file() {
@@ -913,7 +926,7 @@ mod tests {
         first.open_library("173210380", &path);
         first.core.lib.set_name("Ada".to_string());
         let id = first.core.lib.create_playlist("Road trip".to_string()).unwrap();
-        first.core.lib.add_track(id, TrackId(3));
+        first.core.lib.add_track(id, track(3));
         first.flush_library();
 
         // A second run of the app, built through the same fixture so this test
@@ -922,7 +935,7 @@ mod tests {
         second.open_library("173210380", &path);
         assert_eq!(second.core.lib.name, "Ada");
         assert_eq!(second.core.lib.playlist(id).unwrap().name, "Road trip");
-        assert_eq!(second.core.lib.playlist(id).unwrap().tracks, vec![TrackId(3)]);
+        assert_eq!(second.core.lib.playlist(id).unwrap().tracks, vec![track(3)]);
         assert!(second.library.is_some());
 
     }
@@ -937,7 +950,7 @@ mod tests {
         let mut app = app_without_a_session();
         app.open_library("173210380", &path);
         app.core.lib.set_name("Ada".to_string());
-        app.core.lib.toggle_like(TrackId(1));
+        app.core.lib.toggle_like(track(1));
         app.auth = Auth::SignedIn { token: fake_token() };
         assert!(app.library.is_some());
 
@@ -1375,7 +1388,7 @@ mod tests {
 
         let reopened = Store::open(&path).unwrap();
         assert!(
-            reopened.load("173210380").unwrap().is_some(),
+            reopened.load("173210380", &mut Catalogue::seed()).unwrap().is_some(),
             "the row was never written, so the account would be new on every launch"
         );
         assert!(!app.library.as_ref().unwrap().row_pending, "the retry stayed pending");
@@ -1418,13 +1431,13 @@ mod tests {
         let mut app = app_without_a_session();
         app.open_library("173210380", &path);
         let id = app.core.lib.create_playlist("Keep".to_string()).unwrap();
-        crate::state::open_detail(&mut app.core, crate::state::Route::UserPlaylist(id));
+        crate::state::open_detail(&mut app.core, &app.catalogue, crate::state::Route::UserPlaylist(id));
         assert_eq!(app.core.stack.last(), Some(&crate::state::Route::UserPlaylist(id)));
-        assert!(crate::state::invariant(&app.core), "the fixture is already invalid");
+        assert!(crate::state::invariant(&app.core, &app.catalogue), "the fixture is already invalid");
 
         app.forget_session();
         assert!(
-            crate::state::invariant(&app.core),
+            crate::state::invariant(&app.core, &app.catalogue),
             "a route to a playlist that no longer exists survived sign-out"
         );
     }
@@ -1444,7 +1457,7 @@ mod tests {
             seen.fetch_add(1, Ordering::SeqCst);
         }));
 
-        app.core.lib.toggle_like(TrackId(3));
+        app.core.lib.toggle_like(track(3));
         app.wake_if_dirty();
         assert_eq!(count.load(Ordering::SeqCst), 0, "a library with no store woke the loop");
 
@@ -1477,7 +1490,7 @@ mod tests {
 
         let reopened = Store::open(&path).unwrap();
         assert!(
-            reopened.load("999").unwrap().is_some(),
+            reopened.load("999", &mut Catalogue::seed()).unwrap().is_some(),
             "a new account left no row, so a restart would not find it"
         );
     }
@@ -1493,8 +1506,8 @@ mod tests {
         let mut seeded = app_without_a_session();
         seeded.open_library("173210380", &path);
         seeded.core.lib.set_name("Ada".to_string());
-        seeded.core.lib.toggle_like(TrackId(0));
-        seeded.core.lib.toggle_like(TrackId(1));
+        seeded.core.lib.toggle_like(track(0));
+        seeded.core.lib.toggle_like(track(1));
         seeded.flush_library();
         drop(seeded);
 
@@ -1503,7 +1516,7 @@ mod tests {
         // later build no longer resolves, which no write can produce.
         conn.execute_batch(
             "PRAGMA foreign_keys = OFF;
-             UPDATE \"like\" SET track_id = '999' WHERE track_id = '1' AND user_id = '173210380';",
+             UPDATE \"like\" SET track_id = '999' WHERE track_id = 'seed-track-1' AND user_id = '173210380';",
         )
         .unwrap();
         drop(conn);
@@ -1512,13 +1525,13 @@ mod tests {
         app.open_library("173210380", &path);
         assert!(app.library.is_some(), "one unknown item closed the database");
         assert_eq!(app.core.lib.name, "Ada");
-        assert_eq!(app.core.lib.liked.count_ones(), 1, "the good like was lost");
+        assert_eq!(app.core.lib.liked.len(), 1, "the good like was lost");
 
-        app.core.lib.toggle_like(TrackId(2));
+        app.core.lib.toggle_like(track(2));
         app.flush_library();
         let mut reread = app_without_a_session();
         reread.open_library("173210380", &path);
-        assert_eq!(reread.core.lib.liked.count_ones(), 2, "the new like was not saved");
+        assert_eq!(reread.core.lib.liked.len(), 2, "the new like was not saved");
 
     }
 
@@ -1551,12 +1564,12 @@ mod tests {
         let mut first = app_without_a_session();
         first.open_library("111", &path);
         first.core.lib.set_name("Ada".to_string());
-        first.core.lib.toggle_like(TrackId(0));
+        first.core.lib.toggle_like(track(0));
         first.flush_library();
         first.sign_out();
         first.open_library("222", &path);
 
-        assert!(first.core.lib.liked == 0, "account B inherited A's likes");
+        assert!(first.core.lib.liked.is_empty(), "account B inherited A's likes");
         assert!(first.library.is_some(), "account B has no database");
 
     }
@@ -1583,7 +1596,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .store
-                .load("173210380")
+                .load("173210380", &mut Catalogue::seed())
                 .unwrap()
                 .unwrap()
                 .lib
@@ -1603,13 +1616,13 @@ mod tests {
         let mut app = app_without_a_session();
         app.open_library("173210380", &path);
         app.core.lib.set_name("Ada".to_string());
-        app.core.lib.toggle_like(TrackId(5));
+        app.core.lib.toggle_like(track(5));
         app.quit();
 
         let mut reread = app_without_a_session();
         reread.open_library("173210380", &path);
         assert_eq!(reread.core.lib.name, "Ada");
-        assert!(reread.core.lib.is_liked(TrackId(5)));
+        assert!(reread.core.lib.is_liked(&track(5)));
 
     }
 
@@ -1634,7 +1647,7 @@ mod tests {
         app.wake_if_dirty();
         assert_eq!(count.load(Ordering::SeqCst), 0, "a clean library woke the loop");
 
-        app.core.lib.toggle_like(TrackId(3));
+        app.core.lib.toggle_like(track(3));
         app.wake_if_dirty();
         assert_eq!(count.load(Ordering::SeqCst), 1, "a change did not wake the loop");
 

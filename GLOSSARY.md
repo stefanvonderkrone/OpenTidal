@@ -5,8 +5,17 @@ docs. One name per thing.
 
 ## Catalogue
 
-The immutable content the app ships with. It never changes, so it sits outside
-the state space the invariant proof explores.
+The content the app can show, in `src/catalogue.rs`. `App` owns the one
+catalogue, outside `State`, so it sits outside the state space the invariant
+proof explores. It starts from the seed and only grows: a load absorbs the
+catalogue rows the store holds, and no operation removes an entry.
+
+- **id** — an opaque Tidal string, such as `77610756`. Only a `Catalogue` mints
+  an id, and only for a member. An id is never a position.
+- **seed** — the built-in catalogue, with ids such as `seed-track-0`. The
+  `seed-` prefix cannot collide with a numeric Tidal id.
+- **absorb** — merge unvalidated catalogue rows into the catalogue. It is the
+  only writer, and it drops a row whose parent it does not hold.
 
 - **artist** — a performer. An album and a track each name one artist.
 - **album** — a release by one artist. A track names one album.

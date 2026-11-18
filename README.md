@@ -19,9 +19,9 @@ Sign in to Tidal now works through the `MusicService` port in `src/tidal.rs`.
 The OAuth authorization-code flow with PKCE lives in `src/auth.rs`, and the
 signed-in user's name shows in the sidebar. The deterministic fake service
 backs the headless proof; set `OPENTIDAL_LIVE=1` (and the `TIDAL_*` env vars)
-to use the real client and the macOS keychain. The catalogue is still
-placeholder content, so there is no real catalogue, playback, or library sync
-yet. Those are later work.
+to use the real client and the macOS keychain. The catalogue is keyed by opaque
+Tidal string ids, but it still starts from built-in seed content, so there is no
+real catalogue fetch, playback, or library sync yet. Those are later work.
 
 ## Build and run
 
@@ -99,12 +99,13 @@ transitions, and now holds the user's `Library`. Its tests prove the combined
 nav-and-library invariant: no route, playlist, history entry or saved item
 references an id that does not exist.
 
-`src/catalog.rs` is the immutable catalogue: artists, albums and tracks as a
-graph (a track names its album and artist), plus the read-only editorial
-playlists, with id newtypes.
+`src/catalogue.rs` is the catalogue: artists, albums and tracks as a graph (a
+track names its album and artist), plus the read-only editorial playlists. Ids
+are opaque Tidal strings. Only a `Catalogue` mints an id, and only for a member.
+The catalogue starts from a built-in seed and only grows.
 
-`src/library.rs` is the single local user's data — liked/saved/followed/
-downloaded bitsets, history, user playlists and collections — and its
+`src/library.rs` is the single local user's data: the liked, saved, followed
+and downloaded sets, history, user playlists and collections. It holds their
 validated operations, with an exhaustive invariant proof.
 
 `src/app.rs` is the rune app state. It holds the proven `State` core plus the

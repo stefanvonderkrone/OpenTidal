@@ -203,8 +203,8 @@ While the app is read-only, the library is a mirror of Tidal, not a truth.
 Every row came from Tidal. Tidal still holds it.
 
 **That recovery is planned, not built.** The sync is not in this branch: the
-catalogue it needs does not exist yet, and the evidence table marks every sync
-check `pending: sync PR`. So today a row dropped by `Store::load` stays gone
+catalogue now has Tidal ids and a place on disk, but nothing fetches it yet, and
+the evidence table marks every sync check `pending: sync PR`. So today a row dropped by `Store::load` stays gone
 until a sync exists. The rule below says what the drop does now and what the
 sync will make true later; do not read it as a working recovery path.
 
@@ -217,8 +217,9 @@ stays closed for writing, so a save cannot overwrite what the app could not
 read.
 
 Two tables hold data no server has: `download` and `history`. A drop there is
-permanent, so the rule needs one more sentence. A drop happens only when the
-catalogue stops shipping an id, which means the app no longer has the album or
+permanent, so the rule needs one more sentence. A write stores the catalogue
+rows a library names, and the catalogue never forgets an id, so a drop happens
+only when the file is damaged, which means the app no longer has the album or
 the track. A downloaded album the app cannot name is not something the user can
 play, and a history entry it cannot name is not something a screen can show. So
 the row went with the content, and nothing the user can reach is lost.
@@ -265,8 +266,9 @@ the route. Raw SQL would break the invariant on the bulk path.
 
 ## Load and the invariant
 
-`src/library.rs` ids are slot indices into fixed arrays, and `src/state.rs`
-proves that no route, playlist, or saved item dangles after each operation.
+`src/library.rs` playlist ids are slot indices into a fixed array, catalogue ids
+are opaque Tidal strings, and `src/state.rs` proves that no route, playlist, or
+saved item dangles after each operation.
 Load is a new way into that state, so it must not bypass the proof.
 
 The rules:
@@ -370,6 +372,10 @@ nothing there is a test.
 | A migrated file has the fresh schema | Compare `sqlite_master` of a fresh and a migrated file | test: `a_fresh_and_a_migrated_schema_match` |
 | A failed migration leaves version 1 | A view named `history` fails the last drop, assert version 1 and the `like` rows | test: `a_failed_migration_leaves_version_one` |
 | A non-text id costs only its row | Plant a blob id, assert the drop and the rest of the library | test: `a_non_text_id_is_dropped_not_fatal` |
+| A write keeps the catalogue rows it names | Write a library that names a fetched track, load into the seed alone, assert the track comes back | test: `a_write_stores_the_catalogue_rows_it_names` |
+| A library row needs its catalogue row | Insert a like with no track row, assert the foreign key refuses it | test: `a_library_row_needs_its_catalogue_row` |
+| A route outside the catalogue cannot open | Open an album id from a larger catalogue, assert the stack is unchanged | test: `opening_an_unknown_album_is_refused` |
+| A track outside the catalogue cannot play | Select a track id from a larger catalogue, assert the state is unchanged | test: `selecting_an_unknown_track_is_refused` |
 | An invalid history row cannot hide a valid entry | Seed an unknown track then two distinct valid ones, assert both load | test: `an_unknown_history_row_does_not_hide_a_valid_one` |
 | The sync never touches local tables | Seed a `download` and a `history` row, sync, assert both remain | pending: sync PR |
 

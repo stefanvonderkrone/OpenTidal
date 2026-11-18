@@ -4,7 +4,6 @@
 
 mod app;
 mod auth;
-mod catalog;
 mod catalogue;
 mod library;
 mod screens;
@@ -15,7 +14,6 @@ mod tidal;
 use rune::tok::{self, radius, space, type_};
 use rune::{AppSpec, Color, Cx, El, Icon, Key, ScrollSpec, col, el, icon, row, text};
 use app::App;
-use catalog::TrackId;
 use state::{Group, Route, State};
 
 // The accent count must match the rune palette the app draws from.
@@ -102,6 +100,7 @@ fn view(app: &App, _cx: &mut Cx<App>) -> El {
     let s = &app.core;
     let t = tok::theme(true);
     let accent = tok::accent(s.accent, true);
+    let cat = &app.catalogue;
 
     col()
         .key("app")
@@ -113,7 +112,7 @@ fn view(app: &App, _cx: &mut Cx<App>) -> El {
                 .child(sidebar(app, t, accent))
                 .child(main_col(app, t, accent)),
         )
-        .child(now_playing(s, t, accent))
+        .child(now_playing(s, cat, t, accent))
 }
 
 fn nav_item(route: Route, selected: bool, t: tok::Theme, accent: Color) -> El {
@@ -130,7 +129,7 @@ fn nav_item(route: Route, selected: bool, t: tok::Theme, accent: Color) -> El {
         .focusable(true)
         .on_press(move |a: &mut App| {
             a.rename.clear();
-            state::open_section(&mut a.core, route)
+            state::open_section(&mut a.core, route.clone())
         })
         .child(
             text(name)
@@ -172,8 +171,10 @@ fn sidebar(app: &App, t: tok::Theme, accent: Color) -> El {
     );
 
     for route in state::SECTIONS {
-        let item = nav_item(route, state::current(s) == route, t, accent);
-        match route.group() {
+        let selected = state::current(s) == &route;
+        let group = route.group();
+        let item = nav_item(route, selected, t, accent);
+        match group {
             Group::Primary => primary = primary.child(item),
             Group::Library => library = library.child(item),
             Group::Bottom => bottom = bottom.child(item),
@@ -275,31 +276,34 @@ fn main_col(app: &App, t: tok::Theme, accent: Color) -> El {
 }
 
 fn screen_body(app: &App, t: tok::Theme, accent: Color) -> El {
-    match state::current(&app.core) {
-        Route::Home => screens::home(t),
+    let s = &app.core;
+    let cat = &app.catalogue;
+    match state::current(s) {
+        Route::Home => screens::home(cat, t),
         Route::Feed => screens::feed(t),
-        Route::Popular => screens::popular(&app.core, t),
-        Route::ForYou => screens::for_you(t),
-        Route::LikedSongs => screens::liked_songs(&app.core, t),
-        Route::Albums => screens::albums(&app.core, t),
-        Route::Artists => screens::artists(&app.core, t),
-        Route::Playlists => screens::playlists(&app.core, t),
+        Route::Popular => screens::popular(s, cat, t),
+        Route::ForYou => screens::for_you(cat, t),
+        Route::LikedSongs => screens::liked_songs(s, cat, t),
+        Route::Albums => screens::albums(s, cat, t),
+        Route::Artists => screens::artists(s, cat, t),
+        Route::Playlists => screens::playlists(s, t),
         Route::Collections => screens::collections(app, t),
-        Route::Local => screens::local(&app.core, t),
-        Route::History => screens::history(&app.core, t),
-        Route::Stats => screens::stats(&app.core, t),
-        Route::Downloads => screens::downloads(&app.core, t),
-        Route::Search => screens::search(t, &app.search),
+        Route::Local => screens::local(s, cat, t),
+        Route::History => screens::history(s, cat, t),
+        Route::Stats => screens::stats(s, cat, t),
+        Route::Downloads => screens::downloads(s, cat, t),
+        Route::Search => screens::search(cat, t, &app.search),
         Route::Settings => screens::settings(t),
-        Route::SettingsPage(p) => screens::settings_page(p, app, t),
+        Route::SettingsPage(p) => screens::settings_page(*p, app, t),
         route => screens::detail(route, app, accent, t),
     }
 }
 
-fn now_playing(s: &State, t: tok::Theme, accent: Color) -> El {
-    let id = s.now_playing.unwrap_or(TrackId(0));
-    let tr = catalog::track(id);
-    let liked = s.lib.is_liked(id);
+fn now_playing(s: &State, cat: &catalogue::Catalogue, t: tok::Theme, accent: Color) -> El {
+    let tr = s.now_playing.as_ref().and_then(|id| cat.track(id));
+    let liked = s.now_playing.as_ref().is_some_and(|id| s.lib.is_liked(id));
+    let title = tr.map_or("Nothing playing", |tr| tr.title.as_str());
+    let artist = tr.and_then(|tr| cat.artist(&tr.artist)).map_or("", |a| a.name.as_str());
 
     let like_btn = el().key("like")
         .label(if liked { "Unlike" } else { "Like" })
@@ -309,7 +313,7 @@ fn now_playing(s: &State, t: tok::Theme, accent: Color) -> El {
         .hover(t.hover)
         .focusable(true)
         .on_press(move |a: &mut App| {
-            if let Some(tr) = a.core.now_playing {
+            if let Some(tr) = a.core.now_playing.clone() {
                 a.core.lib.toggle_like(tr);
             }
         })
@@ -357,8 +361,8 @@ fn now_playing(s: &State, t: tok::Theme, accent: Color) -> El {
                 .child(like_btn)
                 .child(
                     col().gap(2.0)
-                        .child(text(tr.title).key("track").font(type_::BODY).color(t.text))
-                        .child(text(catalog::artist(tr.artist).name).key("artist").font(type_::LABEL).color(t.text_secondary)),
+                        .child(text(title).key("track").font(type_::BODY).color(t.text))
+                        .child(text(artist).key("artist").font(type_::LABEL).color(t.text_secondary)),
                 ),
         )
         .child(

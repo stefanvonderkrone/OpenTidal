@@ -8,9 +8,7 @@
 //! item references an id that does not exist, and that deleting a playlist can
 //! never leave a dangling route behind.
 
-use crate::catalog::{AlbumId, ArtistId, EditorialPlaylistId, TrackId};
-#[cfg(test)]
-use crate::catalog;
+use crate::catalogue::{AlbumId, ArtistId, Catalogue, EditorialPlaylistId, TrackId};
 use crate::library::{Library, PlaylistId};
 
 /// Number of accent colours. Matches `rune::tok::ACCENT_NAMES.len()`;
@@ -39,7 +37,7 @@ pub enum SettingsPage {
 }
 
 impl SettingsPage {
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             SettingsPage::Playback => "Playback",
             SettingsPage::Quality => "Quality",
@@ -54,10 +52,10 @@ impl SettingsPage {
 
 /// A screen in the app. The section variants are the top-level sidebar and
 /// top-bar entries. The detail variants carry an id so a detail screen can
-/// never exist without its subject. Catalogue ids (`Album`, `Artist`,
-/// `EditorialPlaylist`) are valid by type; a `UserPlaylist` id is a slot that
-/// may be empty, so opening and deleting both guard it.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// never exist without its subject. A catalogue id is minted only for a member,
+/// and a `UserPlaylist` id is a slot that may be empty, so [`resolves`] guards
+/// both on the way in. `Clone`, not `Copy`, because a catalogue id holds text.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Route {
     Home,
     Feed,
@@ -94,7 +92,7 @@ pub enum Group {
 impl Route {
     /// The route's human name. Detail routes return a generic name; the view
     /// replaces it with the subject's title.
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             Route::Home => "Home",
             Route::Feed => "Feed",
@@ -120,7 +118,7 @@ impl Route {
     }
 
     /// The sidebar region the section route belongs to.
-    pub fn group(self) -> Group {
+    pub fn group(&self) -> Group {
         match self {
             Route::Home | Route::Feed | Route::Popular | Route::ForYou => Group::Primary,
             Route::LikedSongs | Route::Albums | Route::Artists | Route::Playlists
@@ -168,52 +166,56 @@ pub struct State {
     pub lib: Library,
 }
 
-impl Default for State {
-    fn default() -> Self {
+impl State {
+    /// The state the app starts in. The first catalogue track is now playing, so
+    /// a state never names a track the catalogue lacks.
+    pub fn new(cat: &Catalogue) -> State {
         State {
             stack: vec![Route::Home],
             playing: true,
             accent: 0,
             collapsed: false,
             popular_tab: PopularTab::Artists,
-            now_playing: Some(TrackId(0)),
+            now_playing: cat.tracks().next().map(|t| t.id.clone()),
             lib: Library::default(),
         }
     }
 }
 
-/// The full safety invariant. Every reachable state has a non-empty stack,
-/// an in-range accent and now-playing track, no route to a deleted playlist,
-/// and a valid library. Test-only: the proof invokes it, the binary does not.
-#[cfg(test)]
-pub fn invariant(s: &State) -> bool {
-    s.accent < ACCENT_LEN
-        && !s.stack.is_empty()
-        && now_playing_valid(s)
-        && no_dangling_playlist_route(s)
-        && s.lib.check().is_ok()
-}
-
-#[cfg(test)]
-fn now_playing_valid(s: &State) -> bool {
-    match s.now_playing {
-        Some(t) => (t.0 as usize) < catalog::TRACKS.len(),
-        None => true,
+/// Whether a route names something that exists: a catalogue member, or a user
+/// playlist slot that holds a playlist. `open_detail` refuses a route that does
+/// not resolve, and the invariant requires every route on the stack to resolve.
+pub fn resolves(s: &State, cat: &Catalogue, route: &Route) -> bool {
+    match route {
+        Route::Album(id) => cat.album(id).is_some(),
+        Route::Artist(id) => cat.artist(id).is_some(),
+        Route::EditorialPlaylist(id) => cat.editorial(id).is_some(),
+        Route::UserPlaylist(id) => s.lib.playlist(*id).is_some(),
+        _ => true,
     }
 }
 
+/// The full safety invariant. Every reachable state has a non-empty stack,
+/// an in-range accent, a now-playing track in the catalogue, only routes that
+/// resolve, and a valid library. Test-only: the proof invokes it, the binary
+/// does not.
 #[cfg(test)]
-fn no_dangling_playlist_route(s: &State) -> bool {
-    s.stack.iter().all(|r| match r {
-        Route::UserPlaylist(id) => s.lib.playlist(*id).is_some(),
-        _ => true,
-    })
+pub fn invariant(s: &State, cat: &Catalogue) -> bool {
+    s.accent < ACCENT_LEN
+        && !s.stack.is_empty()
+        && s.now_playing.as_ref().is_none_or(|t| cat.track(t).is_some())
+        && s.stack.iter().all(|r| resolves(s, cat, r))
+        && s.lib.check(cat).is_ok()
 }
+
+/// The root a state falls back to. A `static`, because a route that can hold
+/// text cannot be borrowed from a temporary.
+static HOME: Route = Route::Home;
 
 /// The current screen. Falls back to Home on an empty stack, which the
 /// invariant says never happens.
-pub fn current(s: &State) -> Route {
-    *s.stack.last().unwrap_or(&Route::Home)
+pub fn current(s: &State) -> &Route {
+    s.stack.last().unwrap_or(&HOME)
 }
 
 /// Open a top-level section, replacing any detail depth.
@@ -223,13 +225,10 @@ pub fn open_section(s: &mut State, route: Route) {
 }
 
 /// Drill into a detail screen, stacking it on the current one. Reopening the
-/// same route is a no-op, which keeps the stack finite. Opening a user
-/// playlist that no longer exists is refused, so a dangling route can never
-/// enter the stack.
-pub fn open_detail(s: &mut State, route: Route) {
-    if let Route::UserPlaylist(id) = route
-        && s.lib.playlist(id).is_none()
-    {
+/// same route is a no-op, which keeps the stack finite. A route that does not
+/// resolve is refused, so a dangling route can never enter the stack.
+pub fn open_detail(s: &mut State, cat: &Catalogue, route: Route) {
+    if !resolves(s, cat, &route) {
         return;
     }
     if s.stack.last() != Some(&route) {
@@ -259,10 +258,13 @@ pub fn set_popular_tab(s: &mut State, tab: PopularTab) {
     s.popular_tab = tab;
 }
 
-/// Select a track to play: make it now-playing and record it in history. The
-/// id is a catalogue id, so it is in range by construction.
-pub fn select_track(s: &mut State, t: TrackId) {
-    s.now_playing = Some(t);
+/// Select a track to play: make it now-playing and record it in history. A
+/// track the catalogue lacks is refused.
+pub fn select_track(s: &mut State, cat: &Catalogue, t: TrackId) {
+    if cat.track(&t).is_none() {
+        return;
+    }
+    s.now_playing = Some(t.clone());
     s.lib.record_play(t);
 }
 
@@ -297,7 +299,7 @@ pub fn handle_key(s: &mut State, key: &str) -> bool {
 }
 
 /// The named scenes `main.rs` passes to `AppSpec`, each applied to
-/// `State::default()`. Test-only: `main.rs` keeps its own `App`-level scenes.
+/// `State::new`. Test-only: `main.rs` keeps its own `App`-level scenes.
 #[cfg(test)]
 pub const SCENES: [Scene; 4] = [
     ("default", |_| {}),
@@ -310,13 +312,13 @@ pub const SCENES: [Scene; 4] = [
 #[cfg(test)]
 pub type Scene = (&'static str, fn(&mut State));
 
-/// Every initial state the app can start from: each scene applied to `default`.
+/// Every initial state the app can start from: each scene applied to `new`.
 #[cfg(test)]
-pub fn inits() -> Vec<State> {
+pub fn inits(cat: &Catalogue) -> Vec<State> {
     SCENES
         .iter()
         .map(|(_, f)| {
-            let mut s = State::default();
+            let mut s = State::new(cat);
             f(&mut s);
             s
         })
@@ -326,6 +328,7 @@ pub fn inits() -> Vec<State> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalogue::{AlbumRow, ArtistRow, CatalogueRows, TrackRow};
     use std::collections::{HashSet, VecDeque};
 
     /// The stack depth the exhaustive check explores. The shell never drills
@@ -337,12 +340,33 @@ mod tests {
     /// the library (the dangling-route invariant), so they are the ones the
     /// proof must drill into; one album and one settings page keep the depth
     /// real. The library's own richness is proven exhaustively in `library.rs`.
-    const DETAILS: [Route; 4] = [
-        Route::Album(AlbumId(0)),
-        Route::UserPlaylist(PlaylistId(0)),
-        Route::UserPlaylist(PlaylistId(1)),
-        Route::SettingsPage(SettingsPage::Playback),
-    ];
+    fn details(cat: &Catalogue) -> [Route; 4] {
+        [
+            Route::Album(cat.album_id("seed-album-0").unwrap()),
+            Route::UserPlaylist(PlaylistId(0)),
+            Route::UserPlaylist(PlaylistId(1)),
+            Route::SettingsPage(SettingsPage::Playback),
+        ]
+    }
+
+    /// A catalogue one album and one track larger than the seed, so a test can
+    /// hold a real id that the seed does not have.
+    fn bigger() -> Catalogue {
+        let mut cat = Catalogue::seed();
+        cat.absorb(CatalogueRows {
+            artists: vec![ArtistRow { id: "x-artist".into(), name: "X".into() }],
+            albums: vec![AlbumRow { id: "x-album".into(), title: "X".into(), artist: "x-artist".into() }],
+            tracks: vec![TrackRow {
+                id: "x-track".into(),
+                title: "X".into(),
+                artist: "x-artist".into(),
+                album: "x-album".into(),
+                duration: "PT1M".into(),
+            }],
+            editorial: Vec::new(),
+        });
+        cat
+    }
 
     /// A representative slice of sections, enough to prove the stack stays
     /// non-empty under `open_section` without inflating the state space with
@@ -367,13 +391,13 @@ mod tests {
     /// playlist. The rest of the library surface is proven exhaustively in
     /// `library.rs`; keeping it out of this state space is what keeps the
     /// cross-product bounded.
-    fn successors(s: &State) -> Vec<State> {
+    fn successors(s: &State, cat: &Catalogue) -> Vec<State> {
         let mut out = Vec::new();
         for r in SECTIONS_SUBSET {
-            out.push(applying(|st| open_section(st, r), s));
+            out.push(applying(|st| open_section(st, r.clone()), s));
         }
-        for r in DETAILS {
-            out.push(applying(|st| open_detail(st, r), s));
+        for r in details(cat) {
+            out.push(applying(|st| open_detail(st, cat, r.clone()), s));
         }
         out.push(applying(back, s));
         out.push(applying(tap_play, s));
@@ -385,8 +409,9 @@ mod tests {
         }, s));
         out.push(applying(toggle_sidebar, s));
         out.push(applying(|st| set_popular_tab(st, PopularTab::Albums), s));
-        out.push(applying(|st| select_track(st, TrackId(0)), s));
-        out.push(applying(|st| select_track(st, TrackId(1)), s));
+        for t in cat.tracks().take(2) {
+            out.push(applying(|st| select_track(st, cat, t.id.clone()), s));
+        }
 
         // The stack/library coupling: create fills a slot, delete frees it and
         // must clean every route to it.
@@ -412,17 +437,18 @@ mod tests {
     /// at every depth, not only up to the bound.
     #[test]
     fn every_reachable_state_satisfies_invariant() {
+        let cat = Catalogue::seed();
         let mut seen = HashSet::new();
         let mut queue = VecDeque::new();
-        for init in inits() {
-            assert!(invariant(&init), "initial state breaks the invariant: {init:?}");
+        for init in inits(&cat) {
+            assert!(invariant(&init, &cat), "initial state breaks the invariant: {init:?}");
             if seen.insert(init.clone()) {
                 queue.push_back(init);
             }
         }
         while let Some(s) = queue.pop_front() {
-            assert!(invariant(&s), "reachable state breaks the invariant: {s:?}");
-            for next in successors(&s) {
+            assert!(invariant(&s, &cat), "reachable state breaks the invariant: {s:?}");
+            for next in successors(&s, &cat) {
                 if next.stack.len() <= MAX_DEPTH && seen.insert(next.clone()) {
                     queue.push_back(next);
                 }
@@ -437,10 +463,11 @@ mod tests {
     /// The back transition never empties the stack, whatever the depth.
     #[test]
     fn back_never_empties_the_stack() {
-        let mut s = State::default();
+        let cat = Catalogue::seed();
+        let mut s = State::new(&cat);
         back(&mut s);
         assert!(!s.stack.is_empty(), "back from the root emptied the stack");
-        open_detail(&mut s, Route::Album(AlbumId(0)));
+        open_detail(&mut s, &cat, Route::Album(cat.album_id("seed-album-0").unwrap()));
         back(&mut s);
         assert_eq!(s.stack.len(), 1, "back from a detail did not return to the root");
     }
@@ -449,38 +476,67 @@ mod tests {
     /// duplicate and within the cap.
     #[test]
     fn selecting_records_history() {
-        let mut s = State::default();
-        select_track(&mut s, TrackId(0));
-        select_track(&mut s, TrackId(1));
-        select_track(&mut s, TrackId(0));
-        assert_eq!(s.now_playing, Some(TrackId(0)));
-        assert_eq!(s.lib.history, vec![TrackId(0), TrackId(1)]);
-        assert!(invariant(&s));
+        let cat = Catalogue::seed();
+        let t0 = cat.track_id("seed-track-0").unwrap();
+        let t1 = cat.track_id("seed-track-1").unwrap();
+        let mut s = State::new(&cat);
+        select_track(&mut s, &cat, t0.clone());
+        select_track(&mut s, &cat, t1.clone());
+        select_track(&mut s, &cat, t0.clone());
+        assert_eq!(s.now_playing, Some(t0.clone()));
+        assert_eq!(s.lib.history, vec![t0, t1]);
+        assert!(invariant(&s, &cat));
+    }
+
+    /// An album the catalogue lacks is refused, so a detail screen can never
+    /// open over nothing.
+    #[test]
+    fn opening_an_unknown_album_is_refused() {
+        let cat = Catalogue::seed();
+        let foreign = bigger().album_id("x-album").unwrap();
+        let mut s = State::new(&cat);
+        open_detail(&mut s, &cat, Route::Album(foreign));
+        assert_eq!(s.stack, vec![Route::Home], "an album outside the catalogue was opened");
+        assert!(invariant(&s, &cat));
+    }
+
+    /// A track the catalogue lacks is refused, so neither now-playing nor
+    /// history can name it.
+    #[test]
+    fn selecting_an_unknown_track_is_refused() {
+        let cat = Catalogue::seed();
+        let foreign = bigger().track_id("x-track").unwrap();
+        let mut s = State::new(&cat);
+        let before = s.clone();
+        select_track(&mut s, &cat, foreign);
+        assert_eq!(s, before, "a track outside the catalogue was selected");
     }
 
     /// Deleting a playlist removes every route to it and never empties the
     /// stack, even when the delete removes the root.
     #[test]
     fn deleting_playlist_cleans_the_stack() {
-        let mut s = State::default();
+        let cat = Catalogue::seed();
+        let mut s = State::new(&cat);
         let id = s.lib.create_playlist("Mine".to_string()).unwrap();
-        open_detail(&mut s, Route::UserPlaylist(id));
+        open_detail(&mut s, &cat, Route::UserPlaylist(id));
         assert!(s.stack.contains(&Route::UserPlaylist(id)));
         assert!(delete_playlist(&mut s, id));
         assert!(!s.stack.contains(&Route::UserPlaylist(id)), "dangling route survived");
         assert!(!s.stack.is_empty(), "delete emptied the stack");
-        assert!(invariant(&s));
+        assert!(invariant(&s, &cat));
     }
 
     /// Opening a user playlist that does not exist is refused, so a dangling
     /// route can never enter the stack through the door of `open_detail`.
     #[test]
     fn opening_missing_playlist_is_refused() {
-        let mut s = State::default();
+        let cat = Catalogue::seed();
+        let mut s = State::new(&cat);
         let before = s.stack.len();
-        open_detail(&mut s, Route::UserPlaylist(PlaylistId(0)));
+        open_detail(&mut s, &cat, Route::UserPlaylist(PlaylistId(0)));
         assert_eq!(s.stack.len(), before, "missing playlist was opened");
-        assert!(invariant(&s));
+        assert!(invariant(&s, &cat));
     }
 
     /// A deterministic random walk over the full operation surface, checking
@@ -495,22 +551,27 @@ mod tests {
             x
         };
 
-        let mut s = State::default();
+        let cat = Catalogue::seed();
+        let track = |k: u64| cat.tracks().nth(k as usize).unwrap().id.clone();
+        let album = |k: u64| cat.albums().nth(k as usize).unwrap().id.clone();
+        let artist = |k: u64| cat.artists().nth(k as usize).unwrap().id.clone();
+        let details = details(&cat);
+        let mut s = State::new(&cat);
         for _ in 0..20_000 {
-            assert!(invariant(&s), "random walk broke the invariant at {s:?}");
+            assert!(invariant(&s, &cat), "random walk broke the invariant at {s:?}");
             match next() % 16 {
-                0 => select_track(&mut s, TrackId((next() % 3) as u8)),
+                0 => select_track(&mut s, &cat, track(next() % 3)),
                 1 => {
-                    let t = TrackId((next() % 3) as u8);
+                    let t = track(next() % 3);
                     s.lib.toggle_like(t);
                 }
-                2 => s.lib.toggle_save_album(AlbumId((next() % 2) as u8)),
-                3 => s.lib.toggle_follow(ArtistId((next() % 2) as u8)),
-                4 => s.lib.toggle_download(AlbumId((next() % 2) as u8)),
+                2 => s.lib.toggle_save_album(album(next() % 2)),
+                3 => s.lib.toggle_follow(artist(next() % 2)),
+                4 => s.lib.toggle_download(album(next() % 2)),
                 5 => {
                     let n = (next() % 2) as usize;
                     if s.lib.playlists[n].is_some() {
-                        s.lib.add_track(PlaylistId(n as u8), TrackId((next() % 3) as u8));
+                        s.lib.add_track(PlaylistId(n as u8), track(next() % 3));
                     } else {
                         s.lib.create_playlist("R".to_string());
                     }
@@ -518,7 +579,7 @@ mod tests {
                 6 => {
                     let n = (next() % 2) as usize;
                     if s.lib.playlists[n].is_some() {
-                        s.lib.remove_track(PlaylistId(n as u8), TrackId((next() % 3) as u8));
+                        s.lib.remove_track(PlaylistId(n as u8), &track(next() % 3));
                     }
                 }
                 7 => {
@@ -552,11 +613,11 @@ mod tests {
                     }
                 }
                 13 => {
-                    let r = DETAILS[(next() % DETAILS.len() as u64) as usize];
-                    open_detail(&mut s, r);
+                    let r = details[(next() % details.len() as u64) as usize].clone();
+                    open_detail(&mut s, &cat, r);
                 }
                 14 => back(&mut s),
-                _ => open_section(&mut s, SECTIONS[(next() % SECTIONS.len() as u64) as usize]),
+                _ => open_section(&mut s, SECTIONS[(next() % SECTIONS.len() as u64) as usize].clone()),
             }
         }
     }

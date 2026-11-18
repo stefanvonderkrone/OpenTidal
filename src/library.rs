@@ -1,13 +1,14 @@
 //! The single local user's mutable data and its operations. Rune-free and
-//! nav-free: every operation validates its ids, and [`Library::check`] proves
-//! no out-of-range or dangling reference survives.
+//! nav-free: every operation validates its slots, and [`Library::check`] proves
+//! no reference outside the catalogue and no dangling slot survives.
 //!
 //! Bounds shrink under `cfg(test)` so the exhaustive proof in `state.rs` stays
 //! finite; the runtime uses the real sizes. The random-walk test runs the full
 //! sizes and calls [`Library::check`] after every step.
 
-use crate::catalog::{AlbumId, ArtistId, TrackId};
-use crate::catalog;
+use std::collections::BTreeSet;
+
+use crate::catalogue::{AlbumId, ArtistId, Catalogue, TrackId};
 
 #[cfg(not(test))]
 pub const MAX_PLAYLISTS: usize = 32;
@@ -53,18 +54,16 @@ pub struct Collection {
     pub playlists: Vec<PlaylistId>,
 }
 
-/// The single local user's data.
+/// The single local user's data. The sets are `BTreeSet`, not `HashSet`, because
+/// a `BTreeSet` is `Hash`, so `Library` and `State` stay hashable for the proof.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Library {
     pub name: String,
-    /// Bitset over `TrackId`; set bit means liked.
-    pub liked: u32,
-    /// Bitset over `AlbumId`; set bit means saved.
-    pub saved_albums: u32,
-    /// Bitset over `ArtistId`; set bit means followed.
-    pub followed: u32,
-    /// Bitset over `AlbumId`; set bit means downloaded (offline).
-    pub downloaded: u32,
+    pub liked: BTreeSet<TrackId>,
+    pub saved_albums: BTreeSet<AlbumId>,
+    pub followed: BTreeSet<ArtistId>,
+    /// Albums taken offline.
+    pub downloaded: BTreeSet<AlbumId>,
     /// Recently played tracks, most recent first, never longer than
     /// [`HISTORY_CAP`] and duplicate-free.
     pub history: Vec<TrackId>,
@@ -78,10 +77,10 @@ impl Default for Library {
     fn default() -> Self {
         Library {
             name: "You".to_string(),
-            liked: 0,
-            saved_albums: 0,
-            followed: 0,
-            downloaded: 0,
+            liked: BTreeSet::new(),
+            saved_albums: BTreeSet::new(),
+            followed: BTreeSet::new(),
+            downloaded: BTreeSet::new(),
             history: Vec::new(),
             playlists: std::array::from_fn(|_| None),
             collections: Vec::new(),
@@ -92,14 +91,14 @@ impl Default for Library {
 /// A safety violation, named so the random-walk test reports what broke.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Violation {
-    LikedOutOfRange,
-    SavedAlbumOutOfRange,
-    FollowedOutOfRange,
-    DownloadedOutOfRange,
-    HistoryOutOfRange,
+    LikedNotInCatalogue,
+    SavedAlbumNotInCatalogue,
+    FollowedNotInCatalogue,
+    DownloadedNotInCatalogue,
+    HistoryNotInCatalogue,
     HistoryTooLong,
     HistoryDuplicate,
-    PlaylistTrackOutOfRange,
+    PlaylistTrackNotInCatalogue,
     PlaylistTooLong,
     PlaylistDuplicate,
     TooManyCollections,
@@ -109,42 +108,45 @@ pub enum Violation {
     CollectionTooManyPlaylists,
 }
 
-impl Library {
-    fn bit(id: u8) -> u32 {
-        1u32 << id
+/// Insert an item, or remove it when present.
+fn toggle<T: Ord>(set: &mut BTreeSet<T>, item: T) {
+    if !set.remove(&item) {
+        set.insert(item);
     }
+}
 
-    // --- Like / save / follow / download (bitset toggles) -----------------
+impl Library {
+    // --- Like / save / follow / download ----------------------------------
 
     pub fn toggle_like(&mut self, t: TrackId) {
-        self.liked ^= Self::bit(t.0);
+        toggle(&mut self.liked, t);
     }
-    pub fn is_liked(&self, t: TrackId) -> bool {
-        self.liked & Self::bit(t.0) != 0
+    pub fn is_liked(&self, t: &TrackId) -> bool {
+        self.liked.contains(t)
     }
 
     pub fn toggle_save_album(&mut self, a: AlbumId) {
-        self.saved_albums ^= Self::bit(a.0);
+        toggle(&mut self.saved_albums, a);
     }
-    pub fn is_saved_album(&self, a: AlbumId) -> bool {
-        self.saved_albums & Self::bit(a.0) != 0
+    pub fn is_saved_album(&self, a: &AlbumId) -> bool {
+        self.saved_albums.contains(a)
     }
 
     pub fn toggle_follow(&mut self, a: ArtistId) {
-        self.followed ^= Self::bit(a.0);
+        toggle(&mut self.followed, a);
     }
-    pub fn is_following(&self, a: ArtistId) -> bool {
-        self.followed & Self::bit(a.0) != 0
+    pub fn is_following(&self, a: &ArtistId) -> bool {
+        self.followed.contains(a)
     }
 
-    pub fn remove_download(&mut self, a: AlbumId) {
-        self.downloaded &= !Self::bit(a.0);
+    pub fn remove_download(&mut self, a: &AlbumId) {
+        self.downloaded.remove(a);
     }
     pub fn toggle_download(&mut self, a: AlbumId) {
-        self.downloaded ^= Self::bit(a.0);
+        toggle(&mut self.downloaded, a);
     }
-    pub fn is_downloaded(&self, a: AlbumId) -> bool {
-        self.downloaded & Self::bit(a.0) != 0
+    pub fn is_downloaded(&self, a: &AlbumId) -> bool {
+        self.downloaded.contains(a)
     }
 
     // --- History ----------------------------------------------------------
@@ -152,7 +154,7 @@ impl Library {
     /// Record a play: move `t` to the front, drop its older copy, and keep the
     /// ring within [`HISTORY_CAP`].
     pub fn record_play(&mut self, t: TrackId) {
-        self.history.retain(|&x| x != t);
+        self.history.retain(|x| x != &t);
         self.history.insert(0, t);
         self.history.truncate(HISTORY_CAP);
     }
@@ -215,11 +217,11 @@ impl Library {
     }
 
     /// Remove every occurrence of a track.
-    pub fn remove_track(&mut self, id: PlaylistId, t: TrackId) -> bool {
+    pub fn remove_track(&mut self, id: PlaylistId, t: &TrackId) -> bool {
         match self.playlist_mut(id) {
             Some(p) => {
                 let before = p.tracks.len();
-                p.tracks.retain(|&x| x != t);
+                p.tracks.retain(|x| x != t);
                 before != p.tracks.len()
             }
             None => false,
@@ -302,29 +304,28 @@ impl Library {
 
     // --- The invariant ----------------------------------------------------
 
-    /// Every reference the library holds is in range and within its cap. This
-    /// is the property the exhaustive proof and the random walk both check
-    /// after every operation. The store also calls it on load.
-    pub fn check(&self) -> Result<(), Violation> {
-        if self.liked & !catalog::track_mask() != 0 {
-            return Err(Violation::LikedOutOfRange);
+    /// Every catalogue reference the library holds is a member of `cat`, and
+    /// every cap and duplicate rule holds. This is the property the exhaustive
+    /// proof and the random walk both check after every operation. The store
+    /// calls it before a write and asserts it after a load.
+    pub fn check(&self, cat: &Catalogue) -> Result<(), Violation> {
+        if !self.liked.iter().all(|t| cat.track(t).is_some()) {
+            return Err(Violation::LikedNotInCatalogue);
         }
-        if self.saved_albums & !catalog::album_mask() != 0 {
-            return Err(Violation::SavedAlbumOutOfRange);
+        if !self.saved_albums.iter().all(|a| cat.album(a).is_some()) {
+            return Err(Violation::SavedAlbumNotInCatalogue);
         }
-        if self.followed & !catalog::artist_mask() != 0 {
-            return Err(Violation::FollowedOutOfRange);
+        if !self.followed.iter().all(|a| cat.artist(a).is_some()) {
+            return Err(Violation::FollowedNotInCatalogue);
         }
-        if self.downloaded & !catalog::album_mask() != 0 {
-            return Err(Violation::DownloadedOutOfRange);
+        if !self.downloaded.iter().all(|a| cat.album(a).is_some()) {
+            return Err(Violation::DownloadedNotInCatalogue);
         }
         if self.history.len() > HISTORY_CAP {
             return Err(Violation::HistoryTooLong);
         }
-        for &t in &self.history {
-            if t.0 as usize >= catalog::TRACKS.len() {
-                return Err(Violation::HistoryOutOfRange);
-            }
+        if !self.history.iter().all(|t| cat.track(t).is_some()) {
+            return Err(Violation::HistoryNotInCatalogue);
         }
         if has_dup(&self.history) {
             return Err(Violation::HistoryDuplicate);
@@ -333,10 +334,8 @@ impl Library {
             if p.tracks.len() > PLAYLIST_TRACK_CAP {
                 return Err(Violation::PlaylistTooLong);
             }
-            for &t in &p.tracks {
-                if t.0 as usize >= catalog::TRACKS.len() {
-                    return Err(Violation::PlaylistTrackOutOfRange);
-                }
+            if !p.tracks.iter().all(|t| cat.track(t).is_some()) {
+                return Err(Violation::PlaylistTrackNotInCatalogue);
             }
             if has_dup(&p.tracks) {
                 return Err(Violation::PlaylistDuplicate);
@@ -374,6 +373,7 @@ fn has_dup<T: PartialEq>(xs: &[T]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalogue::{AlbumRow, ArtistRow, CatalogueRows, TrackRow};
     use std::collections::{HashSet, VecDeque};
 
     fn applying(f: impl Fn(&mut Library), l: &Library) -> Library {
@@ -382,17 +382,38 @@ mod tests {
         t
     }
 
+    /// The fixed ids the proof uses, minted from the seed so the state space
+    /// stays finite under the `cfg(test)` bounds.
+    struct Ids {
+        t0: TrackId,
+        t1: TrackId,
+        album: AlbumId,
+        artist: ArtistId,
+    }
+
+    impl Ids {
+        fn new(cat: &Catalogue) -> Ids {
+            Ids {
+                t0: cat.track_id("seed-track-0").unwrap(),
+                t1: cat.track_id("seed-track-1").unwrap(),
+                album: cat.album_id("seed-album-0").unwrap(),
+                artist: cat.artist_id("seed-artist-0").unwrap(),
+            }
+        }
+    }
+
     /// Every library operation, with a fixed id set and fixed names so the
     /// state space stays finite under the `cfg(test)` bounds.
-    fn successors(l: &Library) -> Vec<Library> {
+    fn successors(l: &Library, ids: &Ids) -> Vec<Library> {
+        let Ids { t0, t1, album, artist } = ids;
         let mut out = Vec::new();
-        out.push(applying(|x| x.toggle_like(TrackId(0)), l));
-        out.push(applying(|x| x.toggle_like(TrackId(1)), l));
-        out.push(applying(|x| x.toggle_save_album(AlbumId(0)), l));
-        out.push(applying(|x| x.toggle_follow(ArtistId(0)), l));
-        out.push(applying(|x| x.toggle_download(AlbumId(0)), l));
-        out.push(applying(|x| x.record_play(TrackId(0)), l));
-        out.push(applying(|x| x.record_play(TrackId(1)), l));
+        out.push(applying(|x| x.toggle_like(t0.clone()), l));
+        out.push(applying(|x| x.toggle_like(t1.clone()), l));
+        out.push(applying(|x| x.toggle_save_album(album.clone()), l));
+        out.push(applying(|x| x.toggle_follow(artist.clone()), l));
+        out.push(applying(|x| x.toggle_download(album.clone()), l));
+        out.push(applying(|x| x.record_play(t0.clone()), l));
+        out.push(applying(|x| x.record_play(t1.clone()), l));
 
         out.push(applying(|x| {
             x.create_playlist("A".to_string());
@@ -413,13 +434,13 @@ mod tests {
             x.delete_playlist(PlaylistId(1));
         }, l));
         out.push(applying(|x| {
-            x.add_track(PlaylistId(0), TrackId(0));
+            x.add_track(PlaylistId(0), t0.clone());
         }, l));
         out.push(applying(|x| {
-            x.add_track(PlaylistId(0), TrackId(1));
+            x.add_track(PlaylistId(0), t1.clone());
         }, l));
         out.push(applying(|x| {
-            x.remove_track(PlaylistId(0), TrackId(0));
+            x.remove_track(PlaylistId(0), t0);
         }, l));
         out.push(applying(|x| {
             x.move_track(PlaylistId(0), 0, 1);
@@ -454,15 +475,17 @@ mod tests {
     /// proves the nav half.
     #[test]
     fn every_reachable_library_satisfies_check() {
+        let cat = Catalogue::seed();
+        let ids = Ids::new(&cat);
         let mut seen = HashSet::new();
         let mut queue = VecDeque::new();
         let init = Library::default();
-        assert_eq!(init.check(), Ok(()));
+        assert_eq!(init.check(&cat), Ok(()));
         seen.insert(init.clone());
         queue.push_back(init);
         while let Some(l) = queue.pop_front() {
-            assert_eq!(l.check(), Ok(()), "library broke the invariant: {l:?}");
-            for next in successors(&l) {
+            assert_eq!(l.check(&cat), Ok(()), "library broke the invariant: {l:?}");
+            for next in successors(&l, &ids) {
                 if seen.insert(next.clone()) {
                     queue.push_back(next);
                 }
@@ -475,16 +498,46 @@ mod tests {
     /// a checker that actually detects violations.
     #[test]
     fn check_detects_violations() {
-        let l = Library { liked: crate::catalog::track_mask() + 1, ..Default::default() };
-        assert_eq!(l.check(), Err(Violation::LikedOutOfRange));
+        // A real id the seed lacks: minted by a larger catalogue, checked against
+        // the seed. No test-only constructor exists, so this is the only way.
+        let seed = Catalogue::seed();
+        let mut bigger = Catalogue::seed();
+        bigger.absorb(CatalogueRows {
+            artists: vec![ArtistRow { id: "x-artist".into(), name: "X".into() }],
+            albums: vec![AlbumRow { id: "x-album".into(), title: "X".into(), artist: "x-artist".into() }],
+            tracks: vec![TrackRow {
+                id: "x-track".into(),
+                title: "X".into(),
+                artist: "x-artist".into(),
+                album: "x-album".into(),
+                duration: "PT1M".into(),
+            }],
+            editorial: Vec::new(),
+        });
+        let track = bigger.track_id("x-track").unwrap();
+        let album = bigger.album_id("x-album").unwrap();
+        let artist = bigger.artist_id("x-artist").unwrap();
 
-        let l = Library { history: vec![TrackId(200)], ..Default::default() };
-        assert_eq!(l.check(), Err(Violation::HistoryOutOfRange));
+        let l = Library { liked: BTreeSet::from([track.clone()]), ..Default::default() };
+        assert_eq!(l.check(&seed), Err(Violation::LikedNotInCatalogue));
+        assert_eq!(l.check(&bigger), Ok(()));
+
+        let l = Library { saved_albums: BTreeSet::from([album.clone()]), ..Default::default() };
+        assert_eq!(l.check(&seed), Err(Violation::SavedAlbumNotInCatalogue));
+
+        let l = Library { followed: BTreeSet::from([artist]), ..Default::default() };
+        assert_eq!(l.check(&seed), Err(Violation::FollowedNotInCatalogue));
+
+        let l = Library { downloaded: BTreeSet::from([album]), ..Default::default() };
+        assert_eq!(l.check(&seed), Err(Violation::DownloadedNotInCatalogue));
+
+        let l = Library { history: vec![track.clone()], ..Default::default() };
+        assert_eq!(l.check(&seed), Err(Violation::HistoryNotInCatalogue));
 
         let mut l = Library::default();
         let id = l.create_playlist("X".to_string()).unwrap();
-        l.playlists[id.0 as usize].as_mut().unwrap().tracks.push(TrackId(200));
-        assert_eq!(l.check(), Err(Violation::PlaylistTrackOutOfRange));
+        l.add_track(id, track);
+        assert_eq!(l.check(&seed), Err(Violation::PlaylistTrackNotInCatalogue));
     }
 
     /// Renaming actually changes the name. The invariant does not constrain

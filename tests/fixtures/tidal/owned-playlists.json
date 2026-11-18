@@ -1,0 +1,25 @@
+{
+  "data": [
+    {
+      "type": "playlists",
+      "id": "f6b9f0a1-6c8e-4d24-9c71-1d0e2f3a4b5c",
+      "attributes": {
+        "name": "Evening Drive",
+        "description": "A local playlist with a remote copy",
+        "numberOfItems": 2
+      }
+    },
+    {
+      "type": "playlists",
+      "id": "0c1d2e3f-4a5b-6c7d-8e9f-a0b1c2d3e4f5",
+      "attributes": {
+        "name": "Morning Run",
+        "description": "Owned, not favorited",
+        "numberOfItems": 1
+      }
+    }
+  ],
+  "links": {
+    "self": "/v2/playlists?filter%5Bowners.id%5D=173210380"
+  }
+}

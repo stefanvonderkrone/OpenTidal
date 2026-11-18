@@ -1,7 +1,19 @@
 {
   "data": [
-    {"type": "tracks", "id": "75413016", "meta": {"addedAt": "2026-11-01T12:00:00Z"}},
-    {"type": "tracks", "id": "12345678", "meta": {"addedAt": "2026-10-28T09:30:00Z"}}
+    {
+      "type": "tracks",
+      "id": "75413016",
+      "meta": {
+        "addedAt": "2026-11-01T12:00:00Z"
+      }
+    },
+    {
+      "type": "tracks",
+      "id": "12345678",
+      "meta": {
+        "addedAt": "2026-10-28T09:30:00Z"
+      }
+    }
   ],
   "included": [
     {
@@ -13,8 +25,28 @@
         "popularity": 0.82,
         "explicit": false,
         "trackNumber": 1,
-        "mediaTags": ["LOSSLESS"],
+        "mediaTags": [
+          "LOSSLESS"
+        ],
         "tidalUrl": "https://tidal.com/browse/track/75413016"
+      },
+      "relationships": {
+        "albums": {
+          "data": [
+            {
+              "type": "albums",
+              "id": "251380836"
+            }
+          ]
+        },
+        "artists": {
+          "data": [
+            {
+              "type": "artists",
+              "id": "1566"
+            }
+          ]
+        }
       }
     },
     {
@@ -26,13 +58,58 @@
         "popularity": 0.91,
         "explicit": false,
         "trackNumber": 2,
-        "mediaTags": ["LOSSLESS"],
+        "mediaTags": [
+          "LOSSLESS"
+        ],
         "tidalUrl": "https://tidal.com/browse/track/12345678"
+      },
+      "relationships": {
+        "albums": {
+          "data": [
+            {
+              "type": "albums",
+              "id": "251380836"
+            }
+          ]
+        },
+        "artists": {
+          "data": [
+            {
+              "type": "artists",
+              "id": "1566"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "albums",
+      "id": "251380836",
+      "attributes": {
+        "title": "Currents",
+        "type": "ALBUM"
+      },
+      "relationships": {
+        "artists": {
+          "data": [
+            {
+              "type": "artists",
+              "id": "1566"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "artists",
+      "id": "1566",
+      "attributes": {
+        "name": "Tame Impala"
       }
     }
   ],
   "links": {
-    "self": "/v2/userCollectionTracks/me/relationships/items?include=items",
-    "next": "/v2/userCollectionTracks/me/relationships/items?include=items&page%5Bcursor%5D=page-2"
+    "self": "/v2/userCollectionTracks/me/relationships/items?include=items,items.albums,items.artists",
+    "next": "/v2/userCollectionTracks/me/relationships/items?include=items,items.albums,items.artists&page%5Bcursor%5D=page-2"
   }
 }

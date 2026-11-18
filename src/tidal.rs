@@ -6,10 +6,14 @@
 //! This module is rune-free. It holds no network or token state in `State`; the
 //! app wraps a service in `Arc` on [`crate::app::App`].
 
+use std::collections::BTreeSet;
+
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::auth::{OAuthConfig, Token};
+use crate::catalogue::{AlbumRow, ArtistRow, CatalogueRows, PlaylistRow, TrackRow};
+use crate::library::LibraryRows;
 
 /// A Tidal user id, an opaque string. The newtype keeps it from being mistaken
 /// for any other string. Catalogue ids have their own types in `catalogue.rs`.
@@ -36,6 +40,8 @@ pub enum ServiceError {
     Http(String),
     /// The response body did not match the expected shape.
     Decode(String),
+    /// A paged read hit the page cap or a cursor it had already followed.
+    Paging(String),
 }
 
 /// The read-only music port. Every method takes the access token, so the fake
@@ -106,11 +112,8 @@ impl MusicService for HttpService {
             .ok_or_else(|| ServiceError::Decode("token is not a JWT".to_string()))?;
         let id = claims.user_id().ok_or_else(|| ServiceError::Decode("token has no uid claim".to_string()))?;
         let name = match self.get_doc(token, "/users/me") {
-            Ok(doc) => doc
-                .data
-                .as_ref()
-                .map(|data| name_from(&data.attributes))
-                .unwrap_or_else(|| "You".to_string()),
+            Ok(Document { data: Some(Data::One(profile)), .. }) => name_from(&profile.attributes),
+            Ok(_) => "You".to_string(),
             // Surface an expired token so the caller refreshes and retries;
             // any other failure keeps the best-effort fallback name.
             Err(ServiceError::Unauthorized) => return Err(ServiceError::Unauthorized),
@@ -326,16 +329,214 @@ fn parse_callback(request: &str) -> Option<Callback> {
     Some(cb)
 }
 
-/// The JSON:API document envelope. Tidal wraps every resource in `data`;
-/// here only its `attributes` are read, so the other members are ignored.
+/// The JSON:API document envelope. `data` is one resource for a profile and an
+/// array for a list. `included` holds the resources a list names, and
+/// `links.next` the next page. Members the app does not read are ignored.
 #[derive(Deserialize)]
 struct Document {
-    data: Option<Resource>,
+    #[serde(default)]
+    data: Option<Data>,
+    #[serde(default)]
+    included: Vec<Resource>,
+    #[serde(default)]
+    links: Links,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Data {
+    One(Resource),
+    Many(Vec<Resource>),
+}
+
+#[derive(Deserialize, Default)]
+struct Links {
+    next: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct Resource {
+    #[serde(default, rename = "type")]
+    kind: String,
+    #[serde(default)]
+    id: String,
     attributes: Option<Value>,
+    #[serde(default)]
+    relationships: Value,
+}
+
+impl Resource {
+    fn text(&self, key: &str) -> Option<String> {
+        self.attributes.as_ref()?.get(key)?.as_str().map(str::to_owned)
+    }
+
+    /// The id of the first resource a relationship names, such as the album of
+    /// a track. Empty when absent, which `absorb` drops and counts.
+    fn first(&self, relationship: &str) -> String {
+        self.relationships
+            .get(relationship)
+            .and_then(|r| r.get("data"))
+            .and_then(|d| d.get(0))
+            .and_then(|r| r.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// Add this resource to the catalogue rows, by type. A membership entry
+    /// has no attributes and adds nothing.
+    fn add_to(&self, rows: &mut CatalogueRows) {
+        if self.attributes.is_none() {
+            return;
+        }
+        let id = self.id.clone();
+        match self.kind.as_str() {
+            "artists" => rows.artists.push(ArtistRow { id, name: self.text("name").unwrap_or_default() }),
+            "albums" => rows.albums.push(AlbumRow {
+                id,
+                title: self.text("title").unwrap_or_default(),
+                artist: self.first("artists"),
+            }),
+            "tracks" => rows.tracks.push(TrackRow {
+                id,
+                title: self.text("title").unwrap_or_default(),
+                artist: self.first("artists"),
+                album: self.first("albums"),
+                duration: self.text("duration").unwrap_or_default(),
+            }),
+            "playlists" => rows.playlists.push(PlaylistRow {
+                id,
+                name: self.text("name").unwrap_or_default(),
+                description: self.text("description").unwrap_or_default(),
+                tracks: Vec::new(),
+            }),
+            _ => {}
+        }
+    }
+}
+
+impl Document {
+    fn resources(&self) -> impl Iterator<Item = &Resource> {
+        let data: &[Resource] = match &self.data {
+            Some(Data::One(r)) => std::slice::from_ref(r),
+            Some(Data::Many(rs)) => rs,
+            None => &[],
+        };
+        data.iter()
+    }
+
+    /// The ids in `data` of one type, in order: the members a list page holds.
+    fn members(&self, kind: &str) -> impl Iterator<Item = String> {
+        self.resources().filter(move |r| r.kind == kind).map(|r| r.id.clone())
+    }
+
+    /// Every resource with attributes, in `data` and `included`, as catalogue rows.
+    fn add_to(&self, rows: &mut CatalogueRows) {
+        for r in self.resources().chain(&self.included) {
+            r.add_to(rows);
+        }
+    }
+}
+
+/// The page budget for one whole library read, shared by every list. At about
+/// twenty items a page this is some 8000 items.
+const MAX_PAGES: usize = 400;
+
+/// One page source: a path under the service base in, a document out.
+type PageSource<'a> = dyn FnMut(&str) -> Result<Document, ServiceError> + 'a;
+
+/// Follow `links.next` from `first` until it is absent, handing each page to
+/// `each`. Every page spends one unit of `budget`. A cursor this walk already
+/// followed, an empty budget, or a failed page ends the walk with an error.
+fn walk(
+    budget: &mut usize,
+    prefix: &str,
+    get: &mut PageSource,
+    first: &str,
+    each: &mut dyn FnMut(Document),
+) -> Result<(), ServiceError> {
+    let mut seen = BTreeSet::new();
+    let mut path = first.to_owned();
+    loop {
+        if !seen.insert(path.clone()) {
+            return Err(ServiceError::Paging("repeated cursor".to_string()));
+        }
+        if *budget == 0 {
+            return Err(ServiceError::Paging("page cap".to_string()));
+        }
+        *budget -= 1;
+        let doc = get(&path)?;
+        let next = doc.links.next.clone();
+        each(doc);
+        match next {
+            None => return Ok(()),
+            Some(next) => path = under_base(prefix, &next)?,
+        }
+    }
+}
+
+/// A `next` link as a path under the service base. Tidal sends it from the host
+/// root, such as `/v2/...` for the base `https://openapi.tidal.com/v2`. A link
+/// that is not a path under the base is refused, so the bearer token never
+/// leaves the service.
+fn under_base(prefix: &str, next: &str) -> Result<String, ServiceError> {
+    next.strip_prefix(prefix)
+        .filter(|rest| rest.starts_with('/') && !rest.starts_with("//"))
+        .map(str::to_owned)
+        .ok_or_else(|| ServiceError::Decode(format!("a next link leaves the service: {next}")))
+}
+
+const LIKED: &str = "/userCollectionTracks/me/relationships/items?include=items,items.albums,items.artists";
+const SAVED: &str = "/userCollectionAlbums/me/relationships/items?include=items,items.artists";
+const FOLLOWED: &str = "/userCollectionArtists/me/relationships/items?include=items";
+const FAVORITED: &str = "/userCollectionPlaylists/me/relationships/items?include=items";
+
+/// The account's playlists, by owner. The brackets are percent-encoded, the
+/// way Tidal writes them in its own links.
+fn owned(user: &str) -> String {
+    format!("/playlists?filter%5Bowners.id%5D={user}")
+}
+
+fn playlist_items(id: &str) -> String {
+    format!("/playlists/{id}/relationships/items?include=items,items.albums,items.artists")
+}
+
+/// The whole library read, over any page source. `HttpService` passes its
+/// `get_doc`, and a test passes a map from path to fixture. `prefix` is the
+/// path of the service base, which `next` links start with. The rows exist only
+/// when every page of every list arrived.
+#[cfg_attr(not(test), expect(dead_code, reason = "HttpService::library reads through it once the port has the method"))]
+fn fetch_library(get: &mut PageSource, prefix: &str, user: &str) -> Result<LibraryRows, ServiceError> {
+    let mut budget = MAX_PAGES;
+    let mut rows = LibraryRows::default();
+    type Members = fn(&mut LibraryRows) -> &mut Vec<String>;
+    let lists: [(String, &str, Members); 5] = [
+        (LIKED.to_owned(), "tracks", |r| &mut r.liked),
+        (SAVED.to_owned(), "albums", |r| &mut r.saved_albums),
+        (FOLLOWED.to_owned(), "artists", |r| &mut r.followed),
+        (FAVORITED.to_owned(), "playlists", |r| &mut r.tidal_playlists),
+        (owned(user), "playlists", |r| &mut r.tidal_playlists),
+    ];
+    for (first, kind, members) in lists {
+        walk(&mut budget, prefix, get, &first, &mut |doc| {
+            members(&mut rows).extend(doc.members(kind));
+            doc.add_to(&mut rows.catalogue);
+        })?;
+    }
+    let mut distinct = BTreeSet::new();
+    let playlists: Vec<String> =
+        rows.tidal_playlists.iter().filter(|id| distinct.insert(*id)).cloned().collect();
+    for id in playlists {
+        let mut tracks = Vec::new();
+        walk(&mut budget, prefix, get, &playlist_items(&id), &mut |doc| {
+            tracks.extend(doc.members("tracks"));
+            doc.add_to(&mut rows.catalogue);
+        })?;
+        for row in rows.catalogue.playlists.iter_mut().filter(|p| p.id == id) {
+            row.tracks = tracks.clone();
+        }
+    }
+    Ok(rows)
 }
 
 /// The user's display name from the resource attributes. The field names vary
@@ -380,6 +581,166 @@ fn is_email(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A synthetic fixture from `tests/fixtures/tidal`, decoded the way
+    /// `get_doc` decodes a response body.
+    fn fixture(name: &str) -> Document {
+        let path = format!("{}/tests/fixtures/tidal/{name}", env!("CARGO_MANIFEST_DIR"));
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+    }
+
+    const EVENING: &str = "f6b9f0a1-6c8e-4d24-9c71-1d0e2f3a4b5c";
+    const MORNING: &str = "0c1d2e3f-4a5b-6c7d-8e9f-a0b1c2d3e4f5";
+
+    /// The fixture for each path the read asks for. A path with no fixture
+    /// panics, so a read that asks for something unexpected names it.
+    fn fixture_path(path: &str) -> &'static str {
+        let liked_2 = format!("{LIKED}&page%5Bcursor%5D=page-2");
+        match path {
+            p if p == LIKED => "liked-tracks-page-1.json",
+            p if p == liked_2 => "liked-tracks-page-2.json",
+            p if p == SAVED => "saved-albums.json",
+            p if p == FOLLOWED => "followed-artists.json",
+            p if p == FAVORITED => "playlists.json",
+            p if p == owned("173210380") => "owned-playlists.json",
+            p if p == playlist_items(EVENING) => "playlist-items.json",
+            p if p == playlist_items(MORNING) => "owned-playlist-items.json",
+            other => panic!("the read asked for a path with no fixture: {other}"),
+        }
+    }
+
+    /// The whole fixture library, read through `fetch_library`, with every path
+    /// it asked for in order.
+    fn read_fixtures(
+        mut fail: impl FnMut(&str) -> Option<ServiceError>,
+    ) -> (Result<LibraryRows, ServiceError>, Vec<String>) {
+        let mut asked = Vec::new();
+        let result = fetch_library(
+            &mut |path: &str| {
+                asked.push(path.to_owned());
+                match fail(path) {
+                    Some(error) => Err(error),
+                    None => Ok(fixture(fixture_path(path))),
+                }
+            },
+            "/v2",
+            "173210380",
+        );
+        (result, asked)
+    }
+
+    /// A list longer than one page is read to its last page, in order.
+    #[test]
+    fn liked_tracks_follow_the_cursor_to_the_last_page() {
+        let (rows, _) = read_fixtures(|_| None);
+        assert_eq!(rows.unwrap().liked, ["75413016", "12345678", "98765432"]);
+    }
+
+    /// Every fixture decodes into a library the sync keeps whole: each member
+    /// resolves, and each playlist has its tracks in order.
+    #[test]
+    fn the_fixtures_decode_into_a_whole_library() {
+        let (rows, asked) = read_fixtures(|_| None);
+        assert_eq!(
+            asked.iter().filter(|p| p.contains(EVENING)).count(),
+            1,
+            "a playlist both owned and favorited was read twice"
+        );
+        let mut cat = crate::catalogue::Catalogue::seed();
+        let mut lib = crate::library::Library::default();
+        let report = lib.sync(&mut cat, rows.unwrap());
+        assert_eq!(
+            report,
+            crate::library::SyncReport { liked: 3, saved_albums: 2, followed: 1, tidal_playlists: 2, dropped: 0 }
+        );
+        let evening = cat.playlist(&cat.playlist_id(EVENING).unwrap()).unwrap();
+        assert_eq!(evening.name, "Evening Drive");
+        let titles: Vec<&str> =
+            evening.tracks.iter().map(|t| cat.track(t).unwrap().title.as_str()).collect();
+        assert_eq!(titles, ["Let It Happen", "The Less I Know the Better"]);
+        let morning = cat.playlist(&cat.playlist_id(MORNING).unwrap()).unwrap();
+        assert_eq!(morning.tracks.len(), 1);
+        assert_eq!(lib.check(&cat), Ok(()));
+    }
+
+    /// A page that fails fails the whole read. No rows exist, so nothing
+    /// partial can be applied.
+    #[test]
+    fn a_failed_page_fails_the_whole_fetch() {
+        let (rows, _) = read_fixtures(|path| {
+            path.contains("page-2").then(|| ServiceError::Http("429 Too Many Requests".to_string()))
+        });
+        assert!(matches!(rows, Err(ServiceError::Http(_))), "a failed page was skipped: {rows:?}");
+        let (rows, _) = read_fixtures(|path| {
+            (path == playlist_items(MORNING)).then(|| ServiceError::Http("500".to_string()))
+        });
+        assert!(matches!(rows, Err(ServiceError::Http(_))), "a failed playlist page was skipped: {rows:?}");
+    }
+
+    /// A page whose `next` is a page from this walk ends the read with an error,
+    /// not a loop.
+    #[test]
+    fn a_repeated_cursor_fails_the_fetch() {
+        let mut calls = 0;
+        let mut budget = MAX_PAGES;
+        let result = walk(
+            &mut budget,
+            "/v2",
+            &mut |path: &str| {
+                calls += 1;
+                assert!(calls <= MAX_PAGES, "the walk ran past the page cap");
+                let next = if path == "/a" { "/v2/b" } else { "/v2/a" };
+                Ok(serde_json::from_str(&format!(r#"{{"links":{{"next":"{next}"}}}}"#)).unwrap())
+            },
+            "/a",
+            &mut |_| {},
+        );
+        assert_eq!(result, Err(ServiceError::Paging("repeated cursor".to_string())));
+        assert_eq!(calls, 2);
+    }
+
+    /// A source with no last page ends at the cap. The source panics past the
+    /// cap, so a broken cap fails the test instead of hanging it.
+    #[test]
+    fn the_page_cap_fails_the_fetch() {
+        let mut calls = 0;
+        let mut budget = MAX_PAGES;
+        let result = walk(
+            &mut budget,
+            "/v2",
+            &mut |_: &str| {
+                calls += 1;
+                assert!(calls <= MAX_PAGES, "the walk ran past the page cap");
+                Ok(serde_json::from_str(&format!(r#"{{"links":{{"next":"/v2/p?cursor={calls}"}}}}"#)).unwrap())
+            },
+            "/p",
+            &mut |_| {},
+        );
+        assert_eq!(result, Err(ServiceError::Paging("page cap".to_string())));
+        assert_eq!(calls, MAX_PAGES);
+    }
+
+    /// A `next` link that leaves the service is refused before it is fetched,
+    /// so the bearer token never goes to another host.
+    #[test]
+    fn a_next_link_to_another_host_is_refused() {
+        for next in ["https://evil.example/v2/x", "//evil.example/v2/x", "/v2//evil.example/x", "/x"] {
+            let mut asked = Vec::new();
+            let mut budget = MAX_PAGES;
+            let result = walk(
+                &mut budget,
+                "/v2",
+                &mut |path: &str| {
+                    asked.push(path.to_owned());
+                    Ok(serde_json::from_str(&format!(r#"{{"links":{{"next":"{next}"}}}}"#)).unwrap())
+                },
+                "/first",
+                &mut |_| {},
+            );
+            assert!(matches!(result, Err(ServiceError::Decode(_))), "{next} was followed: {result:?}");
+            assert_eq!(asked, ["/first"], "{next} was fetched");
+        }
+    }
 
     /// The fake returns its fixed user and never touches the network.
     #[test]

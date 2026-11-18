@@ -406,7 +406,12 @@ nothing there is a test.
 | A library screen needs no network | Open Liked Songs offline, assert the disk rows paint | pending: no test |
 | A refresh writes no rows | Count rows before and after a refresh, `user_version` unchanged | pending: no test. A refresh writes the token store only |
 | A failed sync changes nothing | Fail the fetch, assert the library in memory and on disk are unchanged | pending: sync PR |
-| A failed page fails the whole fetch | Serve an error as page 2, assert the fetch returns no rows | pending: sync PR |
+| A failed page fails the whole fetch | Serve an error as page 2, assert the fetch returns no rows | test: `a_failed_page_fails_the_whole_fetch` |
+| A paged list is read to its last page | Two liked-track pages, assert all three members in order | test: `liked_tracks_follow_the_cursor_to_the_last_page` |
+| The fixtures decode into a whole library | Read every fixture, sync, assert the counts, no drop, and the playlist tracks | test: `the_fixtures_decode_into_a_whole_library` |
+| A repeated cursor ends the read | Two pages that name each other, assert the error | test: `a_repeated_cursor_fails_the_fetch` |
+| The page cap ends the read | A source with no last page, assert the error at the cap | test: `the_page_cap_fails_the_fetch` |
+| The token never leaves the host | A `next` link to another host or outside the base, assert it is refused before a fetch | test: `a_next_link_to_another_host_is_refused` |
 | A version 1 file keeps what the user wrote | Migrate a version 1 file, assert the name, playlists and collections stay and every id row is gone | test: `a_version_one_file_keeps_its_playlists_and_drops_its_catalogue_rows` |
 | A migrated file has the fresh schema | Compare `sqlite_master` of a fresh and a migrated file | test: `a_fresh_and_a_migrated_schema_match` |
 | A version 2 file keeps every row | Migrate a version 2 file with a row in every table, assert the whole library loads | test: `a_version_2_file_migrates_to_version_3` |

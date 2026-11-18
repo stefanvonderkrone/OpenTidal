@@ -58,6 +58,15 @@ pub struct Cursor {
     path: String,
 }
 
+#[cfg(test)]
+impl Cursor {
+    /// The cursor `FakeService` mints for page `path`, so a test in another
+    /// module can build a page by hand.
+    pub fn fake(path: &str) -> Cursor {
+        Cursor { leg: Leg::Last, path: path.to_string() }
+    }
+}
+
 /// Which read of a list a cursor is on. Only `RemoteList::Playlists` has two:
 /// the favorited playlists, then the owned ones.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]

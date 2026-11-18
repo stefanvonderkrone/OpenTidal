@@ -151,7 +151,6 @@ impl<T: Ord + Clone> Members<T> {
 
 /// One remote list that a paged read fills. Not `Collection`, which names a
 /// folder of user playlists.
-#[cfg_attr(not(test), expect(dead_code, reason = "the page worker is the first caller"))]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum RemoteList {
     Liked,
@@ -159,7 +158,29 @@ pub enum RemoteList {
     Artists,
     Playlists,
     /// The tracks of one Tidal playlist. Never a seed playlist.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the playlist route is the first caller"))]
     Playlist(CataloguePlaylistId),
+}
+
+/// One landed page of one remote list, ready to apply. `confirmed` is every
+/// member id the pass has read so far, page one first, as raw text.
+#[cfg_attr(not(test), expect(dead_code, reason = "the page worker is the first caller"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Merge {
+    pub list: RemoteList,
+    pub rows: CatalogueRows,
+    pub confirmed: Vec<String>,
+    pub reach: Reach,
+}
+
+/// What one merge left in the list it named.
+#[cfg_attr(not(test), expect(dead_code, reason = "the page worker is the first caller"))]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct MergeReport {
+    pub members: usize,
+    /// Catalogue rows that absorb dropped, plus confirmed ids that name nothing
+    /// the catalogue holds after the absorb.
+    pub dropped: usize,
 }
 
 /// The single local user's data. `downloaded` is a `BTreeSet`, not a `HashSet`,
@@ -465,6 +486,49 @@ impl Library {
             tidal_playlists: self.tidal_playlists.len(),
             dropped,
         }
+    }
+
+    /// Absorb the page's rows into `cat`, then merge the confirmed ids that
+    /// resolve into the one list `m.list` names. The tracks of a Tidal
+    /// playlist live in the catalogue, so `RemoteList::Playlist` merges there.
+    /// Downloads, history, user playlists, collections and the name are
+    /// untouched. A confirmed id that does not resolve is counted, not kept.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the page worker is the first caller"))]
+    pub fn merge(&mut self, cat: &mut Catalogue, m: Merge) -> MergeReport {
+        fn into<T: Ord + Clone>(
+            members: &mut Members<T>,
+            confirmed: Vec<String>,
+            id: impl Fn(&str) -> Option<T>,
+            reach: Reach,
+            dropped: &mut usize,
+        ) -> usize {
+            members.merge(&resolve(confirmed, id, dropped), reach);
+            members.len()
+        }
+        let mut dropped = cat.absorb(m.rows);
+        let members = match &m.list {
+            RemoteList::Liked => into(&mut self.liked, m.confirmed, |raw| cat.track_id(raw), m.reach, &mut dropped),
+            RemoteList::Albums => {
+                into(&mut self.saved_albums, m.confirmed, |raw| cat.album_id(raw), m.reach, &mut dropped)
+            }
+            RemoteList::Artists => {
+                into(&mut self.followed, m.confirmed, |raw| cat.artist_id(raw), m.reach, &mut dropped)
+            }
+            RemoteList::Playlists => {
+                into(&mut self.tidal_playlists, m.confirmed, |raw| cat.playlist_id(raw), m.reach, &mut dropped)
+            }
+            RemoteList::Playlist(id) => match cat.merge_tracks(id, &m.confirmed, m.reach) {
+                Some(unresolved) => {
+                    dropped += unresolved;
+                    cat.playlist(id).map_or(0, |p| p.tracks.len())
+                }
+                None => {
+                    dropped += m.confirmed.len();
+                    0
+                }
+            },
+        };
+        MergeReport { members, dropped }
     }
 
     // --- Profile ----------------------------------------------------------
@@ -897,6 +961,83 @@ mod tests {
             assert!(!lib.liked.merge(&confirmed, reach), "{reach:?} reported a change on a repeat");
             assert_eq!(lib, once, "a repeated {reach:?} merge changed the library");
         }
+    }
+
+    fn liked_page(confirmed: &[&str], reach: Reach) -> Merge {
+        Merge {
+            list: RemoteList::Liked,
+            rows: CatalogueRows::default(),
+            confirmed: confirmed.iter().map(|s| s.to_string()).collect(),
+            reach,
+        }
+    }
+
+    /// A partial page is only the start of the list, so a local like it omits
+    /// may sit on a later page and survives. Only a complete read removes it.
+    /// Local data and the name survive both.
+    #[test]
+    fn a_local_like_survives_a_partial_merge_and_only_a_complete_merge_removes_it() {
+        let mut cat = Catalogue::seed();
+        let before = full_library(&cat);
+        let mut lib = before.clone();
+        let local = cat.track_id("seed-track-0").unwrap();
+        assert!(lib.is_liked(&local));
+
+        let report = lib.merge(&mut cat, liked_page(&["seed-track-1", "404"], Reach::Partial));
+        assert_eq!(lib.liked.to_vec(), tracks(&cat, &[1, 0]), "a partial merge dropped the local like");
+        assert_eq!(report, MergeReport { members: 2, dropped: 1 });
+
+        let report = lib.merge(&mut cat, liked_page(&["seed-track-1"], Reach::Complete));
+        assert_eq!(lib.liked.to_vec(), tracks(&cat, &[1]), "a complete merge kept a like Tidal does not list");
+        assert_eq!(report, MergeReport { members: 1, dropped: 0 });
+
+        assert_eq!(lib.name, before.name, "a merge changed the name");
+        assert_eq!(lib.downloaded, before.downloaded, "a merge touched the downloads");
+        assert_eq!(lib.history, before.history, "a merge touched the history");
+        assert_eq!(lib.playlists, before.playlists, "a merge touched a user playlist");
+        assert_eq!(lib.collections, before.collections, "a merge touched a collection");
+        assert_eq!(lib.saved_albums, before.saved_albums, "a liked page touched the saved albums");
+    }
+
+    /// The tracks of a Tidal playlist live in the catalogue. A track page
+    /// replaces them there, adds the tracks it brings, and leaves the
+    /// playlist's name and cover and every library list alone.
+    #[test]
+    fn a_playlist_track_page_changes_its_tracks_and_not_its_name_or_cover() {
+        let mut cat = Catalogue::seed();
+        cat.absorb(CatalogueRows {
+            playlists: vec![PlaylistRow {
+                id: "x-playlist".into(),
+                name: "Evening".into(),
+                description: String::new(),
+                tracks: vec!["seed-track-0".into()],
+                cover: "x-cover".into(),
+            }],
+            ..CatalogueRows::default()
+        });
+        let id = cat.playlist_id("x-playlist").unwrap();
+        let cover = cat.playlist(&id).unwrap().cover.clone();
+        assert!(cover.is_some());
+        let before = full_library(&cat);
+        let mut lib = before.clone();
+
+        let report = lib.merge(
+            &mut cat,
+            Merge {
+                list: RemoteList::Playlist(id.clone()),
+                rows: fetched_rows(),
+                confirmed: vec!["x-track".into(), "seed-track-3".into()],
+                reach: Reach::Complete,
+            },
+        );
+
+        let playlist = cat.playlist(&id).unwrap();
+        let x_track = cat.track_id("x-track").unwrap();
+        assert_eq!(playlist.tracks.to_vec(), [vec![x_track], tracks(&cat, &[3])].concat());
+        assert_eq!(playlist.name, "Evening", "a track page renamed the playlist");
+        assert_eq!(playlist.cover, cover, "a track page changed the cover");
+        assert_eq!(report, MergeReport { members: 2, dropped: 0 });
+        assert_eq!(lib, before, "a playlist track page changed the library");
     }
 
     /// Renaming actually changes the name. The invariant does not constrain

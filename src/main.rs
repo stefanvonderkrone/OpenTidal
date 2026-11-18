@@ -8,6 +8,7 @@ mod auth;
 mod catalogue;
 mod covers;
 mod library;
+mod pager;
 mod screens;
 mod state;
 mod store;

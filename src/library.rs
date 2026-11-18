@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::catalogue::{AlbumId, ArtistId, Catalogue, TrackId};
+use crate::catalogue::{AlbumId, ArtistId, Catalogue, CataloguePlaylistId, TrackId};
 
 #[cfg(not(test))]
 pub const MAX_PLAYLISTS: usize = 32;
@@ -62,6 +62,9 @@ pub struct Library {
     pub liked: BTreeSet<TrackId>,
     pub saved_albums: BTreeSet<AlbumId>,
     pub followed: BTreeSet<ArtistId>,
+    /// Playlists the account owns or favorites on Tidal. Read-only here: the
+    /// content lives in the catalogue, and no edit method takes this id type.
+    pub tidal_playlists: BTreeSet<CataloguePlaylistId>,
     /// Albums taken offline.
     pub downloaded: BTreeSet<AlbumId>,
     /// Recently played tracks, most recent first, never longer than
@@ -80,6 +83,7 @@ impl Default for Library {
             liked: BTreeSet::new(),
             saved_albums: BTreeSet::new(),
             followed: BTreeSet::new(),
+            tidal_playlists: BTreeSet::new(),
             downloaded: BTreeSet::new(),
             history: Vec::new(),
             playlists: std::array::from_fn(|_| None),
@@ -94,6 +98,7 @@ pub enum Violation {
     LikedNotInCatalogue,
     SavedAlbumNotInCatalogue,
     FollowedNotInCatalogue,
+    TidalPlaylistNotInCatalogue,
     DownloadedNotInCatalogue,
     HistoryNotInCatalogue,
     HistoryTooLong,
@@ -318,6 +323,9 @@ impl Library {
         if !self.followed.iter().all(|a| cat.artist(a).is_some()) {
             return Err(Violation::FollowedNotInCatalogue);
         }
+        if !self.tidal_playlists.iter().all(|p| cat.playlist(p).is_some()) {
+            return Err(Violation::TidalPlaylistNotInCatalogue);
+        }
         if !self.downloaded.iter().all(|a| cat.album(a).is_some()) {
             return Err(Violation::DownloadedNotInCatalogue);
         }
@@ -373,7 +381,7 @@ fn has_dup<T: PartialEq>(xs: &[T]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalogue::{AlbumRow, ArtistRow, CatalogueRows, TrackRow};
+    use crate::catalogue::{AlbumRow, ArtistRow, CatalogueRows, PlaylistRow, TrackRow};
     use std::collections::{HashSet, VecDeque};
 
     fn applying(f: impl Fn(&mut Library), l: &Library) -> Library {
@@ -512,9 +520,15 @@ mod tests {
                 album: "x-album".into(),
                 duration: "PT1M".into(),
             }],
-            playlists: Vec::new(),
+            playlists: vec![PlaylistRow {
+                id: "x-playlist".into(),
+                name: "X".into(),
+                description: String::new(),
+                tracks: vec!["x-track".into()],
+            }],
         });
         let track = bigger.track_id("x-track").unwrap();
+        let playlist = bigger.playlists().find(|p| p.id.as_str() == "x-playlist").unwrap().id.clone();
         let album = bigger.album_id("x-album").unwrap();
         let artist = bigger.artist_id("x-artist").unwrap();
 
@@ -527,6 +541,10 @@ mod tests {
 
         let l = Library { followed: BTreeSet::from([artist]), ..Default::default() };
         assert_eq!(l.check(&seed), Err(Violation::FollowedNotInCatalogue));
+
+        let l = Library { tidal_playlists: BTreeSet::from([playlist]), ..Default::default() };
+        assert_eq!(l.check(&seed), Err(Violation::TidalPlaylistNotInCatalogue));
+        assert_eq!(l.check(&bigger), Ok(()));
 
         let l = Library { downloaded: BTreeSet::from([album]), ..Default::default() };
         assert_eq!(l.check(&seed), Err(Violation::DownloadedNotInCatalogue));

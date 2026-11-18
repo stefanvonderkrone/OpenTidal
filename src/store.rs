@@ -232,6 +232,7 @@ impl Store {
             liked: load_set(&tx, user_id, "like", "track_id", |raw| cat.track_id(raw), &mut dropped)?,
             saved_albums: load_set(&tx, user_id, "save", "album_id", |raw| cat.album_id(raw), &mut dropped)?,
             followed: load_set(&tx, user_id, "follow", "artist_id", |raw| cat.artist_id(raw), &mut dropped)?,
+            tidal_playlists: BTreeSet::new(),
             downloaded: load_set(&tx, user_id, "download", "album_id", |raw| cat.album_id(raw), &mut dropped)?,
             history: Vec::new(),
             playlists: std::array::from_fn(|_| None),

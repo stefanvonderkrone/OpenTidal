@@ -32,14 +32,14 @@ refresh token persists in `auth.toml` by default. The macOS keychain stays as an
 
 ## PR sequence
 
-1. `feat/tidal-boundary` — the `MusicService` boundary, the `User` and `Token`
+1. `feat/tidal-boundary` adds the `MusicService` boundary, the `User` and `Token`
    types, PKCE auth with token persistence, and the signed-in name in the
-   sidebar and Account screen. Fake-backed headless proof.
-2. `feat/tidal-catalogue` — fetch real artists, albums, tracks, and playlists,
-   replace the placeholder `catalog.rs` with a store keyed by opaque string ids.
-3. `feat/tidal-library` — fetch liked tracks, saved albums, followed artists,
+   sidebar and Account screen. A fake-backed headless proof backs it.
+2. `feat/tidal-catalogue` fetches real artists, albums, tracks, and playlists.
+   It replaces the placeholder `catalog.rs` with a store keyed by opaque strings.
+3. `feat/tidal-library` fetches liked tracks, saved albums, followed artists,
    and user playlists from `/userCollection*` relationships into the library.
-4. `feat/tidal-search` — search the live catalogue, with debounce.
+4. `feat/tidal-search` searches the live catalogue with a debounce.
 
 Each later PR depends on the one before.
 

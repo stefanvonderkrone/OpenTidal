@@ -11,16 +11,16 @@ strings, so `album-0` is the first album card on the current screen, whatever
 the catalogue holds. The seed keeps today's order, so `album-0` on Home is
 *Currents*.
 
-- `nav-<name>` — a sidebar section (e.g. `nav-Playlists`, `nav-Albums`).
-- `album-<pos>` / `artist-<pos>` / `editorial-<pos>` — a catalogue card on a screen.
-- `playlist-<slot>` — a user playlist card on the Playlists screen.
-- `like` — the heart on the now-playing bar (label `Like` → `Unlike`).
-- `save` / `follow` / `download` — the toggle buttons on a detail hero.
-- `new-playlist`, `add`, `rename-playlist`, `delete-playlist` — playlist actions.
-- `rm-<slot>-<pos>`, `up-<slot>-<pos>`, `down-<slot>-<pos>` — per-track playlist actions.
-- `new-collection`, `add-to-col-<idx>`, `del-col-<idx>`, `rm-from-col-<idx>-<pos>`.
-- `dl-<pos>`, `rm-dl-<pos>` — download rows on the Downloads screen.
-- `track-<pos>` — a track row in a list (also `track-<pos>` in a playlist, with the actions).
+- `nav-<name>` names a sidebar section, such as `nav-Playlists` or `nav-Albums`.
+- `album-<pos>`, `artist-<pos>`, and `editorial-<pos>` name a catalogue card on a screen.
+- `playlist-<slot>` names a user playlist card on the Playlists screen.
+- `like` is the heart on the now-playing bar. Its label changes from `Like` to `Unlike`.
+- `save`, `follow`, and `download` are the toggle buttons on a detail hero.
+- `new-playlist`, `add`, `rename-playlist`, and `delete-playlist` are playlist actions.
+- `rm-<slot>-<pos>`, `up-<slot>-<pos>`, and `down-<slot>-<pos>` are per-track playlist actions.
+- `new-collection`, `add-to-col-<idx>`, `del-col-<idx>`, and `rm-from-col-<idx>-<pos>` are collection actions.
+- `dl-<pos>` and `rm-dl-<pos>` name download rows on the Downloads screen.
+- `track-<pos>` names a track row in a list, including a playlist row with its actions.
 
 The journeys:
 

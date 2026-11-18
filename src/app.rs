@@ -79,11 +79,11 @@ pub struct App {
     pub last_sync: Option<Result<SyncReport, String>>,
 }
 
-/// The session and the account a sync started under. The result is applied only
-/// when both still match. The session alone is not enough: a dead refresh token
-/// closes the library without a new session.
+/// The session and the account a worker started under. The result is applied
+/// only when both still match, which `ticket_holds` checks. The session alone is
+/// not enough: a dead refresh token closes the library without a new session.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct SyncTicket {
+pub struct Ticket {
     session: u64,
     user_id: String,
 }
@@ -107,7 +107,7 @@ type AuthFlow = (u64, Result<Token, String>);
 type ProfileFetch = (u64, Result<(Token, User), ServiceError>);
 
 /// A finished library read, tagged with its ticket, carrying the token to persist.
-type SyncFetch = (SyncTicket, Result<(Token, LibraryRows), ServiceError>);
+type SyncFetch = (Ticket, Result<(Token, LibraryRows), ServiceError>);
 
 /// A dummy token for the deterministic sign-in, so the fake path exercises the
 /// same `SignedIn` state without a network.
@@ -439,13 +439,13 @@ impl App {
     /// pending profile fetch: both workers may refresh the token, and two
     /// refreshes of one refresh token race each other.
     pub fn sync(&mut self) {
-        if self.profile.is_pending() || self.sync.is_pending() {
+        if self.token_in_use() {
             return;
         }
         let (Some(open), Auth::SignedIn { token }) = (&self.library, &self.auth) else {
             return;
         };
-        let ticket = SyncTicket { session: self.session, user_id: open.user_id.clone() };
+        let ticket = Ticket { session: self.session, user_id: open.user_id.clone() };
         let service = self.service.clone();
         let config = self.oauth.clone();
         self.sync.request(token.clone(), move |t| {
@@ -454,6 +454,20 @@ impl App {
                 with_fresh_token(&|t| refresh(&config, t), t, &|access| service.library(access, &user));
             (ticket, result)
         });
+    }
+
+    /// Whether a worker that may refresh the token is running. A new sync or a
+    /// cover batch waits for both, because two refreshes of one refresh token
+    /// race each other.
+    fn token_in_use(&self) -> bool {
+        self.profile.is_pending() || self.sync.is_pending()
+    }
+
+    /// Whether a worker result still belongs to the open library: the same
+    /// session and the same account.
+    fn ticket_holds(&self, ticket: &Ticket) -> bool {
+        ticket.session == self.session
+            && self.library.as_ref().is_some_and(|open| open.user_id == ticket.user_id)
     }
 
     /// Persist a token a worker used, and make it the session's token.
@@ -542,8 +556,7 @@ impl App {
             }
         }
         if let Some((ticket, result)) = self.sync.take()
-            && ticket.session == self.session
-            && self.library.as_ref().is_some_and(|open| open.user_id == ticket.user_id)
+            && self.ticket_holds(&ticket)
         {
             changed = true;
             match result {

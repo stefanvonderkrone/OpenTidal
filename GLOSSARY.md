@@ -95,7 +95,8 @@ A sync mirrors the library from Tidal. Nothing writes back.
 - **sync.** Read the whole Tidal library of the signed-in account, then
   replace likes, saves, follows, and Tidal playlists in one step. `Library::sync`
   applies it. A fetch that fails on any page changes nothing.
-- **sync ticket.** The session and user id a sync started under. The result is
-  applied only when both still match the open library.
+- **ticket.** The session and user id a worker started under. In code it is
+  `Ticket`, checked by `App::ticket_holds`. A result is applied only when both
+  still match the open library.
 - **user id**: Tidal's account id, from the `uid` claim of the access token.
   It is the database key. It does not change on a refresh or a fresh sign-in.

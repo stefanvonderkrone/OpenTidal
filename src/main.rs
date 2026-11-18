@@ -29,7 +29,7 @@ const HEART: Icon = Icon { name: "heart", view: 24.0, body: "<path d=\"M12 21s-6
 
 type Scene = (&'static str, fn(&mut App));
 
-const SCENES: [Scene; 7] = [
+const SCENES: [Scene; 8] = [
     ("default", |_| {}),
     ("accent-blue", |a| a.core.accent = 0),
     ("accent-pink", |a| a.core.accent = 2),
@@ -42,6 +42,7 @@ const SCENES: [Scene; 7] = [
     }),
     ("signed-in-stored", signed_in_stored_scene),
     ("signed-in-synced", signed_in_synced_scene),
+    ("signed-in-covers", signed_in_covers_scene),
 ];
 
 /// Signs in as a user the database can key on, so a driven scene proves the write
@@ -123,6 +124,35 @@ fn signed_in_synced_scene(a: &mut App) {
         ..library::LibraryRows::default()
     };
     a.service = std::sync::Arc::new(tidal::FakeService { library: Ok(library), ..tidal::FakeService::default() });
+}
+
+/// The stored scene, with a fake service whose library saves one album with a
+/// cover, and whose cover is a solid magenta PNG. The covers land beside the
+/// scene's database, so a second run with the same `OPENTIDAL_DB` reads them
+/// back with no fetch. Each decode is waited on, so it lands before the snap.
+fn signed_in_covers_scene(a: &mut App) {
+    use catalogue::{AlbumRow, CatalogueRows};
+    signed_in_stored_scene(a);
+    let library = library::LibraryRows {
+        catalogue: CatalogueRows {
+            albums: vec![AlbumRow {
+                id: "fixture-album-1".to_string(),
+                title: "Fixture Cover".to_string(),
+                artist: "seed-artist-0".to_string(),
+                cover: "fixture-cover-1".to_string(),
+            }],
+            ..CatalogueRows::default()
+        },
+        saved_albums: vec!["fixture-album-1".to_string()],
+        ..library::LibraryRows::default()
+    };
+    let magenta = include_bytes!("../tests/fixtures/covers/magenta.png").to_vec();
+    a.service = std::sync::Arc::new(tidal::FakeService {
+        library: Ok(library),
+        covers: [("fixture-cover-1".to_string(), Ok(magenta))].into(),
+        ..tidal::FakeService::default()
+    });
+    a.wait_for_decode = true;
 }
 
 fn view(app: &App, _cx: &mut Cx<App>) -> El {
@@ -310,21 +340,22 @@ fn main_col(app: &App, t: tok::Theme, accent: Color) -> El {
 fn screen_body(app: &App, t: tok::Theme, accent: Color) -> El {
     let s = &app.core;
     let cat = &app.catalogue;
+    let covers = app.covers();
     match state::current(s) {
-        Route::Home => screens::home(cat, t),
+        Route::Home => screens::home(cat, covers, t),
         Route::Feed => screens::feed(t),
-        Route::Popular => screens::popular(s, cat, t),
-        Route::ForYou => screens::for_you(cat, t),
+        Route::Popular => screens::popular(s, cat, covers, t),
+        Route::ForYou => screens::for_you(cat, covers, t),
         Route::LikedSongs => screens::liked_songs(s, cat, t),
-        Route::Albums => screens::albums(s, cat, t),
+        Route::Albums => screens::albums(s, cat, covers, t),
         Route::Artists => screens::artists(s, cat, t),
-        Route::Playlists => screens::playlists(s, cat, t),
+        Route::Playlists => screens::playlists(s, cat, covers, t),
         Route::Collections => screens::collections(app, t),
         Route::Local => screens::local(s, cat, t),
         Route::History => screens::history(s, cat, t),
         Route::Stats => screens::stats(s, cat, t),
         Route::Downloads => screens::downloads(s, cat, t),
-        Route::Search => screens::search(cat, t, &app.search),
+        Route::Search => screens::search(cat, covers, t, &app.search),
         Route::Settings => screens::settings(t),
         Route::SettingsPage(p) => screens::settings_page(*p, app, t),
         route => screens::detail(route, app, accent, t),

@@ -15,6 +15,7 @@ the catalogue holds. The seed keeps today's order, so `album-0` on Home is
 - `album-<pos>`, `artist-<pos>`, and `seed-playlist-<pos>` name a catalogue card on a screen.
 - `playlist-<slot>` names a user playlist card on the Playlists screen.
 - `tidal-playlist-<pos>` names a Tidal playlist card in the From Tidal grid on the Playlists screen.
+- `cover` is a card's placeholder gradient, and `cover-image` is its cover once the image decoded with no error. A card has one or the other. The hero uses `hero-cover` and `hero-cover-image` the same way.
 - `sync-library` is the Sync with Tidal button on the Account screen, and `sync-status` is the line under it.
 - `like` is the heart on the now-playing bar. Its label changes from `Like` to `Unlike`.
 - `save`, `follow`, and `download` are the toggle buttons on a detail hero.
@@ -39,6 +40,7 @@ The journeys:
 | `tidal-sync` | A sync shows a Tidal playlist that opens read-only. |
 | `tidal-sync-local` | After a sync, a local playlist still opens with its edit actions. |
 | `tidal-sync-status` | The Account screen reports what the sync left. |
+| `covers` | A synced album shows its fetched cover, and a second run shows it from disk with no fetch. |
 
 The `sign-in` journey runs against the deterministic fake service, which signs
 in at once, so no browser or network is needed headless. The `signed-in` scene
@@ -67,3 +69,23 @@ scripts/tree-assert.py artifacts/tidal-sync-status/tree.json "text=sync-status=S
 The `absent` predicates alone cannot catch a Tidal card that opens nothing, so
 the title assertion is the one that fails when the card is wired to a user
 playlist slot.
+
+The `covers` journey starts from the `signed-in-covers` scene. Its fake service
+saves one album whose cover is the solid magenta PNG in
+`tests/fixtures/covers/magenta.png`. The cover cache sits beside the scene's
+database, so both runs below must share one `OPENTIDAL_DB`. The first run
+fetches the cover. The second run reads it from disk, and its log says the batch
+fetched 0 covers. `scripts/pixel-assert.py` reads the snap inside the
+`cover-image` rect, so a placeholder or a missing key fails it:
+
+```sh
+export OPENTIDAL_DB="$(mktemp -d)/scene.db"
+scripts/control-opentidal drive features/covers/script.json artifacts/covers --scene signed-in-covers
+scripts/tree-assert.py artifacts/covers/tree.json has=cover-image absent=cover
+scripts/pixel-assert.py artifacts/covers/frame.png artifacts/covers/tree.json cover-image ff00ff 0.9
+grep "fetched 1 of 1 covers" artifacts/covers/run.log
+
+scripts/control-opentidal drive features/covers/script.json artifacts/covers-hit --scene signed-in-covers
+scripts/pixel-assert.py artifacts/covers-hit/frame.png artifacts/covers-hit/tree.json cover-image ff00ff 0.9
+grep "fetched 0 of 1 covers" artifacts/covers-hit/run.log
+```

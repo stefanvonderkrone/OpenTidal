@@ -29,6 +29,12 @@ cargo clippy -q -p opentidal --all-targets --no-deps ${fix[@]+"${fix[@]}"} -- -D
 echo "== evidence table"
 python3 scripts/evidence-status.py
 
+echo "== pixel check self-test"
+# The cover journey proves a decoded cover with this script. The self-test proves
+# it passes on a matching rect and fails on a wrong rect and on a missing key, so a
+# broken check cannot pass a placeholder.
+python3 scripts/pixel-assert.py --self-test
+
 echo "== no copied scope list"
 # The list lives in `DEFAULT_SCOPE` and nowhere else. `scripts/scope-check.py` reads
 # the working tree, the index and the untracked files, and fails when it cannot read

@@ -109,7 +109,6 @@ pub struct CataloguePlaylist {
 
 /// Whose `coverArt` relationship names a cover. A fetch needs the owner,
 /// because the pinned spec has no third-party read of an artwork by its id.
-#[cfg_attr(not(test), expect(dead_code, reason = "the screens draw covers from unit 10"))]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum CoverOwner {
     Album(AlbumId),
@@ -125,7 +124,6 @@ pub struct CoverRequest {
 }
 
 impl Album {
-    #[cfg_attr(not(test), expect(dead_code, reason = "the screens draw covers from unit 10"))]
     pub fn cover_request(&self) -> Option<CoverRequest> {
         let artwork = self.cover.clone()?;
         Some(CoverRequest { artwork, owner: CoverOwner::Album(self.id.clone()) })
@@ -133,7 +131,6 @@ impl Album {
 }
 
 impl CataloguePlaylist {
-    #[cfg_attr(not(test), expect(dead_code, reason = "the screens draw covers from unit 10"))]
     pub fn cover_request(&self) -> Option<CoverRequest> {
         let artwork = self.cover.clone()?;
         Some(CoverRequest { artwork, owner: CoverOwner::Playlist(self.id.clone()) })

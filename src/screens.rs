@@ -5,20 +5,21 @@
 
 use rune::tok::{self, radius, space, type_};
 use rune::{Color, El, ScrollSpec, TextEdit, col, el, oklch, row, text, text_input};
-use crate::app::App;
+use crate::app::{App, Cover, Covers};
 use crate::catalogue::{Album, AlbumId, Artist, ArtistId, Catalogue, CataloguePlaylist, CataloguePlaylistId, Track, TrackId};
 use crate::library::{self, PlaylistId};
 use crate::state::{self, PopularTab, Route, SettingsPage, State};
 
-/// A colourful vertical gradient for a placeholder cover.
-pub fn cover(i: usize) -> (Color, Color) {
+/// A colourful vertical gradient, the placeholder for an item with no cover.
+fn placeholder(i: usize) -> (Color, Color) {
     let hue = (i as f32 * 37.0 + 14.0) % 360.0;
     (oklch(0.62, 0.16, hue), oklch(0.34, 0.15, hue))
 }
 
-/// A cover seed from an id, so an item has one colour on every screen and
-/// across restarts. FNV-1a, because the std hasher may change between releases.
-fn cover_seed(id: &str) -> usize {
+/// A placeholder seed from an id, so an item has one colour on every screen
+/// and across restarts. FNV-1a, because the std hasher may change between
+/// releases.
+fn placeholder_seed(id: &str) -> usize {
     let hash = id.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
     (hash % 360) as usize
 }
@@ -36,9 +37,29 @@ fn artist_name<'a>(cat: &'a Catalogue, id: &ArtistId) -> &'a str {
 
 // --- Cards ---------------------------------------------------------------
 
+/// The placeholder gradient keyed `key`.
+fn placeholder_art(key: &str, seed: usize, size: f32, round: f32, t: tok::Theme) -> El {
+    let (top, bottom) = placeholder(seed);
+    el().key(key).size(size, size).radius(round).gradient(top, bottom).shadow(2.0, 12.0, t.shadow_soft)
+}
+
+/// The cover when its pixels decoded with no error, keyed `<key>-image`, else
+/// the placeholder keyed `key`. A tree assertion on `cover-image` therefore
+/// cannot pass on a placeholder or on an image still decoding.
+fn cover_art(key: &str, cover: &Cover, size: f32, round: f32, t: tok::Theme) -> El {
+    match cover.ready() {
+        Some(image) => el()
+            .key(format!("{key}-image"))
+            .size(size, size)
+            .radius(round)
+            .pixels(image.pixels())
+            .shadow(2.0, 12.0, t.shadow_soft),
+        None => placeholder_art(key, placeholder_seed(cover.seed()), size, round, t),
+    }
+}
+
 /// A square media card that drills into a detail route on press.
-fn card(key: &str, seed: usize, title: &str, subtitle: &str, route: Route, t: tok::Theme) -> El {
-    let (top, bottom) = cover(seed);
+fn card(key: &str, art: El, title: &str, subtitle: &str, route: Route, t: tok::Theme) -> El {
     col().key(key)
         .w(168.0)
         .gap(space::S2)
@@ -46,26 +67,20 @@ fn card(key: &str, seed: usize, title: &str, subtitle: &str, route: Route, t: to
             a.rename.clear();
             state::open_detail(&mut a.core, &a.catalogue, route.clone())
         })
-        .child(
-            el().key("cover")
-                .size(168.0, 168.0)
-                .radius(radius::MD)
-                .gradient(top, bottom)
-                .shadow(2.0, 12.0, t.shadow_soft),
-        )
+        .child(art)
         .child(text(title).key("title").font(type_::BODY).color(t.text))
         .child(text(subtitle).key("subtitle").font(type_::LABEL).color(t.text_secondary))
 }
 
 /// Keys are positions on the screen, so a script taps the same visible card
 /// whatever the catalogue holds.
-fn album_card(pos: usize, a: &Album, cat: &Catalogue, t: tok::Theme) -> El {
-    card(&format!("album-{pos}"), cover_seed(a.id.as_str()), &a.title, artist_name(cat, &a.artist), Route::Album(a.id.clone()), t)
+fn album_card(pos: usize, a: &Album, cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
+    let art = cover_art("cover", &covers.album(a), 168.0, radius::MD, t);
+    card(&format!("album-{pos}"), art, &a.title, artist_name(cat, &a.artist), Route::Album(a.id.clone()), t)
 }
 
 fn artist_card(pos: usize, a: &Artist, t: tok::Theme) -> El {
     let id = a.id.clone();
-    let (top, bottom) = cover(cover_seed(a.id.as_str()));
     col().key(format!("artist-{pos}"))
         .w(120.0)
         .gap(space::S2)
@@ -73,22 +88,18 @@ fn artist_card(pos: usize, a: &Artist, t: tok::Theme) -> El {
             app.rename.clear();
             state::open_detail(&mut app.core, &app.catalogue, Route::Artist(id.clone()))
         })
-        .child(
-            el().key("cover")
-                .size(120.0, 120.0)
-                .radius(60.0)
-                .gradient(top, bottom)
-                .shadow(2.0, 12.0, t.shadow_soft),
-        )
+        .child(placeholder_art("cover", placeholder_seed(a.id.as_str()), 120.0, 60.0, t))
         .child(text(&a.name).key("name").font(type_::BODY).color(t.text).center())
 }
 
-fn seed_playlist_card(pos: usize, p: &CataloguePlaylist, t: tok::Theme) -> El {
-    card(&format!("seed-playlist-{pos}"), cover_seed(p.id.as_str()), &p.name, &p.description, Route::CataloguePlaylist(p.id.clone()), t)
+fn catalogue_playlist_card(key: String, p: &CataloguePlaylist, subtitle: &str, covers: Covers<'_>, t: tok::Theme) -> El {
+    let art = cover_art("cover", &covers.playlist(p), 168.0, radius::MD, t);
+    card(&key, art, &p.name, subtitle, Route::CataloguePlaylist(p.id.clone()), t)
 }
 
 fn playlist_card(id: PlaylistId, name: &str, t: tok::Theme) -> El {
-    card(&format!("playlist-{}", id.0), id.0 as usize + 10, name, "Your playlist", Route::UserPlaylist(id), t)
+    let art = placeholder_art("cover", id.0 as usize + 10, 168.0, radius::MD, t);
+    card(&format!("playlist-{}", id.0), art, name, "Your playlist", Route::UserPlaylist(id), t)
 }
 
 // --- Shelves and grids ---------------------------------------------------
@@ -234,8 +245,8 @@ fn page(title: &str, subtitle: &str, t: tok::Theme, body: El) -> El {
         )
 }
 
-fn all_albums_grid(cat: &Catalogue, t: tok::Theme) -> El {
-    let cards: Vec<El> = cat.albums().enumerate().map(|(i, a)| album_card(i, a, cat, t)).collect();
+fn all_albums_grid(cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
+    let cards: Vec<El> = cat.albums().enumerate().map(|(i, a)| album_card(i, a, cat, covers, t)).collect();
     grid(cards, 5)
 }
 
@@ -253,9 +264,12 @@ pub fn home_playlists(cat: &Catalogue) -> impl Iterator<Item = &CataloguePlaylis
     cat.seed_playlists()
 }
 
-pub fn home(cat: &Catalogue, t: tok::Theme) -> El {
-    let rec: Vec<El> = cat.albums().take(5).enumerate().map(|(i, a)| album_card(i, a, cat, t)).collect();
-    let edits: Vec<El> = home_playlists(cat).enumerate().map(|(i, p)| seed_playlist_card(i, p, t)).collect();
+pub fn home(cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
+    let rec: Vec<El> = cat.albums().take(5).enumerate().map(|(i, a)| album_card(i, a, cat, covers, t)).collect();
+    let edits: Vec<El> = home_playlists(cat)
+        .enumerate()
+        .map(|(i, p)| catalogue_playlist_card(format!("seed-playlist-{i}"), p, &p.description, covers, t))
+        .collect();
     page("Home", "Your music, your way", t,
         col().gap(space::S6)
             .child(shelf("Recommended for you", t, rec))
@@ -281,14 +295,14 @@ pub fn feed(t: tok::Theme) -> El {
     page("Feed", "Activity from artists you follow", t, rows)
 }
 
-pub fn popular(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
+pub fn popular(s: &State, cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
     let tabs = row().gap(space::S2).pb(space::S3)
         .child(tab("Artists", PopularTab::Artists, s, t))
         .child(tab("Albums", PopularTab::Albums, s, t))
         .child(tab("Tracks", PopularTab::Tracks, s, t));
     let body = match s.popular_tab {
         PopularTab::Artists => all_artists_grid(cat, t),
-        PopularTab::Albums => all_albums_grid(cat, t),
+        PopularTab::Albums => all_albums_grid(cat, covers, t),
         PopularTab::Tracks => track_list(cat.tracks().collect(), s.now_playing.as_ref(), cat, t),
     };
     page("Popular", "Global charts", t,
@@ -309,9 +323,9 @@ fn tab(label: &str, tab: PopularTab, s: &State, t: tok::Theme) -> El {
         .child(text(label).key("label").font(type_::BODY).color(if active { t.bg } else { t.text }))
 }
 
-pub fn for_you(cat: &Catalogue, t: tok::Theme) -> El {
+pub fn for_you(cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
     // One position count across both shelves, so no two cards share a key.
-    let mut cards: Vec<El> = cat.albums().enumerate().map(|(i, x)| album_card(i, x, cat, t)).collect();
+    let mut cards: Vec<El> = cat.albums().enumerate().map(|(i, x)| album_card(i, x, cat, covers, t)).collect();
     let b = cards.split_off(cards.len().min(5));
     let a = cards;
     page("For You", "Built from what you play", t,
@@ -330,12 +344,12 @@ pub fn liked_songs(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
     page("Liked Songs", "Tracks you liked", t, body)
 }
 
-pub fn albums(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
+pub fn albums(s: &State, cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
     let saved: Vec<&Album> = cat.albums().filter(|a| s.lib.is_saved_album(&a.id)).collect();
     let body = if saved.is_empty() {
         empty("No saved albums yet. Open an album and tap Save.", t)
     } else {
-        grid(saved.into_iter().enumerate().map(|(i, a)| album_card(i, a, cat, t)).collect(), 5)
+        grid(saved.into_iter().enumerate().map(|(i, a)| album_card(i, a, cat, covers, t)).collect(), 5)
     };
     page("Albums", "Albums you saved", t, body)
 }
@@ -350,7 +364,7 @@ pub fn artists(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
     page("Artists", "Artists you follow", t, body)
 }
 
-pub fn playlists(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
+pub fn playlists(s: &State, cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
     let new_btn = el().key("new-playlist").label("New playlist")
         .h(40.0).px(space::S3).radius(radius::MD).center_y().focusable(true)
         .fill(t.text)
@@ -374,7 +388,7 @@ pub fn playlists(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
     let tidal: Vec<El> = s.lib.tidal_playlists.iter()
         .filter_map(|id| cat.playlist(id))
         .enumerate()
-        .map(|(n, p)| card(&format!("tidal-playlist-{n}"), cover_seed(p.id.as_str()), &p.name, "From Tidal", Route::CataloguePlaylist(p.id.clone()), t))
+        .map(|(n, p)| catalogue_playlist_card(format!("tidal-playlist-{n}"), p, "From Tidal", covers, t))
         .collect();
     if !tidal.is_empty() {
         body = body
@@ -547,16 +561,16 @@ pub fn downloads(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
     page("Downloads", "Your download queue", t, rows)
 }
 
-pub fn search(cat: &Catalogue, t: tok::Theme, edit: &TextEdit) -> El {
+pub fn search(cat: &Catalogue, covers: Covers<'_>, t: tok::Theme, edit: &TextEdit) -> El {
     let query = edit.text.trim();
     let results = if query.is_empty() {
-        all_albums_grid(cat, t)
+        all_albums_grid(cat, covers, t)
     } else {
         let q = query.to_lowercase();
         let matches = |s: &str| s.to_lowercase().contains(&q);
         let albums: Vec<El> = cat.albums()
             .filter(|a| matches(&a.title) || matches(artist_name(cat, &a.artist)))
-            .enumerate().map(|(i, a)| album_card(i, a, cat, t)).collect();
+            .enumerate().map(|(i, a)| album_card(i, a, cat, covers, t)).collect();
         let artists: Vec<El> = cat.artists()
             .filter(|a| matches(&a.name))
             .enumerate().map(|(i, a)| artist_card(i, a, t)).collect();
@@ -813,13 +827,13 @@ fn action_button<F: Fn(&mut App) + 'static>(key: &str, label: &str, accent: Colo
         .child(text(label).key("label").font(type_::BODY).color(if filled { t.bg } else { t.text }))
 }
 
-fn hero(cover_el: El, title: &str, subtitle: &str, t: tok::Theme, actions: Vec<El>) -> El {
+fn hero(art: El, title: &str, subtitle: &str, t: tok::Theme, actions: Vec<El>) -> El {
     let mut btns = row().gap(space::S2).pt(space::S3);
     for b in actions {
         btns = btns.child(b);
     }
     row().px(space::S6).pt(space::S6).pb(space::S3).gap(space::S6)
-        .child(cover_el)
+        .child(art)
         .child(
             col().gap(space::S2)
                 .child(text(title).key("hero-title").font(type_::TITLE).color(t.text))
@@ -838,20 +852,16 @@ fn detail_body(body: El) -> El {
         .child(body)
 }
 
-fn cover_el(seed: usize, size: f32, round: f32, t: tok::Theme) -> El {
-    let (top, bottom) = cover(seed);
-    el().key("hero-cover").size(size, size).radius(round).gradient(top, bottom).shadow(2.0, 12.0, t.shadow_soft)
-}
-
 /// A detail screen. The route variant selects the subject; the back affordance
 /// lives in the top bar, not here.
 pub fn detail(route: &Route, app: &App, accent: Color, t: tok::Theme) -> El {
     let s = &app.core;
     let cat = &app.catalogue;
+    let covers = app.covers();
     match route {
-        Route::Album(id) => album_detail(id, s, cat, accent, t),
+        Route::Album(id) => album_detail(id, s, cat, covers, accent, t),
         Route::Artist(id) => artist_detail(id, s, cat, accent, t),
-        Route::CataloguePlaylist(id) => catalogue_playlist_detail(id, s, cat, accent, t),
+        Route::CataloguePlaylist(id) => catalogue_playlist_detail(id, s, cat, covers, accent, t),
         Route::UserPlaylist(id) => user_playlist_detail(*id, app, accent, t),
         _ => page("Detail", "", t, el()),
     }
@@ -867,7 +877,7 @@ fn play_first(first: impl Fn(&Catalogue) -> Option<TrackId> + 'static) -> impl F
     }
 }
 
-fn album_detail(id: &AlbumId, s: &State, cat: &Catalogue, accent: Color, t: tok::Theme) -> El {
+fn album_detail(id: &AlbumId, s: &State, cat: &Catalogue, covers: Covers<'_>, accent: Color, t: tok::Theme) -> El {
     let Some(a) = cat.album(id) else {
         return page("Album", "This album is gone", t, el());
     };
@@ -890,7 +900,7 @@ fn album_detail(id: &AlbumId, s: &State, cat: &Catalogue, accent: Color, t: tok:
     ];
 
     col().grow(1.0).min_h(0.0)
-        .child(hero(cover_el(cover_seed(id.as_str()), 200.0, radius::MD, t), &a.title, &format!("Album by {artist}"), t, actions))
+        .child(hero(cover_art("hero-cover", &covers.album(a), 200.0, radius::MD, t), &a.title, &format!("Album by {artist}"), t, actions))
         .child(detail_body(track_list(tracks, s.now_playing.as_ref(), cat, t)))
 }
 
@@ -911,11 +921,11 @@ fn artist_detail(id: &ArtistId, s: &State, cat: &Catalogue, accent: Color, t: to
     ];
 
     col().grow(1.0).min_h(0.0)
-        .child(hero(cover_el(cover_seed(id.as_str()), 200.0, 100.0, t), &a.name, "Artist", t, actions))
+        .child(hero(placeholder_art("hero-cover", placeholder_seed(id.as_str()), 200.0, 100.0, t), &a.name, "Artist", t, actions))
         .child(detail_body(track_list(tracks, s.now_playing.as_ref(), cat, t)))
 }
 
-fn catalogue_playlist_detail(id: &CataloguePlaylistId, s: &State, cat: &Catalogue, accent: Color, t: tok::Theme) -> El {
+fn catalogue_playlist_detail(id: &CataloguePlaylistId, s: &State, cat: &Catalogue, covers: Covers<'_>, accent: Color, t: tok::Theme) -> El {
     let Some(p) = cat.playlist(id) else {
         return page("Playlist", "This playlist is gone", t, el());
     };
@@ -927,7 +937,7 @@ fn catalogue_playlist_detail(id: &CataloguePlaylistId, s: &State, cat: &Catalogu
     ];
 
     col().grow(1.0).min_h(0.0)
-        .child(hero(cover_el(cover_seed(id.as_str()), 200.0, radius::MD, t), &p.name, &p.description, t, actions))
+        .child(hero(cover_art("hero-cover", &covers.playlist(p), 200.0, radius::MD, t), &p.name, &p.description, t, actions))
         .child(detail_body(track_list(tracks, s.now_playing.as_ref(), cat, t)))
 }
 
@@ -987,6 +997,6 @@ fn user_playlist_detail(id: PlaylistId, app: &App, accent: Color, t: tok::Theme)
     }
 
     col().grow(1.0).min_h(0.0)
-        .child(hero(cover_el(id.0 as usize + 10, 200.0, radius::MD, t), &name, "Your playlist", t, actions))
+        .child(hero(placeholder_art("hero-cover", id.0 as usize + 10, 200.0, radius::MD, t), &name, "Your playlist", t, actions))
         .child(detail_body(body))
 }

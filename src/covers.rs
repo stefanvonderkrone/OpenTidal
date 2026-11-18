@@ -196,6 +196,7 @@ pub fn resolve(
         };
         outcomes.push((request.artwork, outcome));
     }
+    eprintln!("opentidal: a cover batch fetched {fetches} of {} covers", outcomes.len());
     outcomes
 }
 

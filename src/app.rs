@@ -320,7 +320,6 @@ impl App {
     }
 
     /// The view-facing covers. With no open library every cover is a gradient.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the screens draw covers from unit 10"))]
     pub fn covers(&self) -> Covers<'_> {
         Covers {
             open: self.library.as_ref().and_then(|open| open.covers.as_ref()),
@@ -942,14 +941,12 @@ impl Default for App {
 }
 
 /// A borrow of the open account's covers for one frame.
-#[cfg_attr(not(test), expect(dead_code, reason = "the screens draw covers from unit 10"))]
 #[derive(Clone, Copy)]
 pub struct Covers<'a> {
     open: Option<&'a AccountCovers>,
     waker: Option<&'a Waker>,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "the screens draw covers from unit 10"))]
 impl Covers<'_> {
     /// The cover of an album. A new artwork id is recorded as wanted, and the
     /// loop is woken once so `drain` starts a batch. A known id costs one map
@@ -958,7 +955,6 @@ impl Covers<'_> {
         self.cover(album.cover_request(), album.id.as_str())
     }
 
-    #[expect(dead_code, reason = "the screens draw covers from unit 10")]
     pub fn playlist(self, playlist: &CataloguePlaylist) -> Cover {
         self.cover(playlist.cover_request(), playlist.id.as_str())
     }
@@ -986,22 +982,18 @@ impl Covers<'_> {
 }
 
 /// What a screen draws: a decoded image, or the gradient its seed picks.
-#[cfg_attr(not(test), expect(dead_code, reason = "the screens draw covers from unit 10"))]
 pub struct Cover {
     image: Option<Image>,
-    #[cfg_attr(test, expect(dead_code, reason = "the screens draw covers from unit 10"))]
     seed: String,
 }
 
 impl Cover {
     /// The image only when it decoded with no error.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the screens draw covers from unit 10"))]
     pub fn ready(&self) -> Option<&Image> {
         self.image.as_ref().filter(|image| image.is_ready() && image.error().is_none())
     }
 
     /// The text the placeholder gradient is picked from: the owner's id.
-    #[expect(dead_code, reason = "the screens draw covers from unit 10")]
     pub fn seed(&self) -> &str {
         &self.seed
     }

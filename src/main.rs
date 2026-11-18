@@ -3,6 +3,7 @@
 //! `cargo run -- --snap out.png --scene default` renders headless.
 
 mod app;
+mod atomic;
 mod auth;
 mod catalogue;
 mod library;

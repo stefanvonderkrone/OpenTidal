@@ -27,7 +27,7 @@ const HEART: Icon = Icon { name: "heart", view: 24.0, body: "<path d=\"M12 21s-6
 
 type Scene = (&'static str, fn(&mut App));
 
-const SCENES: [Scene; 6] = [
+const SCENES: [Scene; 7] = [
     ("default", |_| {}),
     ("accent-blue", |a| a.core.accent = 0),
     ("accent-pink", |a| a.core.accent = 2),
@@ -39,6 +39,7 @@ const SCENES: [Scene; 6] = [
         };
     }),
     ("signed-in-stored", signed_in_stored_scene),
+    ("signed-in-synced", signed_in_synced_scene),
 ];
 
 /// Signs in as a user the database can key on, so a driven scene proves the write
@@ -91,6 +92,29 @@ fn signed_in_stored_scene(a: &mut App) {
     a.tokens.save(&token);
     a.setup(std::sync::Arc::new(|| ()));
     a.core.lib.set_name("Stored User".to_string());
+}
+
+/// The stored scene, with a fake service whose library holds one liked track and
+/// one Tidal playlist. Nothing syncs by itself: the Sync with Tidal button on the
+/// Account screen starts it, the way the deterministic build always does.
+fn signed_in_synced_scene(a: &mut App) {
+    use catalogue::{CatalogueRows, PlaylistRow};
+    signed_in_stored_scene(a);
+    let library = library::LibraryRows {
+        catalogue: CatalogueRows {
+            playlists: vec![PlaylistRow {
+                id: "f6b9f0a1-6c8e-4d24-9c71-1d0e2f3a4b5c".to_string(),
+                name: "Evening Drive".to_string(),
+                description: "A playlist from Tidal".to_string(),
+                tracks: vec!["seed-track-0".to_string(), "seed-track-1".to_string()],
+            }],
+            ..CatalogueRows::default()
+        },
+        liked: vec!["seed-track-3".to_string()],
+        tidal_playlists: vec!["f6b9f0a1-6c8e-4d24-9c71-1d0e2f3a4b5c".to_string()],
+        ..library::LibraryRows::default()
+    };
+    a.service = std::sync::Arc::new(tidal::FakeService { library: Ok(library), ..tidal::FakeService::default() });
 }
 
 fn view(app: &App, _cx: &mut Cx<App>) -> El {
@@ -286,7 +310,7 @@ fn screen_body(app: &App, t: tok::Theme, accent: Color) -> El {
         Route::LikedSongs => screens::liked_songs(s, cat, t),
         Route::Albums => screens::albums(s, cat, t),
         Route::Artists => screens::artists(s, cat, t),
-        Route::Playlists => screens::playlists(s, t),
+        Route::Playlists => screens::playlists(s, cat, t),
         Route::Collections => screens::collections(app, t),
         Route::Local => screens::local(s, cat, t),
         Route::History => screens::history(s, cat, t),

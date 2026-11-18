@@ -1,0 +1,1 @@
+{"events":[{"t":0.1,"type":"tap","key":"settings-go"},{"t":0.2,"type":"tap","key":"set-5"},{"t":0.3,"type":"tap","key":"sync-library"},{"t":0.6,"type":"tap","key":"nav-Playlists"},{"t":0.7,"type":"tap","key":"new-playlist"},{"t":0.9,"type":"tap","key":"playlist-0"},{"t":1.1,"type":"mark","name":"end"}]}

@@ -350,7 +350,7 @@ pub fn artists(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
     page("Artists", "Artists you follow", t, body)
 }
 
-pub fn playlists(s: &State, t: tok::Theme) -> El {
+pub fn playlists(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
     let new_btn = el().key("new-playlist").label("New playlist")
         .h(40.0).px(space::S3).radius(radius::MD).center_y().focusable(true)
         .fill(t.text)
@@ -364,11 +364,23 @@ pub fn playlists(s: &State, t: tok::Theme) -> El {
         .filter_map(|(i, p)| p.as_ref().map(|p| (PlaylistId(i as u8), p.name.clone())))
         .map(|(id, name)| playlist_card(id, &name, t))
         .collect();
-    let body = if cards.is_empty() {
+    let mut body = if cards.is_empty() {
         col().gap(space::S3).child(new_btn).child(empty("No playlists yet. Create one.", t))
     } else {
         col().gap(space::S3).child(new_btn).child(grid(cards, 5))
     };
+    // Tidal playlists open the read-only catalogue route, so no edit action can
+    // reach one. Only this account's memberships are listed.
+    let tidal: Vec<El> = s.lib.tidal_playlists.iter()
+        .filter_map(|id| cat.playlist(id))
+        .enumerate()
+        .map(|(n, p)| card(&format!("tidal-playlist-{n}"), cover_seed(p.id.as_str()), &p.name, "From Tidal", Route::CataloguePlaylist(p.id.clone()), t))
+        .collect();
+    if !tidal.is_empty() {
+        body = body
+            .child(text("From Tidal").key("tidal-playlists-title").font(type_::SECTION).color(t.text))
+            .child(grid(tidal, 5));
+    }
     page("Playlists", "Your playlists", t, body)
 }
 
@@ -678,7 +690,11 @@ fn account_page(app: &App, t: tok::Theme) -> El {
                         .color(t.text_secondary),
                 );
             }
-            page("Account", "Your profile", t, with_write_error(app, body, t).child(sign_out_button(t)))
+            page("Account", "Your profile", t,
+                with_write_error(app, body, t)
+                    .child(sync_button(t))
+                    .child(text(sync_status(app)).key("sync-status").font(type_::BODY).color(t.text_secondary))
+                    .child(sign_out_button(t)))
         }
         crate::auth::Auth::Authorizing { .. } => {
             page("Account", "Your profile", t,
@@ -726,6 +742,44 @@ fn account_page(app: &App, t: tok::Theme) -> El {
                     .child(save_btn))
         }
     }
+}
+
+/// What the last sync did, or that one is running. A failure says that nothing
+/// changed, because a failed sync applies nothing.
+fn sync_status(app: &App) -> String {
+    if app.sync.is_pending() {
+        return "Syncing with Tidal…".to_string();
+    }
+    match &app.last_sync {
+        None => "Not synced in this session.".to_string(),
+        Some(Err(message)) => message.clone(),
+        Some(Ok(r)) => {
+            let mut line = format!(
+                "Synced {}, {}, {} and {}.",
+                count(r.liked, "track"),
+                count(r.saved_albums, "album"),
+                count(r.followed, "artist"),
+                count(r.tidal_playlists, "playlist")
+            );
+            if r.dropped > 0 {
+                line.push_str(&format!(" {} could not be read.", count(r.dropped, "item")));
+            }
+            line
+        }
+    }
+}
+
+/// A count with its noun, such as `1 track` or `2 tracks`.
+fn count(n: usize, noun: &str) -> String {
+    if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") }
+}
+
+fn sync_button(t: tok::Theme) -> El {
+    el().key("sync-library").label("Sync with Tidal")
+        .h(40.0).px(space::S3).radius(radius::MD).center_y().focusable(true)
+        .fill(t.hover)
+        .on_press(|a: &mut App| a.sync())
+        .child(text("Sync with Tidal").key("label").font(type_::BODY).color(t.text))
 }
 
 fn sign_in_button(t: tok::Theme) -> El {

@@ -355,7 +355,7 @@ mod tests {
         let mut cat = Catalogue::seed();
         cat.absorb(CatalogueRows {
             artists: vec![ArtistRow { id: "x-artist".into(), name: "X".into() }],
-            albums: vec![AlbumRow { id: "x-album".into(), title: "X".into(), artist: "x-artist".into() }],
+            albums: vec![AlbumRow { id: "x-album".into(), title: "X".into(), artist: "x-artist".into(), cover: String::new() }],
             tracks: vec![TrackRow {
                 id: "x-track".into(),
                 title: "X".into(),

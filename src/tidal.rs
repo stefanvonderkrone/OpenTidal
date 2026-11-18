@@ -417,6 +417,7 @@ impl Resource {
                 id,
                 title: self.text("title").unwrap_or_default(),
                 artist: self.first("artists"),
+                cover: String::new(),
             }),
             "tracks" => rows.tracks.push(TrackRow {
                 id,
@@ -430,6 +431,7 @@ impl Resource {
                 name: self.text("name").unwrap_or_default(),
                 description: self.text("description").unwrap_or_default(),
                 tracks: Vec::new(),
+                cover: String::new(),
             }),
             _ => {}
         }

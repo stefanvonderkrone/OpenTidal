@@ -108,6 +108,7 @@ fn signed_in_synced_scene(a: &mut App) {
                 name: "Evening Drive".to_string(),
                 description: "A playlist from Tidal".to_string(),
                 tracks: vec!["seed-track-0".to_string(), "seed-track-1".to_string()],
+                cover: String::new(),
             }],
             ..CatalogueRows::default()
         },

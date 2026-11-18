@@ -477,7 +477,7 @@ mod tests {
     fn fetched_rows() -> CatalogueRows {
         CatalogueRows {
             artists: vec![ArtistRow { id: "x-artist".into(), name: "X".into() }],
-            albums: vec![AlbumRow { id: "x-album".into(), title: "X".into(), artist: "x-artist".into() }],
+            albums: vec![AlbumRow { id: "x-album".into(), title: "X".into(), artist: "x-artist".into(), cover: String::new() }],
             tracks: vec![TrackRow {
                 id: "x-track".into(),
                 title: "X".into(),
@@ -603,7 +603,7 @@ mod tests {
         let mut bigger = Catalogue::seed();
         bigger.absorb(CatalogueRows {
             artists: vec![ArtistRow { id: "x-artist".into(), name: "X".into() }],
-            albums: vec![AlbumRow { id: "x-album".into(), title: "X".into(), artist: "x-artist".into() }],
+            albums: vec![AlbumRow { id: "x-album".into(), title: "X".into(), artist: "x-artist".into(), cover: String::new() }],
             tracks: vec![TrackRow {
                 id: "x-track".into(),
                 title: "X".into(),
@@ -616,6 +616,7 @@ mod tests {
                 name: "X".into(),
                 description: String::new(),
                 tracks: vec!["x-track".into()],
+                cover: String::new(),
             }],
         });
         let track = bigger.track_id("x-track").unwrap();

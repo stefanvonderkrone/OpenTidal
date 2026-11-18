@@ -1781,6 +1781,7 @@ mod tests {
                     name: format!("{name} secret"),
                     description: String::new(),
                     tracks: vec!["seed-track-0".into()],
+                    cover: String::new(),
                 }],
                 ..CatalogueRows::default()
             },

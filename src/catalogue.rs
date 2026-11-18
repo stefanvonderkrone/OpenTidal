@@ -54,6 +54,11 @@ id!(
     /// A catalogue playlist id: a seed playlist or a Tidal playlist.
     CataloguePlaylistId
 );
+id!(
+    /// A Tidal artwork id, from a `coverArt` relationship. The shape rule of
+    /// `mint` makes it a safe file name: ASCII letters, digits and hyphens.
+    ArtworkId
+);
 
 impl CataloguePlaylistId {
     /// Whether the seed holds this playlist. Every other catalogue playlist came
@@ -78,6 +83,8 @@ pub struct Album {
     pub id: AlbumId,
     pub title: String,
     pub artist: ArtistId,
+    /// `None` when Tidal named no cover, or named one with a malformed id.
+    pub cover: Option<ArtworkId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +103,42 @@ pub struct CataloguePlaylist {
     pub name: String,
     pub description: String,
     pub tracks: Vec<TrackId>,
+    /// `None` when Tidal named no cover, or named one with a malformed id.
+    pub cover: Option<ArtworkId>,
+}
+
+/// Whose `coverArt` relationship names a cover. A fetch needs the owner,
+/// because the pinned spec has no third-party read of an artwork by its id.
+#[cfg_attr(not(test), expect(dead_code, reason = "the cover worker reads it from unit 9"))]
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum CoverOwner {
+    Album(AlbumId),
+    Playlist(CataloguePlaylistId),
+}
+
+/// One cover to show: the artwork and the owner whose relationship reads it.
+/// Built only from an `Album` or a `CataloguePlaylist` that has a cover.
+#[cfg_attr(not(test), expect(dead_code, reason = "the cover worker reads it from unit 9"))]
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CoverRequest {
+    pub artwork: ArtworkId,
+    pub owner: CoverOwner,
+}
+
+impl Album {
+    #[cfg_attr(not(test), expect(dead_code, reason = "the cover worker reads it from unit 9"))]
+    pub fn cover_request(&self) -> Option<CoverRequest> {
+        let artwork = self.cover.clone()?;
+        Some(CoverRequest { artwork, owner: CoverOwner::Album(self.id.clone()) })
+    }
+}
+
+impl CataloguePlaylist {
+    #[cfg_attr(not(test), expect(dead_code, reason = "the cover worker reads it from unit 9"))]
+    pub fn cover_request(&self) -> Option<CoverRequest> {
+        let artwork = self.cover.clone()?;
+        Some(CoverRequest { artwork, owner: CoverOwner::Playlist(self.id.clone()) })
+    }
 }
 
 /// Unvalidated rows, the only way into a catalogue. The store produces them, and
@@ -119,6 +162,8 @@ pub struct AlbumRow {
     pub id: String,
     pub title: String,
     pub artist: String,
+    /// The artwork id, or empty for none.
+    pub cover: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +182,8 @@ pub struct PlaylistRow {
     pub name: String,
     pub description: String,
     pub tracks: Vec<String>,
+    /// The artwork id, or empty for none.
+    pub cover: String,
 }
 
 /// The catalogue. Insertion order is display order. `absorb` is the only writer
@@ -167,8 +214,10 @@ impl Catalogue {
     /// Merge rows and return how many it dropped. Artists go first, then albums
     /// whose artist is known, then tracks whose album and artist are known, then
     /// catalogue playlists with their known tracks. A row with a malformed id or
-    /// duration is dropped. A known id updates its fields in place and keeps its
-    /// position. Absorbing the same rows twice changes nothing.
+    /// duration is dropped. A malformed or empty cover never drops a row: it
+    /// keeps the cover the entry already has, or none. A known id updates its
+    /// fields in place and keeps its position. Absorbing the same rows twice
+    /// changes nothing.
     pub fn absorb(&mut self, rows: CatalogueRows) -> usize {
         let mut dropped = 0;
         for row in rows.artists {
@@ -184,7 +233,10 @@ impl Catalogue {
                 dropped += 1;
                 continue;
             };
-            upsert(&mut self.albums, &mut self.album_at, Album { id, title: row.title, artist }, |a| &a.id);
+            let known = self.album(&id).and_then(|a| a.cover.clone());
+            let cover = mint(&row.cover).map(ArtworkId).or(known);
+            let album = Album { id, title: row.title, artist, cover };
+            upsert(&mut self.albums, &mut self.album_at, album, |a| &a.id);
         }
         for row in rows.tracks {
             let (Some(id), Some(artist), Some(album), Some(duration)) = (
@@ -206,8 +258,10 @@ impl Catalogue {
             };
             let tracks: Vec<TrackId> = row.tracks.iter().filter_map(|t| self.track_id(t)).collect();
             dropped += row.tracks.len() - tracks.len();
+            let known = self.playlist(&id).and_then(|p| p.cover.clone());
+            let cover = mint(&row.cover).map(ArtworkId).or(known);
             let playlist =
-                CataloguePlaylist { id, name: row.name, description: row.description, tracks };
+                CataloguePlaylist { id, name: row.name, description: row.description, tracks, cover };
             upsert(&mut self.playlists, &mut self.playlist_at, playlist, |p| &p.id);
         }
         dropped
@@ -300,6 +354,7 @@ impl Catalogue {
                     id: a.id.as_str().into(),
                     title: a.title.clone(),
                     artist: a.artist.as_str().into(),
+                    cover: cover_text(&a.cover),
                 })
                 .collect(),
             tracks: tracks
@@ -319,6 +374,7 @@ impl Catalogue {
                     name: p.name.clone(),
                     description: p.description.clone(),
                     tracks: p.tracks.iter().map(|t| t.as_str().into()).collect(),
+                    cover: cover_text(&p.cover),
                 })
                 .collect(),
         }
@@ -333,6 +389,11 @@ impl Catalogue {
     pub fn tracks_of_artist<'a>(&'a self, id: &'a ArtistId) -> impl Iterator<Item = &'a Track> {
         self.tracks.iter().filter(move |t| &t.artist == id)
     }
+}
+
+/// A cover as row text: the artwork id, or empty for none.
+fn cover_text(cover: &Option<ArtworkId>) -> String {
+    cover.as_ref().map(|c| c.as_str().to_string()).unwrap_or_default()
 }
 
 /// Insert a new entry at the end, or replace a known one where it stands.
@@ -460,7 +521,12 @@ fn seed_rows() -> CatalogueRows {
         albums: SEED_ALBUMS
             .iter()
             .enumerate()
-            .map(|(n, title)| AlbumRow { id: album(n), title: title.to_string(), artist: artist(n) })
+            .map(|(n, title)| AlbumRow {
+                id: album(n),
+                title: title.to_string(),
+                artist: artist(n),
+                cover: String::new(),
+            })
             .collect(),
         tracks: SEED_TRACKS
             .iter()
@@ -481,6 +547,7 @@ fn seed_rows() -> CatalogueRows {
                 name: name.to_string(),
                 description: description.to_string(),
                 tracks: tracks.iter().map(|&t| track(t)).collect(),
+                cover: String::new(),
             })
             .collect(),
     }
@@ -495,7 +562,7 @@ mod tests {
     }
 
     fn album(id: &str, artist: &str) -> AlbumRow {
-        AlbumRow { id: id.into(), title: format!("{id} title"), artist: artist.into() }
+        AlbumRow { id: id.into(), title: format!("{id} title"), artist: artist.into(), cover: String::new() }
     }
 
     fn track(id: &str, album: &str, artist: &str) -> TrackRow {
@@ -541,6 +608,7 @@ mod tests {
                 name: "Private".into(),
                 description: String::new(),
                 tracks: Vec::new(),
+                cover: String::new(),
             }],
             ..Default::default()
         });
@@ -563,6 +631,7 @@ mod tests {
                 name: "E".into(),
                 description: String::new(),
                 tracks: vec!["100".into(), "999".into()],
+                cover: String::new(),
             }],
         });
         assert_eq!(dropped, 4);
@@ -638,6 +707,94 @@ mod tests {
         let mut fresh = Catalogue::default();
         assert_eq!(fresh.absorb(rows), 0);
         assert_eq!(lib.check(&fresh), Ok(()));
+    }
+
+    fn playlist(id: &str, cover: &str) -> PlaylistRow {
+        PlaylistRow {
+            id: id.into(),
+            name: format!("{id} name"),
+            description: String::new(),
+            tracks: vec!["seed-track-0".into()],
+            cover: cover.into(),
+        }
+    }
+
+    fn covered_album(id: &str, cover: &str) -> AlbumRow {
+        AlbumRow { cover: cover.into(), ..album(id, "seed-artist-0") }
+    }
+
+    /// A malformed cover costs the cover, never the album. Each bad id is one a
+    /// file name must not carry, so it must not become an artwork id.
+    #[test]
+    fn a_bad_cover_does_not_hide_its_album() {
+        let mut cat = Catalogue::seed();
+        let long = "9".repeat(MAX_ID_LEN + 1);
+        let bad = ["a/b", "..", "has space", long.as_str()];
+        let rows: Vec<AlbumRow> =
+            bad.iter().enumerate().map(|(n, c)| covered_album(&format!("bad-{n}"), c)).collect();
+        assert_eq!(cat.absorb(CatalogueRows { albums: rows, ..CatalogueRows::default() }), 0);
+        for n in 0..bad.len() {
+            let id = cat.album_id(&format!("bad-{n}")).expect("a bad cover hid its album");
+            assert_eq!(cat.album(&id).unwrap().cover, None);
+        }
+    }
+
+    /// The playlist twin of the album rule.
+    #[test]
+    fn a_bad_cover_does_not_hide_its_playlist() {
+        let mut cat = Catalogue::seed();
+        let dropped =
+            cat.absorb(CatalogueRows { playlists: vec![playlist("p-1", "a/b")], ..CatalogueRows::default() });
+        assert_eq!(dropped, 0);
+        let id = cat.playlist_id("p-1").expect("a bad cover hid its playlist");
+        let p = cat.playlist(&id).unwrap();
+        assert_eq!(p.cover, None);
+        assert_eq!(p.tracks.len(), 1);
+    }
+
+    /// A track page names its album without `coverArt`. That row must not erase
+    /// the cover the saved-albums page gave, and neither must a bad one.
+    #[test]
+    fn a_row_without_a_cover_keeps_the_known_cover() {
+        let mut cat = Catalogue::seed();
+        cat.absorb(CatalogueRows {
+            albums: vec![covered_album("10", "art-1")],
+            playlists: vec![playlist("p-1", "art-2")],
+            ..CatalogueRows::default()
+        });
+        cat.absorb(CatalogueRows {
+            albums: vec![covered_album("10", "")],
+            playlists: vec![playlist("p-1", "a/b")],
+            ..CatalogueRows::default()
+        });
+        let album = cat.album(&cat.album_id("10").unwrap()).unwrap();
+        assert_eq!(album.cover.as_ref().map(ArtworkId::as_str), Some("art-1"));
+        let p = cat.playlist(&cat.playlist_id("p-1").unwrap()).unwrap();
+        assert_eq!(p.cover.as_ref().map(ArtworkId::as_str), Some("art-2"));
+        let request = album.cover_request().unwrap();
+        assert_eq!(request.owner, CoverOwner::Album(album.id.clone()));
+        assert_eq!(p.cover_request().unwrap().owner, CoverOwner::Playlist(p.id.clone()));
+    }
+
+    /// The rows for a library carry the covers, so a write and a load keep them.
+    #[test]
+    fn rows_for_carries_the_cover() {
+        let mut cat = Catalogue::seed();
+        cat.absorb(CatalogueRows {
+            albums: vec![covered_album("10", "art-1")],
+            playlists: vec![playlist("p-1", "art-2")],
+            ..CatalogueRows::default()
+        });
+        let mut lib = Library::default();
+        lib.toggle_save_album(cat.album_id("10").unwrap());
+        lib.tidal_playlists.insert(cat.playlist_id("p-1").unwrap());
+        let rows = cat.rows_for(&lib);
+        let album = rows.albums.iter().find(|a| a.id == "10").unwrap();
+        assert_eq!(album.cover, "art-1");
+        assert_eq!(rows.playlists[0].cover, "art-2");
+        let mut fresh = Catalogue::default();
+        assert_eq!(fresh.absorb(rows), 0);
+        assert_eq!(fresh.album(&fresh.album_id("10").unwrap()).unwrap().cover, cat.album(&cat.album_id("10").unwrap()).unwrap().cover);
     }
 
     /// Tidal sends a duration as ISO 8601. A track whose duration does not parse

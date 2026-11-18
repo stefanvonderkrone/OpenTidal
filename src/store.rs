@@ -654,7 +654,7 @@ fn read_catalogue(conn: &Connection) -> Result<CatalogueRows, StoreError> {
     let mut q = stmt.query([])?;
     while let Some(row) = q.next()? {
         if let (Some(id), Some(title), Some(artist)) = (text(row, 0)?, text(row, 1)?, text(row, 2)?) {
-            rows.albums.push(AlbumRow { id, title, artist });
+            rows.albums.push(AlbumRow { id, title, artist, cover: String::new() });
         }
     }
     let mut stmt =
@@ -672,7 +672,7 @@ fn read_catalogue(conn: &Connection) -> Result<CatalogueRows, StoreError> {
     let mut q = stmt.query([])?;
     while let Some(row) = q.next()? {
         if let (Some(id), Some(name), Some(description)) = (text(row, 0)?, text(row, 1)?, text(row, 2)?) {
-            rows.playlists.push(PlaylistRow { id, name, description, tracks: Vec::new() });
+            rows.playlists.push(PlaylistRow { id, name, description, tracks: Vec::new(), cover: String::new() });
         }
     }
     // A track row that is not text cannot name a track, so it is skipped, and
@@ -1541,6 +1541,7 @@ mod tests {
                 name: "Evening Drive".into(),
                 description: "Remote".into(),
                 tracks: vec!["seed-track-4".into(), "seed-track-2".into()],
+                cover: String::new(),
             }],
             ..CatalogueRows::default()
         });
@@ -1616,7 +1617,7 @@ mod tests {
         let mut fetched = cat();
         fetched.absorb(CatalogueRows {
             artists: vec![ArtistRow { id: "3346".into(), name: "Fetched".into() }],
-            albums: vec![AlbumRow { id: "77610756".into(), title: "Fetched".into(), artist: "3346".into() }],
+            albums: vec![AlbumRow { id: "77610756".into(), title: "Fetched".into(), artist: "3346".into(), cover: String::new() }],
             tracks: vec![TrackRow {
                 id: "77610757".into(),
                 title: "Fetched".into(),

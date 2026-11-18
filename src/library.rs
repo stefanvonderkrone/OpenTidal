@@ -512,7 +512,7 @@ mod tests {
                 album: "x-album".into(),
                 duration: "PT1M".into(),
             }],
-            editorial: Vec::new(),
+            playlists: Vec::new(),
         });
         let track = bigger.track_id("x-track").unwrap();
         let album = bigger.album_id("x-album").unwrap();

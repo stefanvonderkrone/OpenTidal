@@ -6,7 +6,7 @@
 use rune::tok::{self, radius, space, type_};
 use rune::{Color, El, ScrollSpec, TextEdit, col, el, oklch, row, text, text_input};
 use crate::app::App;
-use crate::catalogue::{Album, AlbumId, Artist, ArtistId, Catalogue, EditorialPlaylist, EditorialPlaylistId, Track, TrackId};
+use crate::catalogue::{Album, AlbumId, Artist, ArtistId, Catalogue, CataloguePlaylist, CataloguePlaylistId, Track, TrackId};
 use crate::library::{self, PlaylistId};
 use crate::state::{self, PopularTab, Route, SettingsPage, State};
 
@@ -83,8 +83,8 @@ fn artist_card(pos: usize, a: &Artist, t: tok::Theme) -> El {
         .child(text(&a.name).key("name").font(type_::BODY).color(t.text).center())
 }
 
-fn editorial_card(pos: usize, p: &EditorialPlaylist, t: tok::Theme) -> El {
-    card(&format!("editorial-{pos}"), cover_seed(p.id.as_str()), &p.name, &p.description, Route::EditorialPlaylist(p.id.clone()), t)
+fn seed_playlist_card(pos: usize, p: &CataloguePlaylist, t: tok::Theme) -> El {
+    card(&format!("seed-playlist-{pos}"), cover_seed(p.id.as_str()), &p.name, &p.description, Route::CataloguePlaylist(p.id.clone()), t)
 }
 
 fn playlist_card(id: PlaylistId, name: &str, t: tok::Theme) -> El {
@@ -248,7 +248,7 @@ fn all_artists_grid(cat: &Catalogue, t: tok::Theme) -> El {
 
 pub fn home(cat: &Catalogue, t: tok::Theme) -> El {
     let rec: Vec<El> = cat.albums().take(5).enumerate().map(|(i, a)| album_card(i, a, cat, t)).collect();
-    let edits: Vec<El> = cat.editorials().enumerate().map(|(i, p)| editorial_card(i, p, t)).collect();
+    let edits: Vec<El> = cat.playlists().enumerate().map(|(i, p)| seed_playlist_card(i, p, t)).collect();
     page("Home", "Your music, your way", t,
         col().gap(space::S6)
             .child(shelf("Recommended for you", t, rec))
@@ -790,7 +790,7 @@ pub fn detail(route: &Route, app: &App, accent: Color, t: tok::Theme) -> El {
     match route {
         Route::Album(id) => album_detail(id, s, cat, accent, t),
         Route::Artist(id) => artist_detail(id, s, cat, accent, t),
-        Route::EditorialPlaylist(id) => editorial_detail(id, s, cat, accent, t),
+        Route::CataloguePlaylist(id) => catalogue_playlist_detail(id, s, cat, accent, t),
         Route::UserPlaylist(id) => user_playlist_detail(*id, app, accent, t),
         _ => page("Detail", "", t, el()),
     }
@@ -854,15 +854,15 @@ fn artist_detail(id: &ArtistId, s: &State, cat: &Catalogue, accent: Color, t: to
         .child(detail_body(track_list(tracks, s.now_playing.as_ref(), cat, t)))
 }
 
-fn editorial_detail(id: &EditorialPlaylistId, s: &State, cat: &Catalogue, accent: Color, t: tok::Theme) -> El {
-    let Some(p) = cat.editorial(id) else {
+fn catalogue_playlist_detail(id: &CataloguePlaylistId, s: &State, cat: &Catalogue, accent: Color, t: tok::Theme) -> El {
+    let Some(p) = cat.playlist(id) else {
         return page("Playlist", "This playlist is gone", t, el());
     };
     let tracks: Vec<&Track> = p.tracks.iter().filter_map(|tid| cat.track(tid)).collect();
 
     let play = id.clone();
     let actions = vec![
-        action_button("play", "Play", accent, true, t, play_first(move |cat| cat.editorial(&play).and_then(|p| p.tracks.first().cloned()))),
+        action_button("play", "Play", accent, true, t, play_first(move |cat| cat.playlist(&play).and_then(|p| p.tracks.first().cloned()))),
     ];
 
     col().grow(1.0).min_h(0.0)

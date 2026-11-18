@@ -1,4 +1,4 @@
-//! The catalogue: artists, albums, tracks and editorial playlists, keyed by
+//! The catalogue: artists, albums, tracks and catalogue playlists, keyed by
 //! opaque Tidal string ids. Rune-free.
 //!
 //! Two rules live here and nowhere else.
@@ -51,8 +51,8 @@ id!(
     TrackId
 );
 id!(
-    /// An editorial playlist id.
-    EditorialPlaylistId
+    /// A catalogue playlist id: a seed playlist or a Tidal playlist.
+    CataloguePlaylistId
 );
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,8 +79,8 @@ pub struct Track {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EditorialPlaylist {
-    pub id: EditorialPlaylistId,
+pub struct CataloguePlaylist {
+    pub id: CataloguePlaylistId,
     pub name: String,
     pub description: String,
     pub tracks: Vec<TrackId>,
@@ -93,7 +93,7 @@ pub struct CatalogueRows {
     pub artists: Vec<ArtistRow>,
     pub albums: Vec<AlbumRow>,
     pub tracks: Vec<TrackRow>,
-    pub editorial: Vec<EditorialRow>,
+    pub playlists: Vec<PlaylistRow>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,7 +120,7 @@ pub struct TrackRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EditorialRow {
+pub struct PlaylistRow {
     pub id: String,
     pub name: String,
     pub description: String,
@@ -134,16 +134,16 @@ pub struct Catalogue {
     artists: Vec<Artist>,
     albums: Vec<Album>,
     tracks: Vec<Track>,
-    editorial: Vec<EditorialPlaylist>,
+    playlists: Vec<CataloguePlaylist>,
     artist_at: BTreeMap<ArtistId, usize>,
     album_at: BTreeMap<AlbumId, usize>,
     track_at: BTreeMap<TrackId, usize>,
-    editorial_at: BTreeMap<EditorialPlaylistId, usize>,
+    playlist_at: BTreeMap<CataloguePlaylistId, usize>,
 }
 
 impl Catalogue {
     /// The built-in catalogue: ten artists, ten albums, 21 tracks and three
-    /// editorial playlists, with ids such as `seed-track-0`. The `seed-` prefix
+    /// seed playlists, with ids such as `seed-track-0`. The `seed-` prefix
     /// cannot collide with a numeric Tidal id.
     pub fn seed() -> Catalogue {
         let mut cat = Catalogue::default();
@@ -154,7 +154,7 @@ impl Catalogue {
 
     /// Merge rows and return how many it dropped. Artists go first, then albums
     /// whose artist is known, then tracks whose album and artist are known, then
-    /// editorial playlists with their known tracks. A row with a malformed id or
+    /// catalogue playlists with their known tracks. A row with a malformed id or
     /// duration is dropped. A known id updates its fields in place and keeps its
     /// position. Absorbing the same rows twice changes nothing.
     pub fn absorb(&mut self, rows: CatalogueRows) -> usize {
@@ -187,16 +187,16 @@ impl Catalogue {
             let track = Track { id, title: row.title, artist, album, duration };
             upsert(&mut self.tracks, &mut self.track_at, track, |t| &t.id);
         }
-        for row in rows.editorial {
-            let Some(id) = mint(&row.id).map(EditorialPlaylistId) else {
+        for row in rows.playlists {
+            let Some(id) = mint(&row.id).map(CataloguePlaylistId) else {
                 dropped += 1;
                 continue;
             };
             let tracks: Vec<TrackId> = row.tracks.iter().filter_map(|t| self.track_id(t)).collect();
             dropped += row.tracks.len() - tracks.len();
             let playlist =
-                EditorialPlaylist { id, name: row.name, description: row.description, tracks };
-            upsert(&mut self.editorial, &mut self.editorial_at, playlist, |p| &p.id);
+                CataloguePlaylist { id, name: row.name, description: row.description, tracks };
+            upsert(&mut self.playlists, &mut self.playlist_at, playlist, |p| &p.id);
         }
         dropped
     }
@@ -220,8 +220,8 @@ impl Catalogue {
     pub fn track(&self, id: &TrackId) -> Option<&Track> {
         self.track_at.get(id).map(|&i| &self.tracks[i])
     }
-    pub fn editorial(&self, id: &EditorialPlaylistId) -> Option<&EditorialPlaylist> {
-        self.editorial_at.get(id).map(|&i| &self.editorial[i])
+    pub fn playlist(&self, id: &CataloguePlaylistId) -> Option<&CataloguePlaylist> {
+        self.playlist_at.get(id).map(|&i| &self.playlists[i])
     }
 
     pub fn artists(&self) -> impl Iterator<Item = &Artist> {
@@ -233,8 +233,8 @@ impl Catalogue {
     pub fn tracks(&self) -> impl Iterator<Item = &Track> {
         self.tracks.iter()
     }
-    pub fn editorials(&self) -> impl Iterator<Item = &EditorialPlaylist> {
-        self.editorial.iter()
+    pub fn playlists(&self) -> impl Iterator<Item = &CataloguePlaylist> {
+        self.playlists.iter()
     }
 
     /// The rows for everything a library names, closed over parents: a track
@@ -285,7 +285,7 @@ impl Catalogue {
                     duration: iso_duration(t.duration),
                 })
                 .collect(),
-            editorial: Vec::new(),
+            playlists: Vec::new(),
         }
     }
 
@@ -406,7 +406,7 @@ const SEED_TRACKS: [(&str, usize, &str); 21] = [
 ];
 
 /// Name, description and track positions.
-const SEED_EDITORIAL: [(&str, &str, &[usize]); 3] = [
+const SEED_PLAYLISTS: [(&str, &str, &[usize]); 3] = [
     ("Chill", "Laid-back for slow evenings", &[3, 16, 18, 20]),
     ("Workout", "Heavy and relentless", &[0, 6, 12, 13]),
     ("Focus", "Instrumental and steady", &[1, 8, 15]),
@@ -438,11 +438,11 @@ fn seed_rows() -> CatalogueRows {
                 duration: duration.to_string(),
             })
             .collect(),
-        editorial: SEED_EDITORIAL
+        playlists: SEED_PLAYLISTS
             .iter()
             .enumerate()
-            .map(|(n, &(name, description, tracks))| EditorialRow {
-                id: format!("seed-editorial-{n}"),
+            .map(|(n, &(name, description, tracks))| PlaylistRow {
+                id: format!("seed-playlist-{n}"),
                 name: name.to_string(),
                 description: description.to_string(),
                 tracks: tracks.iter().map(|&t| track(t)).collect(),
@@ -482,13 +482,13 @@ mod tests {
         assert_eq!(cat.artists().count(), 10);
         assert_eq!(cat.albums().count(), 10);
         assert_eq!(cat.tracks().count(), 21);
-        assert_eq!(cat.editorials().count(), 3);
+        assert_eq!(cat.playlists().count(), 3);
         assert_eq!(cat.albums().next().map(|a| a.title.as_str()), Some("Currents"));
         for t in cat.tracks() {
             assert!(cat.album(&t.album).is_some(), "{t:?} names a missing album");
             assert!(cat.artist(&t.artist).is_some(), "{t:?} names a missing artist");
         }
-        for p in cat.editorials() {
+        for p in cat.playlists() {
             assert!(!p.tracks.is_empty());
             assert!(p.tracks.iter().all(|t| cat.track(t).is_some()));
         }
@@ -504,7 +504,7 @@ mod tests {
             artists: vec![artist("1")],
             albums: vec![album("10", "1"), album("11", "2")],
             tracks: vec![track("100", "10", "1"), track("101", "11", "1"), track("102", "10", "2")],
-            editorial: vec![EditorialRow {
+            playlists: vec![PlaylistRow {
                 id: "e".into(),
                 name: "E".into(),
                 description: String::new(),
@@ -516,7 +516,7 @@ mod tests {
         assert!(cat.track_id("101").is_none(), "a track with an unknown album got in");
         assert!(cat.track_id("102").is_none(), "a track with an unknown artist got in");
         assert!(cat.track_id("100").is_some());
-        let e = cat.editorials().find(|p| p.id.as_str() == "e").unwrap();
+        let e = cat.playlists().find(|p| p.id.as_str() == "e").unwrap();
         assert_eq!(e.tracks, vec![cat.track_id("100").unwrap()]);
     }
 
@@ -530,7 +530,7 @@ mod tests {
             artists: vec![artist("seed-artist-1")],
             albums: vec![album("77610756", "seed-artist-1")],
             tracks: vec![track("77610757", "77610756", "seed-artist-1")],
-            editorial: Vec::new(),
+            playlists: Vec::new(),
         });
         assert!(cat.track(&held).is_some(), "absorb forgot an id");
         assert_eq!(cat.tracks().count(), 22);

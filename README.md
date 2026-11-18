@@ -100,7 +100,7 @@ nav-and-library invariant: no route, playlist, history entry or saved item
 references an id that does not exist.
 
 `src/catalogue.rs` is the catalogue: artists, albums and tracks as a graph (a
-track names its album and artist), plus the read-only editorial playlists. Ids
+track names its album and artist), plus the read-only seed playlists. Ids
 are opaque Tidal strings. Only a `Catalogue` mints an id, and only for a member.
 The catalogue starts from a built-in seed and only grows.
 

@@ -1448,7 +1448,7 @@ mod tests {
                 album: "77610756".into(),
                 duration: "PT3M26S".into(),
             }],
-            editorial: Vec::new(),
+            playlists: Vec::new(),
         });
         let mut lib = Library::default();
         lib.toggle_like(fetched.track_id("77610757").unwrap());

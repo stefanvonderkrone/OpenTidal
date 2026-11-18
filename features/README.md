@@ -12,7 +12,7 @@ the catalogue holds. The seed keeps today's order, so `album-0` on Home is
 *Currents*.
 
 - `nav-<name>` names a sidebar section, such as `nav-Playlists` or `nav-Albums`.
-- `album-<pos>`, `artist-<pos>`, and `editorial-<pos>` name a catalogue card on a screen.
+- `album-<pos>`, `artist-<pos>`, and `seed-playlist-<pos>` name a catalogue card on a screen.
 - `playlist-<slot>` names a user playlist card on the Playlists screen.
 - `like` is the heart on the now-playing bar. Its label changes from `Like` to `Unlike`.
 - `save`, `follow`, and `download` are the toggle buttons on a detail hero.

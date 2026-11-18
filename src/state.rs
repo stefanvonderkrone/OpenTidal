@@ -8,7 +8,7 @@
 //! item references an id that does not exist, and that deleting a playlist can
 //! never leave a dangling route behind.
 
-use crate::catalogue::{AlbumId, ArtistId, Catalogue, EditorialPlaylistId, TrackId};
+use crate::catalogue::{AlbumId, ArtistId, Catalogue, CataloguePlaylistId, TrackId};
 use crate::library::{Library, PlaylistId};
 
 /// Number of accent colours. Matches `rune::tok::ACCENT_NAMES.len()`;
@@ -75,7 +75,7 @@ pub enum Route {
     SettingsPage(SettingsPage),
     Album(AlbumId),
     Artist(ArtistId),
-    EditorialPlaylist(EditorialPlaylistId),
+    CataloguePlaylist(CataloguePlaylistId),
     UserPlaylist(PlaylistId),
 }
 
@@ -112,7 +112,7 @@ impl Route {
             Route::SettingsPage(p) => p.label(),
             Route::Album(_) => "Album",
             Route::Artist(_) => "Artist",
-            Route::EditorialPlaylist(_) => "Playlist",
+            Route::CataloguePlaylist(_) => "Playlist",
             Route::UserPlaylist(_) => "Playlist",
         }
     }
@@ -128,7 +128,7 @@ impl Route {
             }
             Route::Album(_)
             | Route::Artist(_)
-            | Route::EditorialPlaylist(_)
+            | Route::CataloguePlaylist(_)
             | Route::UserPlaylist(_) => Group::Library,
         }
     }
@@ -189,7 +189,7 @@ pub fn resolves(s: &State, cat: &Catalogue, route: &Route) -> bool {
     match route {
         Route::Album(id) => cat.album(id).is_some(),
         Route::Artist(id) => cat.artist(id).is_some(),
-        Route::EditorialPlaylist(id) => cat.editorial(id).is_some(),
+        Route::CataloguePlaylist(id) => cat.playlist(id).is_some(),
         Route::UserPlaylist(id) => s.lib.playlist(*id).is_some(),
         _ => true,
     }
@@ -363,7 +363,7 @@ mod tests {
                 album: "x-album".into(),
                 duration: "PT1M".into(),
             }],
-            editorial: Vec::new(),
+            playlists: Vec::new(),
         });
         cat
     }

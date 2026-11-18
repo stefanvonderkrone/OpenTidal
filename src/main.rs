@@ -5,6 +5,7 @@
 mod app;
 mod auth;
 mod catalog;
+mod catalogue;
 mod library;
 mod screens;
 mod state;

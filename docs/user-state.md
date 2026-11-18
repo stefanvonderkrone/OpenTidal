@@ -51,7 +51,7 @@ directory.
 
 ## Schema
 
-`PRAGMA user_version` is 2.
+`PRAGMA user_version` is 3.
 
 ```
 user(id TEXT PRIMARY KEY, name TEXT NOT NULL, updated_at INTEGER NOT NULL)
@@ -94,6 +94,16 @@ collection_playlist(user_id TEXT NOT NULL REFERENCES user, idx INTEGER NOT NULL,
 history(user_id TEXT NOT NULL REFERENCES user, position INTEGER NOT NULL,
         track_id TEXT NOT NULL REFERENCES track,
         PRIMARY KEY (user_id, position))
+
+catalogue_playlist(id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                   description TEXT NOT NULL)
+catalogue_playlist_track(playlist_id TEXT NOT NULL REFERENCES catalogue_playlist,
+                         position INTEGER NOT NULL,
+                         track_id TEXT NOT NULL REFERENCES track,
+                         PRIMARY KEY (playlist_id, position))
+tidal_playlist(user_id TEXT NOT NULL REFERENCES user,
+               playlist_id TEXT NOT NULL REFERENCES catalogue_playlist,
+               PRIMARY KEY (user_id, playlist_id))
 ```
 
 Notes:
@@ -112,6 +122,10 @@ Notes:
   library row cannot reach the disk before its catalogue row.
 - A TEXT column turns an inserted number into text, but a blob stays a blob.
   Load drops a row whose id is not text and counts it, like any other unknown id.
+- `catalogue_playlist` and `catalogue_playlist_track` hold the catalogue
+  playlists the stored libraries name, shared by every account like the other
+  catalogue tables. `tidal_playlist` is the per-account membership. The local
+  slots keep the `playlist` table.
 - `duration` is ISO 8601 text such as `PT3M26S`, the shape Tidal sends.
 - No `is_active` column. The token store decides who is active. A stored
   flag would be a second source of truth and could disagree after a crash.
@@ -129,6 +143,11 @@ keeps its name and loses its placeholder tracks.
 
 A failure at any statement rolls back to an intact version 1, which the next open
 migrates again.
+
+### Migration from version 2
+
+Version 2 holds every row version 3 keeps. The migration adds the three catalogue
+playlist tables in one transaction and changes nothing else.
 
 ## Start
 
@@ -390,6 +409,9 @@ nothing there is a test.
 | A failed page fails the whole fetch | Serve an error as page 2, assert the fetch returns no rows | pending: sync PR |
 | A version 1 file keeps what the user wrote | Migrate a version 1 file, assert the name, playlists and collections stay and every id row is gone | test: `a_version_one_file_keeps_its_playlists_and_drops_its_catalogue_rows` |
 | A migrated file has the fresh schema | Compare `sqlite_master` of a fresh and a migrated file | test: `a_fresh_and_a_migrated_schema_match` |
+| A version 2 file keeps every row | Migrate a version 2 file with a row in every table, assert the whole library loads | test: `a_version_2_file_migrates_to_version_3` |
+| A Tidal playlist survives a restart | Write a library that names a fetched playlist, load into the seed alone, assert the name and tracks | test: `a_tidal_playlist_survives_a_restart` |
+| An unknown Tidal playlist cannot hide a valid one | Plant an unknown membership before a valid one, assert the valid one loads and the drop is counted | test: `an_unknown_tidal_playlist_does_not_hide_a_valid_one` |
 | A failed migration leaves version 1 | A view named `history` fails the last drop, assert version 1 and the `like` rows | test: `a_failed_migration_leaves_version_one` |
 | A non-text id costs only its row | Plant a blob id, assert the drop and the rest of the library | test: `a_non_text_id_is_dropped_not_fatal` |
 | A write keeps the catalogue rows it names | Write a library that names a fetched track, load into the seed alone, assert the track comes back | test: `a_write_stores_the_catalogue_rows_it_names` |

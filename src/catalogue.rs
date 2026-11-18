@@ -210,6 +210,9 @@ impl Catalogue {
     pub fn track_id(&self, raw: &str) -> Option<TrackId> {
         self.track_at.get_key_value(raw).map(|(id, _)| id.clone())
     }
+    pub fn playlist_id(&self, raw: &str) -> Option<CataloguePlaylistId> {
+        self.playlist_at.get_key_value(raw).map(|(id, _)| id.clone())
+    }
 
     pub fn artist(&self, id: &ArtistId) -> Option<&Artist> {
         self.artist_at.get(id).map(|&i| &self.artists[i])
@@ -237,15 +240,19 @@ impl Catalogue {
         self.playlists.iter()
     }
 
-    /// The rows for everything a library names, closed over parents: a track
-    /// brings its album and artist, and an album brings its artist. `Store::write`
-    /// stores these before the library rows that name them.
+    /// The rows for everything a library names, closed over parents: a Tidal
+    /// playlist brings its tracks, a track brings its album and artist, and an
+    /// album brings its artist. `Store::write` stores these before the library
+    /// rows that name them.
     pub fn rows_for(&self, lib: &Library) -> CatalogueRows {
+        let playlists: Vec<&CataloguePlaylist> =
+            lib.tidal_playlists.iter().filter_map(|id| self.playlist(id)).collect();
         let tracks: BTreeSet<&TrackId> = lib
             .liked
             .iter()
             .chain(&lib.history)
             .chain(lib.playlists.iter().flatten().flat_map(|p| &p.tracks))
+            .chain(playlists.iter().flat_map(|p| &p.tracks))
             .collect();
         let tracks: Vec<&Track> = tracks.into_iter().filter_map(|id| self.track(id)).collect();
         let albums: BTreeSet<&AlbumId> = lib
@@ -285,7 +292,15 @@ impl Catalogue {
                     duration: iso_duration(t.duration),
                 })
                 .collect(),
-            playlists: Vec::new(),
+            playlists: playlists
+                .iter()
+                .map(|p| PlaylistRow {
+                    id: p.id.as_str().into(),
+                    name: p.name.clone(),
+                    description: p.description.clone(),
+                    tracks: p.tracks.iter().map(|t| t.as_str().into()).collect(),
+                })
+                .collect(),
         }
     }
 

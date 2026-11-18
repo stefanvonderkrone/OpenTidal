@@ -66,6 +66,23 @@ Each milestone passes the preflight before the next one starts.
    in the app, and similar artists. Compilations and appears-on stay unproven
    until a live check against a real account.
 
+The sync reads six lists, in this order:
+
+- `GET /userCollectionTracks/me/relationships/items?include=items,items.albums,items.artists`
+- `GET /userCollectionAlbums/me/relationships/items?include=items,items.artists`
+- `GET /userCollectionArtists/me/relationships/items?include=items`
+- `GET /userCollectionPlaylists/me/relationships/items?include=items`
+- `GET /playlists?filter[owners.id]=<uid>` for the owned playlists
+- `GET /playlists/<id>/relationships/items?include=items,items.albums,items.artists`
+  for each distinct playlist from the two lists above
+
+Each list follows `links.next` until it is absent. One page budget of 400 pages
+covers the whole fetch. A repeated cursor, an exhausted budget, a failed page, or
+a `next` link that is not a path on the service host fails the whole fetch, so
+the bearer token never leaves the Tidal host and no partial read is applied.
+Whether Tidal honours the nested `include` on the relationship endpoints is not
+checked live. A track whose album or artist is missing is dropped and counted.
+
 Nested folders are dropped. The public API cannot derive them. The folder
 endpoints need `r_usr`, which this app cannot request. The deprecated folder
 view does not carry a parent field in its schema. Local collections stay flat.

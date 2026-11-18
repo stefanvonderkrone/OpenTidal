@@ -410,6 +410,11 @@
     },
     {
       "method": "get",
+      "path": "/playlists",
+      "spec": "playlists"
+    },
+    {
+      "method": "get",
       "path": "/playlists/{id}/relationships/items",
       "spec": "playlists"
     },

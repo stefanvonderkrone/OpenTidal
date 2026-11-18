@@ -230,39 +230,59 @@ answer.
 
 ## Sync
 
-A sync runs on demand, when a library screen opens. Start reads disk only, so
-a launch stays free of network work. The cost of that choice: a user who never
-opens a library screen never syncs, and a broken leaf waits until one does.
+A sync reads the whole Tidal library of the signed-in account, then replaces
+the mirrored memberships in one step. The mirrored memberships are likes,
+saves, follows, and Tidal playlists. A sync never touches downloads, history,
+user playlists, collections, or the name.
 
-How it lands: paint the rows from disk first, then update in place as pages
-arrive. The app must never show a spinner over a list it already has, or the
-sync makes the app slower than the file alone.
+A sync starts from the Sync with Tidal button on the Account screen. In live
+mode it also starts once the profile fetch lands, with the token that fetch
+proved. It never starts while the profile fetch is still pending, so two
+workers can never refresh one refresh token at the same time. Start reads the
+disk only, so a launch stays free of network work until the profile fetch.
 
-A sync is the only thing that creates rows in bulk, and the only thing that
-deletes them. It obeys three rules.
+A sync obeys four rules.
 
-1. Merge, never replace. The collection read is paged. Page 4 of 7 can fail,
-   and a replace has already deleted everything. A merge makes an unread page
-   a no-op.
-2. Delete only after a complete read. The sync carries a `complete` flag, set
-   when the last page arrives. No delete pass runs on a partial read.
-3. Delete only from the tables Tidal owns. Those are `like`, `save`, `follow`,
-   `playlist`, `playlist_track`, `collection`, and `collection_playlist`. The
-   `download` and `history` tables are local, so the sync never deletes a row
-   there.
+1. Fetch everything, then apply once. The read is paged. The fetch returns the
+   rows only after the last page of every list arrives. A failed page, a
+   repeated cursor, or the page cap fails the whole fetch, and nothing changes
+   in memory or on disk. There is no page-by-page merge and no `complete` flag:
+   rows that exist are complete.
+2. Replace, never merge. A complete read is the truth for the four mirrored
+   memberships, so a member Tidal no longer lists is removed.
+3. Write once. The apply changes the library in memory, and the next frame
+   writes it through `Store::write` in one transaction, like any other edit.
+4. Apply only to the account that asked. The result carries the session and the
+   user id it started under. A result for an earlier session, a closed library,
+   or another account is dropped.
 
-Rule 3 removes the need for a size guard. A wrong delete from a mirrored table
-costs one sync, because the server returns the row again. The two tables where
-a wrong delete would lose real work are the two the sync cannot touch.
+A Tidal playlist is a catalogue playlist, not a user playlist. Its name and
+tracks live in the catalogue, and the library holds only its id in
+`tidal_playlists`. No edit operation takes a catalogue playlist id, so a local
+edit cannot reach a Tidal playlist. User playlists keep their slots and stay
+editable. Collections stay flat and local, and they hold user playlists only.
 
-The offline window is the one cost. A broken leaf stays missing until the
+The `download` and `history` tables are local. The sync never writes them, so a
+wrong sync cannot lose real work. A wrong removal from a mirrored membership
+costs one sync, because the server returns the member again.
+
+The cost of a complete fetch: a library larger than the page cap never syncs.
+The cap is 400 pages for the whole fetch. The Account screen says why the sync
+failed, and that nothing changed.
+
+The offline window is the other cost. A broken leaf stays missing until the
 first sync after the network returns. The local copy is as good as the last
 successful read.
 
-The delete pass runs through the state operations, never through the store
-directly. `Route::UserPlaylist` holds a slot, so a playlist that a route names
-can be the target of a delete. `state.rs:272` `delete_playlist` already repairs
-the route. Raw SQL would break the invariant on the bulk path.
+A catalogue playlist that leaves `tidal_playlists` stays in the catalogue for
+the session, because the catalogue never forgets. A route to it still resolves,
+so a sync needs no route repair. The next load does not bring it back, because
+a write stores only the catalogue rows the library names.
+
+The catalogue is shared by every account in one run, and so are the catalogue
+tables on disk. The library names which Tidal playlists an account sees. The
+Home shelf shows seed playlists only, and `forget_session` clears every route
+to a Tidal playlist, so one account never sees another account's playlist names.
 
 ## Load and the invariant
 
@@ -366,8 +386,8 @@ nothing there is a test.
 | Start needs no network | Launch with the network off, name and playlist visible | pending: no test. Start reads the disk first, then fetches the profile |
 | A library screen needs no network | Open Liked Songs offline, assert the disk rows paint | pending: no test |
 | A refresh writes no rows | Count rows before and after a refresh, `user_version` unchanged | pending: no test. A refresh writes the token store only |
-| A partial sync loses nothing | Fail the read after page 2, assert every row is still present | pending: sync PR |
-| A partial sync deletes nothing | Same test, assert the delete pass did not run | pending: sync PR |
+| A failed sync changes nothing | Fail the fetch, assert the library in memory and on disk are unchanged | pending: sync PR |
+| A failed page fails the whole fetch | Serve an error as page 2, assert the fetch returns no rows | pending: sync PR |
 | A version 1 file keeps what the user wrote | Migrate a version 1 file, assert the name, playlists and collections stay and every id row is gone | test: `a_version_one_file_keeps_its_playlists_and_drops_its_catalogue_rows` |
 | A migrated file has the fresh schema | Compare `sqlite_master` of a fresh and a migrated file | test: `a_fresh_and_a_migrated_schema_match` |
 | A failed migration leaves version 1 | A view named `history` fails the last drop, assert version 1 and the `like` rows | test: `a_failed_migration_leaves_version_one` |
@@ -377,7 +397,7 @@ nothing there is a test.
 | A route outside the catalogue cannot open | Open an album id from a larger catalogue, assert the stack is unchanged | test: `opening_an_unknown_album_is_refused` |
 | A track outside the catalogue cannot play | Select a track id from a larger catalogue, assert the state is unchanged | test: `selecting_an_unknown_track_is_refused` |
 | An invalid history row cannot hide a valid entry | Seed an unknown track then two distinct valid ones, assert both load | test: `an_unknown_history_row_does_not_hide_a_valid_one` |
-| The sync never touches local tables | Seed a `download` and a `history` row, sync, assert both remain | pending: sync PR |
+| The sync never touches local data | Seed a download, a history entry, a user playlist and a collection, sync, assert all remain | pending: sync PR |
 
 ## Confirmed live
 

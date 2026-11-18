@@ -20,8 +20,14 @@ catalogue rows the store holds, and no operation removes an entry.
 - **artist.** A performer. An album and a track each name one artist.
 - **album.** A release by one artist. A track names one album.
 - **track.** One song. A track names one album and one artist.
-- **editorial playlist.** A read-only, curated playlist in the catalogue. The
-  user cannot change it.
+- **catalogue playlist.** A read-only playlist in the catalogue, with a name, a
+  description, and ordered tracks. The user cannot change it. In code it is
+  `CataloguePlaylist`, opened through `Route::CataloguePlaylist`. The seed holds
+  three, with ids such as `seed-playlist-0`. Every other one is a Tidal
+  playlist.
+- **Tidal playlist.** A catalogue playlist the account owns or favorites on
+  Tidal. The library holds its id in `tidal_playlists`, and the catalogue holds
+  its content. It is never a user playlist and never takes a slot.
 
 ## Library
 
@@ -34,8 +40,8 @@ the database keeps a row set per account id.
 - **follow.** Follow an artist. Followed artists appear on the Artists screen.
 - **download.** Take an album offline. Downloaded albums appear on the
   Downloads screen. Their tracks appear on the On this device screen.
-- **user playlist.** A playlist the user owns. The user can create, rename,
-  delete, reorder, and add or remove tracks.
+- **user playlist.** A local playlist in a slot. The user can create, rename,
+  delete, reorder, and add or remove tracks. A sync never touches one.
 - **collection.** A folder of user playlists. The user can create, rename,
   delete, and add or remove playlists.
 - **history.** The recently played tracks, most recent first.
@@ -73,8 +79,8 @@ or saved item references an id that does not exist.
 
 ## Tidal
 
-The remote half, behind the `MusicService` port in `src/tidal.rs`. Read-only
-today. The catalogue and library stay local until the later PRs move them.
+The remote half, behind the `MusicService` port in `src/tidal.rs`. Read-only.
+A sync mirrors the library from Tidal. Nothing writes back.
 
 - **service.** The `MusicService` port. The app reaches Tidal only through it.
   The deterministic fake backs every proof. The real client backs
@@ -86,5 +92,10 @@ today. The catalogue and library stay local until the later PRs move them.
   `SignedOut`, `Authorizing`, `SignedIn`, and `Failed`, from `src/auth.rs`.
 - **token.** An OAuth access token and its refresh token. The refresh token
   persists in the token file or the macOS keychain.
+- **sync.** Read the whole Tidal library of the signed-in account, then
+  replace likes, saves, follows, and Tidal playlists in one step. `Library::sync`
+  applies it. A fetch that fails on any page changes nothing.
+- **sync ticket.** The session and user id a sync started under. The result is
+  applied only when both still match the open library.
 - **user id**: Tidal's account id, from the `uid` claim of the access token.
   It is the database key. It does not change on a refresh or a fresh sign-in.

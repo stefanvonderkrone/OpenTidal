@@ -381,6 +381,28 @@ deliberate: the `user_id` column costs nothing now and the door stays open.
 - Settings > Account needs a `remove account data` action. A second person's
   listening history on this machine must be deletable.
 
+### Account isolation of playlist tracks
+
+The catalogue is shared, and `catalogue_playlist_track` keeps one track list per
+Tidal playlist, with no `user_id`. If two accounts follow one playlist id, the
+list holds the tracks of the account that wrote it last. Without a guard,
+account B opens that playlist and sees account A's tracks until B's own page
+lands.
+
+The rule: when an account opens and the file holds a row for another account,
+`Catalogue::forget_playlist_tracks` empties the tracks of every Tidal playlist.
+The ids, names and covers stay. Seed playlists keep their tracks. The switch
+raises the catalogue revision, so the next drain writes the emptied lists of
+this account's playlists to disk. A file with only this account keeps its
+cached tracks, so a restart still shows them first. Reopening the account that
+is already open empties nothing.
+
+The cost: with two accounts in one file, a Tidal playlist shows no cached tracks
+after a restart until its page lands. A `user_id` column on
+`catalogue_playlist_track` would remove that cost, and is not in this branch.
+
+Test: `account_b_never_sees_account_a_playlist_tracks`.
+
 ## Evidence
 
 Each row names its status. `test:` names a real test and `scripts/evidence-status.py`
@@ -475,6 +497,7 @@ names the test that covers the code path, and no hand check has happened.
 | An invalid history row cannot hide a valid entry | Seed an unknown track then two distinct valid ones, assert both load | test: `an_unknown_history_row_does_not_hide_a_valid_one` |
 | A merge never touches local data | Seed a download, a history entry, a user playlist and a collection, merge a partial and a complete page, assert all remain | test: `a_local_like_survives_a_partial_merge_and_only_a_complete_merge_removes_it` |
 | One account never sees another's playlist names | Sync account A, open its playlist, sign out, open account B in this run and the next, assert Home and the stack hold no name of A's | test: `account_b_never_sees_account_a_playlist_names` |
+| One account never sees another's playlist tracks | Two accounts follow one playlist id, A merges tracks, open B with its page held, assert no track of A's in memory or on disk and the seed tracks intact, release, assert only B's tracks | test: `account_b_never_sees_account_a_playlist_tracks` |
 | A page for another account is dropped | Hold a page, open another account in the same session, release, assert nothing landed in memory or on disk | test: `a_page_for_another_account_is_dropped` |
 | A page waits for the profile fetch | Hold the profile fetch, ask for a sync, assert no page, then release and assert one page per mirrored list | test: `a_page_waits_for_the_profile_fetch` |
 | Only a complete pass removes a row | Read page one of two, assert the cached row stays, then read to the end, assert it is gone | test: `only_a_complete_pass_removes_a_row` |

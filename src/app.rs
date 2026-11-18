@@ -266,7 +266,16 @@ impl App {
         };
         // A missing row means a new account, so the in-memory library must not
         // carry the previous account's rows into this one.
-        match store.load(user_id, &mut self.catalogue) {
+        let loaded = store.load(user_id, &mut self.catalogue);
+        // What the file holds, so the drain writes back a list emptied below.
+        let loaded_revision = self.catalogue.revision();
+        // One file serves every account, and a Tidal playlist keeps one track
+        // list for all of them, so with another account in the file this one
+        // could see that account's list. A file read failure counts as shared.
+        if loaded.is_ok() && store.holds_another_account(user_id).unwrap_or(true) {
+            self.catalogue.forget_playlist_tracks();
+        }
+        match loaded {
             Ok(Some(loaded)) => {
                 if loaded.dropped > 0 {
                     eprintln!(
@@ -317,7 +326,7 @@ impl App {
             }
         }
         self.on_disk = self.core.lib.clone();
-        self.on_disk_revision = self.catalogue.revision();
+        self.on_disk_revision = loaded_revision;
         self.library = Some(OpenLibrary {
             user_id: user_id.to_string(),
             store,
@@ -2323,6 +2332,58 @@ mod tests {
 
         assert!(app.core.lib.liked.is_empty(), "account A's page landed in account B's library");
         assert!(on_disk("account-b", &path).liked.is_empty(), "account A's page reached account B's rows");
+    }
+
+    /// Two accounts follow one Tidal playlist. Account B never sees the tracks
+    /// account A merged into it, in memory or on disk, and sees its own once its
+    /// page lands. The seed playlists keep their tracks across the switch.
+    #[test]
+    fn account_b_never_sees_account_a_playlist_tracks() {
+        use crate::catalogue::{CatalogueRows, PlaylistRow};
+        let dir = TempDir::new("cross-account-tracks");
+        let path = dir.path();
+        let shared = |tracks: &[&str]| CatalogueRows {
+            playlists: vec![PlaylistRow {
+                id: "shared".into(),
+                name: "Shared".into(),
+                description: String::new(),
+                tracks: tracks.iter().map(|t| t.to_string()).collect(),
+                cover: String::new(),
+            }],
+            ..CatalogueRows::default()
+        };
+        let mut app = signed_in("account-b", &path, Vec::new());
+        app.catalogue.absorb(shared(&[]));
+        let id = app.catalogue.playlist_id("shared").unwrap();
+        app.core.lib.tidal_playlists.insert(id.clone());
+        assert!(app.flush_library());
+
+        app.open_library("account-a", &path);
+        app.catalogue.absorb(shared(&["seed-track-1", "seed-track-2"]));
+        app.core.lib.tidal_playlists.insert(id.clone());
+        assert!(app.flush_library());
+        assert_eq!(app.catalogue.playlist(&id).unwrap().tracks.to_vec(), tracks(&[1, 2]), "account A merged nothing");
+        let seeds = |cat: &Catalogue| -> Vec<Vec<TrackId>> { cat.seed_playlists().map(|p| p.tracks.to_vec()).collect() };
+        let seeded = seeds(&Catalogue::seed());
+
+        let list = RemoteList::Playlist(id.clone());
+        let (service, release) = Recorded::held(vec![(list.clone(), vec![page(&["seed-track-3"])])]);
+        app.service = Arc::new(service);
+        app.revalidate_on_entry = true;
+        app.open_library("account-b", &path);
+        crate::state::open_detail(&mut app.core, &app.catalogue, crate::state::Route::CataloguePlaylist(id.clone()));
+        app.drain();
+        assert!(app.pages.is_pending(), "the fixture started no page for account B");
+        assert!(app.catalogue.playlist(&id).unwrap().tracks.is_empty(), "account B sees account A's tracks");
+        assert_eq!(seeds(&app.catalogue), seeded, "the switch emptied a seed playlist");
+        let mut stored = Catalogue::seed();
+        Store::open(&path).unwrap().load("account-b", &mut stored).unwrap();
+        assert!(stored.playlist(&id).unwrap().tracks.is_empty(), "account A's tracks stayed on disk");
+
+        release.send(()).unwrap();
+        drain_until(&mut app, |a| !a.pages.is_pending() && a.pass_status(list.clone()) == PassStatus::Complete);
+        assert_eq!(app.catalogue.playlist(&id).unwrap().tracks.to_vec(), tracks(&[3]), "account B's page did not land alone");
+        assert_eq!(seeds(&app.catalogue), seeded, "account B's page emptied a seed playlist");
     }
 
     /// No page starts while the profile fetch is pending. That fetch may

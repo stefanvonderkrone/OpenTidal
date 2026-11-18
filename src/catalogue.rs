@@ -103,7 +103,8 @@ pub struct CataloguePlaylist {
     pub name: String,
     pub description: String,
     /// Written only by `Catalogue::merge_tracks`, so a row with no tracks
-    /// cannot erase the tracks a playlist already has.
+    /// cannot erase the tracks a playlist already has, and emptied only by
+    /// `Catalogue::forget_playlist_tracks` when another account opens.
     pub tracks: Members<TrackId>,
     /// `None` when Tidal named no cover, or named one with a malformed id.
     pub cover: Option<ArtworkId>,
@@ -286,7 +287,24 @@ impl Catalogue {
         Some(confirmed.len() - resolved.len())
     }
 
-    /// Rises each time `absorb` or `merge_tracks` changes an entry, and only
+    /// Empty the tracks of every Tidal playlist, keeping its id, name and
+    /// cover. The store keeps one track list per playlist for every account, so
+    /// an account that opens after another must not show the other's list
+    /// before its own page lands. A seed playlist belongs to no account and
+    /// keeps its tracks.
+    pub fn forget_playlist_tracks(&mut self) {
+        let mut changed = false;
+        for p in self.playlists.iter_mut().filter(|p| !p.id.is_seed() && !p.tracks.is_empty()) {
+            p.tracks = Members::default();
+            changed = true;
+        }
+        if changed {
+            self.revision += 1;
+        }
+    }
+
+    /// Rises each time `absorb`, `merge_tracks` or `forget_playlist_tracks`
+    /// changes an entry, and only
     /// then, so a writer can tell whether the catalogue changed since it last
     /// looked.
     pub fn revision(&self) -> u64 {

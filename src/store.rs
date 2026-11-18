@@ -276,6 +276,12 @@ impl Store {
     /// still appears with the tracks it has. A leaf that comes back on the next
     /// sync is recoverable, so dropping it costs nothing permanent. Only a file
     /// that cannot be read at all is an error.
+    /// Whether the file holds a row for an account other than `user_id`, so
+    /// its catalogue may hold that account's playlist tracks.
+    pub fn holds_another_account(&self, user_id: &str) -> Result<bool, StoreError> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM user WHERE id != ?1)", [user_id], |row| row.get(0))?)
+    }
+
     pub fn load(&self, user_id: &str, cat: &mut Catalogue) -> Result<Option<Loaded>, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         cat.absorb(read_catalogue(&tx)?);

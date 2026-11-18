@@ -15,7 +15,7 @@ use crate::library::{
     PLAYLIST_TRACK_CAP, Playlist, PlaylistId,
 };
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 /// The tables that name no catalogue id. Version 1 created them with this text,
 /// so a migrated file and a fresh one hold the same definitions.
@@ -74,6 +74,13 @@ const CATALOGUE_PLAYLIST_TABLES: &str = "
     CREATE TABLE tidal_playlist(user_id TEXT NOT NULL REFERENCES user,
         playlist_id TEXT NOT NULL REFERENCES catalogue_playlist,
         PRIMARY KEY(user_id, playlist_id));";
+
+/// The cover columns, new in version 4. Every path to version 4 runs this text
+/// after the version 3 tables, a fresh file included, so a fresh and a migrated
+/// file hold the same definitions. An empty cover means none.
+const COVER_COLUMNS: &str = "
+    ALTER TABLE album ADD COLUMN cover TEXT NOT NULL DEFAULT '';
+    ALTER TABLE catalogue_playlist ADD COLUMN cover TEXT NOT NULL DEFAULT '';";
 
 /// The version 1 tables that held an integer catalogue id, in the order the
 /// migration drops them.
@@ -194,6 +201,7 @@ impl Store {
                 tx.execute_batch(USER_TABLES)?;
                 tx.execute_batch(CATALOGUE_ID_TABLES)?;
                 tx.execute_batch(CATALOGUE_PLAYLIST_TABLES)?;
+                tx.execute_batch(COVER_COLUMNS)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 tx.commit()?;
             }
@@ -208,6 +216,7 @@ impl Store {
                 }
                 tx.execute_batch(CATALOGUE_ID_TABLES)?;
                 tx.execute_batch(CATALOGUE_PLAYLIST_TABLES)?;
+                tx.execute_batch(COVER_COLUMNS)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 tx.commit()?;
             }
@@ -217,6 +226,15 @@ impl Store {
             2 => {
                 let tx = conn.transaction()?;
                 tx.execute_batch(CATALOGUE_PLAYLIST_TABLES)?;
+                tx.execute_batch(COVER_COLUMNS)?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                tx.commit()?;
+            }
+            // Version 3 lacks only the cover columns. Every row keeps its cover
+            // empty until the next sync names one.
+            3 => {
+                let tx = conn.transaction()?;
+                tx.execute_batch(COVER_COLUMNS)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 tx.commit()?;
             }
@@ -608,9 +626,10 @@ fn upsert_catalogue(tx: &Connection, rows: &CatalogueRows) -> Result<(), StoreEr
     }
     for a in &rows.albums {
         tx.execute(
-            "INSERT INTO album(id, title, artist_id) VALUES (?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET title = excluded.title, artist_id = excluded.artist_id",
-            params![a.id, a.title, a.artist],
+            "INSERT INTO album(id, title, artist_id, cover) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET title = excluded.title, artist_id = excluded.artist_id,
+                 cover = excluded.cover",
+            params![a.id, a.title, a.artist, a.cover],
         )?;
     }
     for t in &rows.tracks {
@@ -623,9 +642,10 @@ fn upsert_catalogue(tx: &Connection, rows: &CatalogueRows) -> Result<(), StoreEr
     }
     for p in &rows.playlists {
         tx.execute(
-            "INSERT INTO catalogue_playlist(id, name, description) VALUES (?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET name = excluded.name, description = excluded.description",
-            params![p.id, p.name, p.description],
+            "INSERT INTO catalogue_playlist(id, name, description, cover) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, description = excluded.description,
+                 cover = excluded.cover",
+            params![p.id, p.name, p.description, p.cover],
         )?;
         tx.execute("DELETE FROM catalogue_playlist_track WHERE playlist_id = ?1", [&p.id])?;
         for (position, track) in p.tracks.iter().enumerate() {
@@ -640,7 +660,8 @@ fn upsert_catalogue(tx: &Connection, rows: &CatalogueRows) -> Result<(), StoreEr
 
 /// Every stored catalogue row, as unvalidated rows for `Catalogue::absorb`, which
 /// is the one place a row becomes an entry. A row with a non-text column is
-/// skipped here, because it cannot be a row of any kind.
+/// skipped here, because it cannot be a row of any kind. The cover is the
+/// exception: a non-text cover reads as none, so it never costs its row.
 fn read_catalogue(conn: &Connection) -> Result<CatalogueRows, StoreError> {
     let mut rows = CatalogueRows::default();
     let mut stmt = conn.prepare("SELECT id, name FROM artist ORDER BY rowid")?;
@@ -650,11 +671,12 @@ fn read_catalogue(conn: &Connection) -> Result<CatalogueRows, StoreError> {
             rows.artists.push(ArtistRow { id, name });
         }
     }
-    let mut stmt = conn.prepare("SELECT id, title, artist_id FROM album ORDER BY rowid")?;
+    let mut stmt = conn.prepare("SELECT id, title, artist_id, cover FROM album ORDER BY rowid")?;
     let mut q = stmt.query([])?;
     while let Some(row) = q.next()? {
         if let (Some(id), Some(title), Some(artist)) = (text(row, 0)?, text(row, 1)?, text(row, 2)?) {
-            rows.albums.push(AlbumRow { id, title, artist, cover: String::new() });
+            let cover = text(row, 3)?.unwrap_or_default();
+            rows.albums.push(AlbumRow { id, title, artist, cover });
         }
     }
     let mut stmt =
@@ -668,11 +690,12 @@ fn read_catalogue(conn: &Connection) -> Result<CatalogueRows, StoreError> {
         }
     }
     let mut stmt =
-        conn.prepare("SELECT id, name, description FROM catalogue_playlist ORDER BY rowid")?;
+        conn.prepare("SELECT id, name, description, cover FROM catalogue_playlist ORDER BY rowid")?;
     let mut q = stmt.query([])?;
     while let Some(row) = q.next()? {
         if let (Some(id), Some(name), Some(description)) = (text(row, 0)?, text(row, 1)?, text(row, 2)?) {
-            rows.playlists.push(PlaylistRow { id, name, description, tracks: Vec::new(), cover: String::new() });
+            let cover = text(row, 3)?.unwrap_or_default();
+            rows.playlists.push(PlaylistRow { id, name, description, tracks: Vec::new(), cover });
         }
     }
     // A track row that is not text cannot name a track, so it is skipped, and
@@ -1459,6 +1482,8 @@ mod tests {
         assert_eq!(schema(&migrated), schema(&fresh), "a version 1 file migrated to another schema");
         let migrated = Store::configure(version_2_file()).unwrap();
         assert_eq!(schema(&migrated), schema(&fresh), "a version 2 file migrated to another schema");
+        let migrated = Store::configure(version_3_file()).unwrap();
+        assert_eq!(schema(&migrated), schema(&fresh), "a version 3 file migrated to another schema");
     }
 
     /// A version 2 file, as the version 2 build left it: the tables without the
@@ -1491,9 +1516,9 @@ mod tests {
     /// Version 2 already holds every row version 3 keeps. The migration only adds
     /// the catalogue playlist tables, so the whole library loads unchanged.
     #[test]
-    fn a_version_2_file_migrates_to_version_3() {
+    fn a_version_2_file_keeps_every_row() {
         let store = Store::configure(version_2_file()).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
 
         let mut expected = Library::default();
         expected.set_name("Ada".to_string());
@@ -1507,6 +1532,102 @@ mod tests {
         expected.add_to_collection(0, id);
         expected.record_play(seed_track(1));
         assert_eq!(loaded_lib(&store, "u"), Some(expected), "the migration lost a version 2 row");
+    }
+
+    /// A version 3 file, as the version 3 build left it: no cover columns, one
+    /// account with a saved album and a Tidal playlist.
+    fn version_3_file() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(USER_TABLES).unwrap();
+        conn.execute_batch(CATALOGUE_ID_TABLES).unwrap();
+        conn.execute_batch(CATALOGUE_PLAYLIST_TABLES).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        conn.execute_batch(
+            "INSERT INTO user VALUES ('u', 'Ada', 0);
+             INSERT INTO artist VALUES ('seed-artist-0', 'Tame Impala');
+             INSERT INTO album VALUES ('77610756', 'Fetched', 'seed-artist-0');
+             INSERT INTO save VALUES ('u', '77610756');
+             INSERT INTO catalogue_playlist VALUES ('f6b9f0a1', 'Evening Drive', '');
+             INSERT INTO tidal_playlist VALUES ('u', 'f6b9f0a1');",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// A version 3 file gains empty covers and keeps every row it had.
+    #[test]
+    fn a_version_3_file_gains_empty_covers() {
+        let store = Store::configure(version_3_file()).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let mut next_run = cat();
+        let loaded = store.load("u", &mut next_run).unwrap().unwrap();
+        assert_eq!(loaded.dropped, 0);
+        assert_eq!(loaded.lib.saved_albums.len(), 1);
+        assert_eq!(loaded.lib.tidal_playlists.len(), 1);
+        let album = next_run.album(&next_run.album_id("77610756").unwrap()).unwrap();
+        assert_eq!(album.cover, None);
+    }
+
+    /// The library and catalogue with an album and a Tidal playlist that each
+    /// carry a cover.
+    fn covered() -> (Library, Catalogue) {
+        let mut fetched = cat();
+        fetched.absorb(CatalogueRows {
+            albums: vec![AlbumRow {
+                id: "77610756".into(),
+                title: "Fetched".into(),
+                artist: "seed-artist-0".into(),
+                cover: "251380836-large".into(),
+            }],
+            playlists: vec![PlaylistRow {
+                id: "f6b9f0a1".into(),
+                name: "Evening Drive".into(),
+                description: String::new(),
+                tracks: vec!["seed-track-0".into()],
+                cover: "playlist-cover-1".into(),
+            }],
+            ..CatalogueRows::default()
+        });
+        let mut lib = Library::default();
+        lib.toggle_save_album(fetched.album_id("77610756").unwrap());
+        lib.tidal_playlists.insert(fetched.playlist_id("f6b9f0a1").unwrap());
+        (lib, fetched)
+    }
+
+    /// A cover outlives the session that fetched it: a later run whose catalogue
+    /// lacks the album and the playlist reads both covers back from the file.
+    #[test]
+    fn a_cover_survives_a_restart() {
+        let mut store = Store::in_memory().unwrap();
+        let (lib, fetched) = covered();
+        store.write("a", &lib, &fetched).unwrap();
+
+        let mut next_run = cat();
+        store.load("a", &mut next_run).unwrap();
+        let album = next_run.album(&next_run.album_id("77610756").unwrap()).unwrap();
+        let playlist = next_run.playlist(&next_run.playlist_id("f6b9f0a1").unwrap()).unwrap();
+        assert_eq!(album, fetched.album(&fetched.album_id("77610756").unwrap()).unwrap());
+        assert_eq!(playlist, fetched.playlist(&fetched.playlist_id("f6b9f0a1").unwrap()).unwrap());
+        assert_eq!(album.cover.as_ref().map(|c| c.as_str()), Some("251380836-large"));
+        assert_eq!(playlist.cover.as_ref().map(|c| c.as_str()), Some("playlist-cover-1"));
+    }
+
+    /// A damaged cover costs only the cover. A blob or a malformed id leaves the
+    /// album and the playlist whole, and nothing is counted as dropped.
+    #[test]
+    fn a_non_text_cover_keeps_its_album() {
+        let mut store = Store::in_memory().unwrap();
+        let (lib, fetched) = covered();
+        store.write("a", &lib, &fetched).unwrap();
+        plant(&store, "UPDATE album SET cover = X'00' WHERE id = '77610756'");
+        plant(&store, "UPDATE catalogue_playlist SET cover = 'a/b' WHERE id = 'f6b9f0a1'");
+
+        let mut next_run = cat();
+        let loaded = store.load("a", &mut next_run).unwrap().unwrap();
+        assert_eq!(loaded.dropped, 0);
+        assert_eq!(loaded.lib, lib, "a damaged cover hid its album or playlist");
+        assert_eq!(next_run.album(&next_run.album_id("77610756").unwrap()).unwrap().cover, None);
+        assert_eq!(next_run.playlist(&next_run.playlist_id("f6b9f0a1").unwrap()).unwrap().cover, None);
     }
 
     /// A membership that names a playlist the catalogue lacks must not use up a

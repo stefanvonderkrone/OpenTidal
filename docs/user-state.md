@@ -426,7 +426,7 @@ names the test that covers the code path, and no hand check has happened.
 | The token never leaves the host | A `next` link to another host or outside the base, assert it is refused before a fetch | test: `a_next_link_to_another_host_is_refused` |
 | A version 1 file keeps what the user wrote | Migrate a version 1 file, assert the name, playlists and collections stay and every id row is gone | test: `a_version_one_file_keeps_its_playlists_and_drops_its_catalogue_rows` |
 | A migrated file has the fresh schema | Compare `sqlite_master` of a fresh and a migrated file | test: `a_fresh_and_a_migrated_schema_match` |
-| A version 2 file keeps every row | Migrate a version 2 file with a row in every table, assert the whole library loads | test: `a_version_2_file_migrates_to_version_3` |
+| A version 2 file keeps every row | Migrate a version 2 file with a row in every table, assert the whole library loads | test: `a_version_2_file_keeps_every_row` |
 | A Tidal playlist survives a restart | Write a library that names a fetched playlist, load into the seed alone, assert the name and tracks | test: `a_tidal_playlist_survives_a_restart` |
 | An unknown Tidal playlist cannot hide a valid one | Plant an unknown membership before a valid one, assert the valid one loads and the drop is counted | test: `an_unknown_tidal_playlist_does_not_hide_a_valid_one` |
 | A failed migration leaves version 1 | A view named `history` fails the last drop, assert version 1 and the `like` rows | test: `a_failed_migration_leaves_version_one` |

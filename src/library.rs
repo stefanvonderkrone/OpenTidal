@@ -95,7 +95,6 @@ impl Default for Library {
 /// A complete read of one account's Tidal library, as unvalidated text in the
 /// shape Tidal sends. Only a fetch that read every page returns one, so a value
 /// of this type is the proof that the read was complete.
-#[cfg_attr(not(test), expect(dead_code, reason = "App::sync applies it once the worker lands"))]
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct LibraryRows {
     pub catalogue: CatalogueRows,

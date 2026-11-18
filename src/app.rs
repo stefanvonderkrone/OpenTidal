@@ -1074,6 +1074,9 @@ mod tests {
             fn current_user(&self, _token: &str) -> Result<User, ServiceError> {
                 Err(ServiceError::Unauthorized)
             }
+            fn library(&self, _token: &str, _user: &str) -> Result<crate::library::LibraryRows, ServiceError> {
+                Err(ServiceError::Unauthorized)
+            }
         }
         let calls = AtomicUsize::new(0);
         let refresh = |t: &Token| {

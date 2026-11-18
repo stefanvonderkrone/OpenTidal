@@ -411,6 +411,7 @@ nothing there is a test.
 | The fixtures decode into a whole library | Read every fixture, sync, assert the counts, no drop, and the playlist tracks | test: `the_fixtures_decode_into_a_whole_library` |
 | A repeated cursor ends the read | Two pages that name each other, assert the error | test: `a_repeated_cursor_fails_the_fetch` |
 | The page cap ends the read | A source with no last page, assert the error at the cap | test: `the_page_cap_fails_the_fetch` |
+| The real client reads every page with the token | A loopback server serves the fixtures, assert every page and the bearer header | test: `http_library_reads_through_a_loopback_server` |
 | The token never leaves the host | A `next` link to another host or outside the base, assert it is refused before a fetch | test: `a_next_link_to_another_host_is_refused` |
 | A version 1 file keeps what the user wrote | Migrate a version 1 file, assert the name, playlists and collections stay and every id row is gone | test: `a_version_one_file_keeps_its_playlists_and_drops_its_catalogue_rows` |
 | A migrated file has the fresh schema | Compare `sqlite_master` of a fresh and a migrated file | test: `a_fresh_and_a_migrated_schema_match` |

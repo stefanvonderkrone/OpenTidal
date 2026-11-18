@@ -48,16 +48,25 @@ pub enum ServiceError {
 /// ignores it and the real client sends it as a bearer header.
 pub trait MusicService: Send + Sync {
     fn current_user(&self, token: &str) -> Result<User, ServiceError>;
+    /// Read every page of the account's library. A failed page, a repeated
+    /// cursor, or the page cap returns an error and no rows.
+    #[cfg_attr(not(test), expect(dead_code, reason = "App::sync calls it once the worker lands"))]
+    fn library(&self, token: &str, user: &str) -> Result<LibraryRows, ServiceError>;
 }
 
 /// A fixed, deterministic service for tests and headless drives.
 pub struct FakeService {
     pub user: User,
+    /// What a sync reads. The default is an empty library.
+    pub library: Result<LibraryRows, ServiceError>,
 }
 
 impl Default for FakeService {
     fn default() -> Self {
-        FakeService { user: User { id: UserId("fake-user".to_string()), name: "Fake User".to_string() } }
+        FakeService {
+            user: User { id: UserId("fake-user".to_string()), name: "Fake User".to_string() },
+            library: Ok(LibraryRows::default()),
+        }
     }
 }
 
@@ -65,12 +74,17 @@ impl MusicService for FakeService {
     fn current_user(&self, _token: &str) -> Result<User, ServiceError> {
         Ok(self.user.clone())
     }
+    fn library(&self, _token: &str, _user: &str) -> Result<LibraryRows, ServiceError> {
+        self.library.clone()
+    }
 }
 
 /// The real client over the Tidal JSON:API (`https://openapi.tidal.com/v2`).
 pub struct HttpService {
     client: reqwest::blocking::Client,
     base: String,
+    /// The path of `base`, such as `/v2`. A `next` link starts with it.
+    prefix: String,
 }
 
 impl HttpService {
@@ -79,7 +93,11 @@ impl HttpService {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("http client");
-        HttpService { client, base: base.trim_end_matches('/').to_string() }
+        let base = base.trim_end_matches('/').to_string();
+        let prefix = reqwest::Url::parse(&base)
+            .map(|url| url.path().trim_end_matches('/').to_string())
+            .unwrap_or_default();
+        HttpService { client, base, prefix }
     }
 
     fn get_doc(&self, token: &str, path: &str) -> Result<Document, ServiceError> {
@@ -120,6 +138,10 @@ impl MusicService for HttpService {
             Err(_) => "You".to_string(),
         };
         Ok(User { id: UserId(id), name })
+    }
+
+    fn library(&self, token: &str, user: &str) -> Result<LibraryRows, ServiceError> {
+        fetch_library(&mut |path: &str| self.get_doc(token, path), &self.prefix, user)
     }
 }
 
@@ -505,7 +527,6 @@ fn playlist_items(id: &str) -> String {
 /// `get_doc`, and a test passes a map from path to fixture. `prefix` is the
 /// path of the service base, which `next` links start with. The rows exist only
 /// when every page of every list arrived.
-#[cfg_attr(not(test), expect(dead_code, reason = "HttpService::library reads through it once the port has the method"))]
 fn fetch_library(get: &mut PageSource, prefix: &str, user: &str) -> Result<LibraryRows, ServiceError> {
     let mut budget = MAX_PAGES;
     let mut rows = LibraryRows::default();
@@ -740,6 +761,54 @@ mod tests {
             assert!(matches!(result, Err(ServiceError::Decode(_))), "{next} was followed: {result:?}");
             assert_eq!(asked, ["/first"], "{next} was fetched");
         }
+    }
+
+    /// The real client reads every page over HTTP, follows `next` under the
+    /// base path, and sends the bearer token on every request.
+    #[test]
+    fn http_library_reads_through_a_loopback_server() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // One request per connection, closed after the answer, so the server can
+        // read each request whole. Eight pages make the whole fixture library.
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..8 {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let n = conn.read(&mut buf).unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap().to_owned();
+                let bearer = request
+                    .lines()
+                    .any(|l| l.eq_ignore_ascii_case("authorization: Bearer tok"));
+                let relative = path.strip_prefix("/v2").unwrap();
+                let body = std::fs::read_to_string(format!(
+                    "{}/tests/fixtures/tidal/{}",
+                    env!("CARGO_MANIFEST_DIR"),
+                    fixture_path(relative)
+                ))
+                .unwrap();
+                let _ = conn.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.api+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                seen.push((path, bearer));
+            }
+            seen
+        });
+        let svc = HttpService::new(&format!("http://127.0.0.1:{}/v2", addr.port()));
+        let rows = svc.library("tok", "173210380").unwrap();
+        let seen = server.join().unwrap();
+        assert_eq!(rows.liked, ["75413016", "12345678", "98765432"]);
+        assert_eq!(seen.len(), 8);
+        assert!(seen.iter().all(|(_, bearer)| *bearer), "a request went without the token: {seen:?}");
+        assert!(seen[1].0.ends_with("page%5Bcursor%5D=page-2"), "the second page was not requested: {seen:?}");
     }
 
     /// The fake returns its fixed user and never touches the network.

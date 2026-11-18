@@ -550,21 +550,30 @@ fn walk(
     }
 }
 
-/// A `next` link as a path under the service base. Tidal sends it from the host
-/// root, such as `/v2/...` for the base `https://openapi.tidal.com/v2`. A link
-/// that is not a path under the base is refused, so the bearer token never
-/// leaves the service.
+/// A `next` link as a path under the service base. Tidal sends an absolute path
+/// from the host root in one of two shapes: with the base path, such as
+/// `/v2/...` for the base `https://openapi.tidal.com/v2`, or without it, such
+/// as `/userCollectionAlbums/...`, which the live service sends. The base path
+/// is stripped only when it is there. Anything that is not an absolute path,
+/// such as a full URL or a `//host` link, is refused. `get_doc` joins every
+/// path to the base, so the bearer token never leaves the service.
 fn under_base(prefix: &str, next: &str) -> Result<String, ServiceError> {
-    next.strip_prefix(prefix)
-        .filter(|rest| rest.starts_with('/') && !rest.starts_with("//"))
-        .map(str::to_owned)
-        .ok_or_else(|| ServiceError::Decode(format!("a next link leaves the service: {next}")))
+    let path = match next.strip_prefix(prefix) {
+        Some(rest) if rest.starts_with('/') => rest,
+        _ => next,
+    };
+    if path.starts_with('/') && !path.starts_with("//") {
+        Ok(path.to_owned())
+    } else {
+        Err(ServiceError::Decode(format!("a next link leaves the service: {next}")))
+    }
 }
 
-const LIKED: &str = "/userCollectionTracks/me/relationships/items?include=items,items.albums,items.artists";
-const SAVED: &str = "/userCollectionAlbums/me/relationships/items?include=items,items.artists";
+const LIKED: &str =
+    "/userCollectionTracks/me/relationships/items?include=items,items.albums,items.artists,items.albums.coverArt";
+const SAVED: &str = "/userCollectionAlbums/me/relationships/items?include=items,items.artists,items.coverArt";
 const FOLLOWED: &str = "/userCollectionArtists/me/relationships/items?include=items";
-const FAVORITED: &str = "/userCollectionPlaylists/me/relationships/items?include=items";
+const FAVORITED: &str = "/userCollectionPlaylists/me/relationships/items?include=items,items.coverArt";
 
 /// The account's playlists, by owner. The brackets are percent-encoded, the
 /// way Tidal writes them in its own links.
@@ -573,7 +582,7 @@ fn owned(user: &str) -> String {
 }
 
 fn playlist_items(id: &str) -> String {
-    format!("/playlists/{id}/relationships/items?include=items,items.albums,items.artists")
+    format!("/playlists/{id}/relationships/items?include=items,items.albums,items.artists,items.albums.coverArt")
 }
 
 /// The whole library read, over any page source. `HttpService` passes its
@@ -721,7 +730,7 @@ mod tests {
     /// The fixture for each path the read asks for. A path with no fixture
     /// panics, so a read that asks for something unexpected names it.
     fn fixture_path(path: &str) -> &'static str {
-        let liked_2 = format!("{LIKED}&page%5Bcursor%5D=page-2");
+        let liked_2 = "/userCollectionTracks/me/relationships/items?include=items,items.albums,items.artists&page%5Bcursor%5D=page-2";
         match path {
             p if p == LIKED => "liked-tracks-page-1.json",
             p if p == liked_2 => "liked-tracks-page-2.json",
@@ -857,7 +866,7 @@ mod tests {
     /// so the bearer token never goes to another host.
     #[test]
     fn a_next_link_to_another_host_is_refused() {
-        for next in ["https://evil.example/v2/x", "//evil.example/v2/x", "/v2//evil.example/x", "/x"] {
+        for next in ["https://evil.example/v2/x", "//evil.example/v2/x", "/v2//evil.example/x", "x", "v2/x"] {
             let mut asked = Vec::new();
             let mut budget = MAX_PAGES;
             let result = walk(
@@ -873,6 +882,28 @@ mod tests {
             assert!(matches!(result, Err(ServiceError::Decode(_))), "{next} was followed: {result:?}");
             assert_eq!(asked, ["/first"], "{next} was fetched");
         }
+    }
+
+    /// The live service sends `next` from the host root without the base path.
+    /// The walk follows it as a path under the base.
+    #[test]
+    fn a_next_link_without_the_base_path_is_followed() {
+        let next = "/userCollectionAlbums/me/relationships/items?include=items&page%5Bcursor%5D=2";
+        let mut asked = Vec::new();
+        let mut budget = MAX_PAGES;
+        let result = walk(
+            &mut budget,
+            "/v2",
+            &mut |path: &str| {
+                asked.push(path.to_owned());
+                let body = if path == "/first" { format!(r#"{{"links":{{"next":"{next}"}}}}"#) } else { "{}".into() };
+                Ok(serde_json::from_str(&body).unwrap())
+            },
+            "/first",
+            &mut |_| {},
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(asked, ["/first", next]);
     }
 
     /// The real client reads every page over HTTP, follows `next` under the
@@ -921,6 +952,14 @@ mod tests {
         assert_eq!(seen.len(), 8);
         assert!(seen.iter().all(|(_, bearer)| *bearer), "a request went without the token: {seen:?}");
         assert!(seen[1].0.ends_with("page%5Bcursor%5D=page-2"), "the second page was not requested: {seen:?}");
+        let includes = |collection: &str| -> Vec<String> {
+            let path = &seen.iter().find(|(p, _)| p.starts_with(&format!("/v2/{collection}/"))).unwrap().0;
+            let query = path.split_once("include=").unwrap().1;
+            query.split('&').next().unwrap().split(',').map(str::to_owned).collect()
+        };
+        assert!(includes("userCollectionTracks").contains(&"items.albums.coverArt".into()), "{seen:?}");
+        assert!(includes("userCollectionAlbums").contains(&"items.coverArt".into()), "{seen:?}");
+        assert!(includes("userCollectionPlaylists").contains(&"items.coverArt".into()), "{seen:?}");
     }
 
     /// A cover request for an album or playlist of the fixtures.

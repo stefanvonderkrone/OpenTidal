@@ -1499,9 +1499,11 @@ mod tests {
         drop(seeded);
 
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute(
-            "UPDATE \"like\" SET track_id = 999 WHERE track_id = 1 AND user_id = '173210380'",
-            [],
+        // Foreign keys off, because the damage stands for a catalogue row that a
+        // later build no longer resolves, which no write can produce.
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             UPDATE \"like\" SET track_id = '999' WHERE track_id = '1' AND user_id = '173210380';",
         )
         .unwrap();
         drop(conn);

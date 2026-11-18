@@ -13,7 +13,54 @@ use crate::library::{
     PLAYLIST_TRACK_CAP, Playlist, PlaylistId,
 };
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
+
+/// The tables that name no catalogue id. Version 1 created them with this text,
+/// so a migrated file and a fresh one hold the same definitions.
+const USER_TABLES: &str = "
+    CREATE TABLE user(id TEXT PRIMARY KEY, name TEXT NOT NULL,
+        updated_at INTEGER NOT NULL);
+    CREATE TABLE playlist(slot INTEGER NOT NULL,
+        user_id TEXT NOT NULL REFERENCES user, name TEXT NOT NULL,
+        PRIMARY KEY(user_id, slot));
+    CREATE TABLE collection(idx INTEGER NOT NULL,
+        user_id TEXT NOT NULL REFERENCES user, name TEXT NOT NULL,
+        PRIMARY KEY(user_id, idx));
+    CREATE TABLE collection_playlist(user_id TEXT NOT NULL REFERENCES user,
+        idx INTEGER NOT NULL, position INTEGER NOT NULL,
+        playlist_slot INTEGER NOT NULL, PRIMARY KEY(user_id, idx, position),
+        FOREIGN KEY(user_id, idx) REFERENCES collection(user_id, idx));";
+
+/// The catalogue rows and the six library tables that name them. A fresh file and
+/// the migration from version 1 both run this text, so the two cannot drift. The
+/// foreign keys mean a library row cannot reach the disk before the catalogue row
+/// it names. A duration is ISO 8601 text, the shape Tidal sends.
+const CATALOGUE_ID_TABLES: &str = "
+    CREATE TABLE artist(id TEXT PRIMARY KEY, name TEXT NOT NULL);
+    CREATE TABLE album(id TEXT PRIMARY KEY, title TEXT NOT NULL,
+        artist_id TEXT NOT NULL REFERENCES artist);
+    CREATE TABLE track(id TEXT PRIMARY KEY, title TEXT NOT NULL,
+        artist_id TEXT NOT NULL REFERENCES artist,
+        album_id TEXT NOT NULL REFERENCES album, duration TEXT NOT NULL);
+    CREATE TABLE \"like\"(user_id TEXT NOT NULL REFERENCES user,
+        track_id TEXT NOT NULL REFERENCES track, PRIMARY KEY(user_id, track_id));
+    CREATE TABLE save(user_id TEXT NOT NULL REFERENCES user,
+        album_id TEXT NOT NULL REFERENCES album, PRIMARY KEY(user_id, album_id));
+    CREATE TABLE follow(user_id TEXT NOT NULL REFERENCES user,
+        artist_id TEXT NOT NULL REFERENCES artist, PRIMARY KEY(user_id, artist_id));
+    CREATE TABLE download(user_id TEXT NOT NULL REFERENCES user,
+        album_id TEXT NOT NULL REFERENCES album, PRIMARY KEY(user_id, album_id));
+    CREATE TABLE playlist_track(user_id TEXT NOT NULL REFERENCES user,
+        slot INTEGER NOT NULL, position INTEGER NOT NULL,
+        track_id TEXT NOT NULL REFERENCES track, PRIMARY KEY(user_id, slot, position),
+        FOREIGN KEY(user_id, slot) REFERENCES playlist(user_id, slot));
+    CREATE TABLE history(user_id TEXT NOT NULL REFERENCES user,
+        position INTEGER NOT NULL, track_id TEXT NOT NULL REFERENCES track,
+        PRIMARY KEY(user_id, position));";
+
+/// The version 1 tables that held an integer catalogue id, in the order the
+/// migration drops them.
+const V1_ID_TABLES: [&str; 6] = ["like", "save", "follow", "download", "playlist_track", "history"];
 
 /// A database that stores libraries by user id.
 pub struct Store {
@@ -127,35 +174,21 @@ impl Store {
         match version {
             0 => {
                 let tx = conn.transaction()?;
-                tx.execute_batch(
-                    "CREATE TABLE user(id TEXT PRIMARY KEY, name TEXT NOT NULL,
-                        updated_at INTEGER NOT NULL);
-                    CREATE TABLE \"like\"(user_id TEXT NOT NULL REFERENCES user,
-                        track_id INTEGER NOT NULL, PRIMARY KEY(user_id, track_id));
-                    CREATE TABLE save(user_id TEXT NOT NULL REFERENCES user,
-                        album_id INTEGER NOT NULL, PRIMARY KEY(user_id, album_id));
-                    CREATE TABLE follow(user_id TEXT NOT NULL REFERENCES user,
-                        artist_id INTEGER NOT NULL, PRIMARY KEY(user_id, artist_id));
-                    CREATE TABLE download(user_id TEXT NOT NULL REFERENCES user,
-                        album_id INTEGER NOT NULL, PRIMARY KEY(user_id, album_id));
-                    CREATE TABLE playlist(slot INTEGER NOT NULL,
-                        user_id TEXT NOT NULL REFERENCES user, name TEXT NOT NULL,
-                        PRIMARY KEY(user_id, slot));
-                    CREATE TABLE playlist_track(user_id TEXT NOT NULL REFERENCES user,
-                        slot INTEGER NOT NULL, position INTEGER NOT NULL,
-                        track_id INTEGER NOT NULL, PRIMARY KEY(user_id, slot, position),
-                        FOREIGN KEY(user_id, slot) REFERENCES playlist(user_id, slot));
-                    CREATE TABLE collection(idx INTEGER NOT NULL,
-                        user_id TEXT NOT NULL REFERENCES user, name TEXT NOT NULL,
-                        PRIMARY KEY(user_id, idx));
-                    CREATE TABLE collection_playlist(user_id TEXT NOT NULL REFERENCES user,
-                        idx INTEGER NOT NULL, position INTEGER NOT NULL,
-                        playlist_slot INTEGER NOT NULL, PRIMARY KEY(user_id, idx, position),
-                        FOREIGN KEY(user_id, idx) REFERENCES collection(user_id, idx));
-                    CREATE TABLE history(user_id TEXT NOT NULL REFERENCES user,
-                        position INTEGER NOT NULL, track_id INTEGER NOT NULL,
-                        PRIMARY KEY(user_id, position));",
-                )?;
+                tx.execute_batch(USER_TABLES)?;
+                tx.execute_batch(CATALOGUE_ID_TABLES)?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                tx.commit()?;
+            }
+            // Version 1 stored placeholder integer ids that name no Tidal item, so
+            // its id rows are dropped, not mapped. Names, slots and collections hold
+            // no catalogue id and survive. One transaction, so a failure at any
+            // statement leaves an intact version 1 that the next open migrates again.
+            1 => {
+                let tx = conn.transaction()?;
+                for table in V1_ID_TABLES {
+                    tx.execute_batch(&format!("DROP TABLE \"{table}\";"))?;
+                }
+                tx.execute_batch(CATALOGUE_ID_TABLES)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 tx.commit()?;
             }
@@ -239,11 +272,12 @@ impl Store {
                     dropped += 1;
                     continue;
                 }
-                let Ok(track) = index(row.get(1)?, catalog::TRACKS.len()) else {
+                let Some(track) = text(row, 1)?.and_then(|raw| position(&raw, catalog::TRACKS.len()))
+                else {
                     dropped += 1;
                     continue;
                 };
-                let track = TrackId(track as u8);
+                let track = TrackId(track);
                 if playlist.tracks.contains(&track) {
                     dropped += 1;
                     continue;
@@ -326,11 +360,12 @@ impl Store {
                     past_the_cap += 1;
                     continue;
                 }
-                let Ok(track) = index(row.get(0)?, catalog::TRACKS.len()) else {
+                let Some(track) = text(row, 0)?.and_then(|raw| position(&raw, catalog::TRACKS.len()))
+                else {
                     dropped += 1;
                     continue;
                 };
-                let track = TrackId(track as u8);
+                let track = TrackId(track);
                 if lib.history.contains(&track) {
                     dropped += 1;
                     continue;
@@ -357,6 +392,7 @@ impl Store {
              ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at",
             params![user_id, lib.name],
         )?;
+        upsert_catalogue(&tx)?;
         for table in [
             "playlist_track",
             "collection_playlist",
@@ -384,7 +420,7 @@ impl Store {
             ))?;
             for id in 0..u32::BITS {
                 if bits & (1 << id) != 0 {
-                    stmt.execute(params![user_id, id])?;
+                    stmt.execute(params![user_id, id.to_string()])?;
                 }
             }
         }
@@ -396,7 +432,7 @@ impl Store {
             )?;
             for (position, track) in playlist.tracks.iter().enumerate() {
                 tx.execute("INSERT INTO playlist_track(user_id, slot, position, track_id) VALUES (?1, ?2, ?3, ?4)",
-                    params![user_id, slot as i64, position as i64, track.0])?;
+                    params![user_id, slot as i64, position as i64, track.0.to_string()])?;
             }
         }
         for (idx, collection) in lib.collections.iter().enumerate() {
@@ -412,7 +448,7 @@ impl Store {
         for (position, track) in lib.history.iter().enumerate() {
             tx.execute(
                 "INSERT INTO history(user_id, position, track_id) VALUES (?1, ?2, ?3)",
-                params![user_id, position as i64, track.0],
+                params![user_id, position as i64, track.0.to_string()],
             )?;
         }
         tx.commit()?;
@@ -516,12 +552,46 @@ pub(crate) fn is_app_directory(dir: &Path) -> bool {
     dir.ends_with(&suffix)
 }
 
-/// A catalogue index, rejected when it names nothing the catalogue ships.
+/// A slot index, rejected when it falls outside the fixed array.
 fn index(value: i64, len: usize) -> Result<usize, ()> {
     if value < 0 || value as u64 >= len as u64 {
         return Err(());
     }
     Ok(value as usize)
+}
+
+/// Store every catalogue row, so each library row's foreign key finds its target.
+fn upsert_catalogue(tx: &Connection) -> Result<(), StoreError> {
+    for a in catalog::ARTISTS {
+        tx.execute(
+            "INSERT INTO artist(id, name) VALUES (?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name",
+            params![a.id.0.to_string(), a.name],
+        )?;
+    }
+    for a in catalog::ALBUMS {
+        tx.execute(
+            "INSERT INTO album(id, title, artist_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET title = excluded.title, artist_id = excluded.artist_id",
+            params![a.id.0.to_string(), a.title, a.artist.0.to_string()],
+        )?;
+    }
+    for t in catalog::TRACKS {
+        let (minutes, seconds) = t.duration.split_once(':').unwrap_or(("0", "0"));
+        tx.execute(
+            "INSERT INTO track(id, title, artist_id, album_id, duration) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET title = excluded.title, artist_id = excluded.artist_id,
+                 album_id = excluded.album_id, duration = excluded.duration",
+            params![
+                t.id.0.to_string(),
+                t.title,
+                t.artist.0.to_string(),
+                t.album.0.to_string(),
+                format!("PT{minutes}M{seconds}S"),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// How many rows a table holds beyond a cap, which load keeps the first of.
@@ -553,12 +623,28 @@ fn load_bits(
     let mut rows = stmt.query([user_id])?;
     let mut bits = 0;
     while let Some(row) = rows.next()? {
-        match index(row.get(0)?, len) {
-            Ok(id) => bits |= 1 << id,
-            Err(()) => *dropped += 1,
+        match text(row, 0)?.and_then(|raw| position(&raw, len)) {
+            Some(id) => bits |= 1 << id,
+            None => *dropped += 1,
         }
     }
     Ok(bits)
+}
+
+/// A catalogue id column as text, or `None` for a value of another type. A TEXT
+/// column turns an inserted number into text, but a blob stays a blob, and a blob
+/// is a damaged row to drop, not a file that cannot be read.
+fn text(row: &rusqlite::Row, column: usize) -> Result<Option<String>, StoreError> {
+    Ok(match row.get_ref(column)? {
+        rusqlite::types::ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok().map(str::to_owned),
+        _ => None,
+    })
+}
+
+/// A placeholder catalogue position stored as text, rejected when it names
+/// nothing the catalogue ships.
+fn position(raw: &str, len: usize) -> Option<u8> {
+    raw.parse::<u8>().ok().filter(|&i| usize::from(i) < len)
 }
 
 #[cfg(test)]
@@ -666,6 +752,15 @@ mod tests {
         }
     }
 
+    /// Run raw SQL with the foreign keys off, so a test can plant the damaged row a
+    /// write can never produce.
+    fn plant(store: &Store, sql: &str) {
+        store
+            .conn
+            .execute_batch(&format!("PRAGMA foreign_keys = OFF; {sql}; PRAGMA foreign_keys = ON;"))
+            .unwrap();
+    }
+
     /// The library from a load that dropped nothing, which is every load the
     /// round-trip tests expect.
     fn loaded_lib(store: &Store, user_id: &str) -> Option<Library> {
@@ -762,12 +857,11 @@ mod tests {
         ).unwrap();
         // Row 0 names nothing the catalogue has, so it is dropped after the limit; rows
         // 1 and 2 are distinct and valid, and both must survive.
-        for (position, track) in [(0i64, 9_999i64), (1, 0), (2, 1)] {
-            store.conn.execute(
-                "INSERT INTO history(user_id, position, track_id) VALUES ('u', ?1, ?2)",
-                params![position, track],
-            ).unwrap();
-        }
+        plant(
+            &store,
+            "INSERT INTO history(user_id, position, track_id)
+             VALUES ('u', 0, '9999'), ('u', 1, '0'), ('u', 2, '1')",
+        );
         let loaded = store.load("u").unwrap().unwrap();
         assert_eq!(
             loaded.lib.history,
@@ -933,10 +1027,7 @@ mod tests {
         lib.toggle_like(TrackId(0));
         lib.toggle_like(TrackId(1));
         store.write("a", &lib).unwrap();
-        store
-            .conn
-            .execute("INSERT INTO \"like\" VALUES ('a', 999)", [])
-            .unwrap();
+        plant(&store, "INSERT INTO \"like\" VALUES ('a', '999')");
 
         let loaded = store.load("a").unwrap().unwrap();
         assert_eq!(loaded.dropped, 1);
@@ -954,10 +1045,7 @@ mod tests {
         lib.add_track(id, TrackId(0));
         lib.add_track(id, TrackId(1));
         store.write("a", &lib).unwrap();
-        store
-            .conn
-            .execute("UPDATE playlist_track SET track_id = 999 WHERE position = 1", [])
-            .unwrap();
+        plant(&store, "UPDATE playlist_track SET track_id = '999' WHERE position = 1");
 
         let loaded = store.load("a").unwrap().unwrap();
         assert_eq!(loaded.dropped, 1);
@@ -1032,10 +1120,7 @@ mod tests {
     fn a_duplicate_history_entry_is_dropped() {
         let mut store = Store::in_memory().unwrap();
         store.write("a", &Library::default()).unwrap();
-        store
-            .conn
-            .execute_batch("INSERT INTO history VALUES ('a', 0, 0), ('a', 1, 0);")
-            .unwrap();
+        plant(&store, "INSERT INTO history VALUES ('a', 0, '0'), ('a', 1, '0')");
 
         let loaded = store.load("a").unwrap().unwrap();
         assert_eq!(loaded.dropped, 1);
@@ -1074,13 +1159,7 @@ mod tests {
         ] {
             let mut store = Store::in_memory().unwrap();
             store.write("a", &populated("Ada", 0)).unwrap();
-            store
-                .conn
-                .execute(
-                    &format!("UPDATE \"{table}\" SET {column} = -1 WHERE user_id = 'a'"),
-                    [],
-                )
-                .unwrap();
+            plant(&store, &format!("UPDATE \"{table}\" SET {column} = 'unknown' WHERE user_id = 'a'"));
             let loaded = store.load("a").unwrap().unwrap();
             assert!(loaded.dropped > 0, "{table} accepted an unknown id");
             assert_eq!(loaded.lib.check(), Ok(()), "{table} broke the invariant");
@@ -1157,6 +1236,157 @@ mod tests {
             Store::configure(store.conn),
             Err(StoreError::Sql(_))
         ));
+    }
+
+    /// The schema the version 1 build created, frozen here so the migration tests
+    /// start from the file a user has on disk.
+    const V1_SCHEMA: &str = "
+        CREATE TABLE user(id TEXT PRIMARY KEY, name TEXT NOT NULL,
+            updated_at INTEGER NOT NULL);
+        CREATE TABLE \"like\"(user_id TEXT NOT NULL REFERENCES user,
+            track_id INTEGER NOT NULL, PRIMARY KEY(user_id, track_id));
+        CREATE TABLE save(user_id TEXT NOT NULL REFERENCES user,
+            album_id INTEGER NOT NULL, PRIMARY KEY(user_id, album_id));
+        CREATE TABLE follow(user_id TEXT NOT NULL REFERENCES user,
+            artist_id INTEGER NOT NULL, PRIMARY KEY(user_id, artist_id));
+        CREATE TABLE download(user_id TEXT NOT NULL REFERENCES user,
+            album_id INTEGER NOT NULL, PRIMARY KEY(user_id, album_id));
+        CREATE TABLE playlist(slot INTEGER NOT NULL,
+            user_id TEXT NOT NULL REFERENCES user, name TEXT NOT NULL,
+            PRIMARY KEY(user_id, slot));
+        CREATE TABLE playlist_track(user_id TEXT NOT NULL REFERENCES user,
+            slot INTEGER NOT NULL, position INTEGER NOT NULL,
+            track_id INTEGER NOT NULL, PRIMARY KEY(user_id, slot, position),
+            FOREIGN KEY(user_id, slot) REFERENCES playlist(user_id, slot));
+        CREATE TABLE collection(idx INTEGER NOT NULL,
+            user_id TEXT NOT NULL REFERENCES user, name TEXT NOT NULL,
+            PRIMARY KEY(user_id, idx));
+        CREATE TABLE collection_playlist(user_id TEXT NOT NULL REFERENCES user,
+            idx INTEGER NOT NULL, position INTEGER NOT NULL,
+            playlist_slot INTEGER NOT NULL, PRIMARY KEY(user_id, idx, position),
+            FOREIGN KEY(user_id, idx) REFERENCES collection(user_id, idx));
+        CREATE TABLE history(user_id TEXT NOT NULL REFERENCES user,
+            position INTEGER NOT NULL, track_id INTEGER NOT NULL,
+            PRIMARY KEY(user_id, position));
+        PRAGMA user_version = 1;";
+
+    /// One account's version 1 rows: a name, a playlist with a track, a collection
+    /// that holds it, and one row in each id table.
+    const V1_ROWS: &str = "
+        INSERT INTO user VALUES ('u', 'Ada', 0);
+        INSERT INTO playlist VALUES (0, 'u', 'Road trip');
+        INSERT INTO playlist_track VALUES ('u', 0, 0, 3);
+        INSERT INTO collection VALUES (0, 'u', 'Trips');
+        INSERT INTO collection_playlist VALUES ('u', 0, 0, 0);
+        INSERT INTO \"like\" VALUES ('u', 3);
+        INSERT INTO save VALUES ('u', 1);
+        INSERT INTO follow VALUES ('u', 1);
+        INSERT INTO download VALUES ('u', 1);
+        INSERT INTO history VALUES ('u', 0, 3);";
+
+    /// Version 1 ids name placeholder content, so the migration drops every row
+    /// that holds one. What the user wrote stays: the name, the playlist with its
+    /// slot, and the collection that holds it.
+    #[test]
+    fn a_version_one_file_keeps_its_playlists_and_drops_its_catalogue_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(V1_SCHEMA).unwrap();
+        conn.execute_batch(V1_ROWS).unwrap();
+        let store = Store::configure(conn).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+
+        let loaded = store.load("u").unwrap().unwrap();
+        assert_eq!(loaded.dropped, 0, "the migration left a row that load had to drop");
+        assert_eq!(loaded.lib.name, "Ada");
+        let playlist = loaded.lib.playlist(PlaylistId(0)).expect("the playlist was lost");
+        assert_eq!(playlist.name, "Road trip");
+        assert!(playlist.tracks.is_empty(), "a placeholder track survived");
+        assert_eq!(loaded.lib.collections[0].name, "Trips");
+        assert_eq!(loaded.lib.collections[0].playlists, vec![PlaylistId(0)]);
+        assert_eq!(loaded.lib.liked, 0);
+        assert_eq!(loaded.lib.saved_albums, 0);
+        assert_eq!(loaded.lib.followed, 0);
+        assert_eq!(loaded.lib.downloaded, 0);
+        assert!(loaded.lib.history.is_empty());
+    }
+
+    /// Every table, column and key a fresh file has, a migrated file has too, so
+    /// no code path can depend on how the file came to be.
+    #[test]
+    fn a_fresh_and_a_migrated_schema_match() {
+        fn schema(store: &Store) -> Vec<(String, String, Option<String>)> {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+                .unwrap();
+            stmt.query_map([], |row| {
+                let sql: Option<String> = row.get(2)?;
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    sql.map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ")),
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+        }
+        let fresh = Store::in_memory().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(V1_SCHEMA).unwrap();
+        conn.execute_batch(V1_ROWS).unwrap();
+        let migrated = Store::configure(conn).unwrap();
+        assert_eq!(schema(&migrated), schema(&fresh));
+    }
+
+    /// A migration that fails partway leaves the version 1 file whole, so the next
+    /// open can migrate it again. A view named `history` makes the last drop fail
+    /// after the `like` table is already gone inside the transaction.
+    #[test]
+    fn a_failed_migration_leaves_version_one() {
+        let dir = TempDirGuard(std::env::temp_dir().join(format!(
+            "opentidal-migrate-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("lib.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V1_SCHEMA).unwrap();
+            conn.execute_batch(V1_ROWS).unwrap();
+            conn.execute_batch(
+                "DROP TABLE history;
+                 CREATE VIEW history AS SELECT user_id, position, track_id FROM playlist_track;",
+            )
+            .unwrap();
+        }
+
+        assert!(Store::open(&path).is_err(), "the migration passed over a view it cannot drop");
+
+        let conn = Connection::open(&path).unwrap();
+        let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, 1, "a failed migration moved the version");
+        let likes: i64 = conn
+            .query_row("SELECT count(*) FROM \"like\"", [], |row| row.get(0))
+            .expect("the like table was dropped outside the transaction");
+        assert_eq!(likes, 1, "a failed migration lost the version 1 rows");
+    }
+
+    /// A TEXT column turns a number into text, but a blob stays a blob. A blob id
+    /// costs only its own row, never the whole library.
+    #[test]
+    fn a_non_text_id_is_dropped_not_fatal() {
+        let mut store = Store::in_memory().unwrap();
+        let mut lib = Library::default();
+        lib.toggle_like(TrackId(0));
+        lib.toggle_like(TrackId(1));
+        store.write("a", &lib).unwrap();
+        plant(&store, "INSERT INTO \"like\" VALUES ('a', X'00')");
+
+        let loaded = store.load("a").unwrap().unwrap();
+        assert_eq!(loaded.dropped, 1);
+        assert_eq!(loaded.lib, lib, "the text likes did not survive");
     }
 
     /// A restart reads back what the previous run wrote: a second connection to

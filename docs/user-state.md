@@ -51,22 +51,36 @@ directory.
 
 ## Schema
 
+`PRAGMA user_version` is 2.
+
 ```
 user(id TEXT PRIMARY KEY, name TEXT NOT NULL, updated_at INTEGER NOT NULL)
 
-like(user_id TEXT NOT NULL REFERENCES user, track_id INTEGER NOT NULL,
+artist(id TEXT PRIMARY KEY, name TEXT NOT NULL)
+album(id TEXT PRIMARY KEY, title TEXT NOT NULL,
+      artist_id TEXT NOT NULL REFERENCES artist)
+track(id TEXT PRIMARY KEY, title TEXT NOT NULL,
+      artist_id TEXT NOT NULL REFERENCES artist,
+      album_id TEXT NOT NULL REFERENCES album, duration TEXT NOT NULL)
+
+like(user_id TEXT NOT NULL REFERENCES user,
+     track_id TEXT NOT NULL REFERENCES track,
      PRIMARY KEY (user_id, track_id))
-save(user_id TEXT NOT NULL REFERENCES user, album_id INTEGER NOT NULL,
+save(user_id TEXT NOT NULL REFERENCES user,
+     album_id TEXT NOT NULL REFERENCES album,
      PRIMARY KEY (user_id, album_id))
-follow(user_id TEXT NOT NULL REFERENCES user, artist_id INTEGER NOT NULL,
-     PRIMARY KEY (user_id, artist_id))
-download(user_id TEXT NOT NULL REFERENCES user, album_id INTEGER NOT NULL,
-     PRIMARY KEY (user_id, album_id))
+follow(user_id TEXT NOT NULL REFERENCES user,
+       artist_id TEXT NOT NULL REFERENCES artist,
+       PRIMARY KEY (user_id, artist_id))
+download(user_id TEXT NOT NULL REFERENCES user,
+         album_id TEXT NOT NULL REFERENCES album,
+         PRIMARY KEY (user_id, album_id))
 
 playlist(slot INTEGER NOT NULL, user_id TEXT NOT NULL REFERENCES user,
          name TEXT NOT NULL, PRIMARY KEY (user_id, slot))
 playlist_track(user_id TEXT NOT NULL REFERENCES user, slot INTEGER NOT NULL,
-               position INTEGER NOT NULL, track_id INTEGER NOT NULL,
+               position INTEGER NOT NULL,
+               track_id TEXT NOT NULL REFERENCES track,
                PRIMARY KEY (user_id, slot, position),
                FOREIGN KEY (user_id, slot) REFERENCES playlist(user_id, slot))
 
@@ -78,13 +92,13 @@ collection_playlist(user_id TEXT NOT NULL REFERENCES user, idx INTEGER NOT NULL,
                     FOREIGN KEY (user_id, idx) REFERENCES collection(user_id, idx))
 
 history(user_id TEXT NOT NULL REFERENCES user, position INTEGER NOT NULL,
-        track_id INTEGER NOT NULL,
+        track_id TEXT NOT NULL REFERENCES track,
         PRIMARY KEY (user_id, position))
 ```
 
 Notes:
 
-- Every table hangs off `user.id`. No table assumes one user.
+- Every library table hangs off `user.id`. No table assumes one user.
 - Playlist slots and collection indices are local to a user. A global slot
   key would prevent two users from each storing slot zero. Child keys include
   `user_id` for the same reason.
@@ -92,11 +106,29 @@ Notes:
   Slots persist as stored. Timestamp columns arrive with the Tidal sync.
 - `history` orders by `position`, never by rowid. A rowid can be reused after
   a delete, and history order is user-visible.
-- `track_id`, `album_id`, `artist_id` hold integer catalogue indices. The
-  catalogue ships with the app and never changes, so the schema cannot carry
-  a foreign key to it. `Library::check` validates these ids on load.
+- `track_id`, `album_id` and `artist_id` hold opaque Tidal ids as text. The
+  `artist`, `album` and `track` tables hold the catalogue rows that the stored
+  libraries name, and they are shared by every account. A foreign key means a
+  library row cannot reach the disk before its catalogue row.
+- A TEXT column turns an inserted number into text, but a blob stays a blob.
+  Load drops a row whose id is not text and counts it, like any other unknown id.
+- `duration` is ISO 8601 text such as `PT3M26S`, the shape Tidal sends.
 - No `is_active` column. The token store decides who is active. A stored
   flag would be a second source of truth and could disagree after a crash.
+
+### Migration from version 1
+
+Version 1 stored integer positions into a catalogue that shipped with the app.
+Those positions name placeholder content, not Tidal items, so no mapping exists.
+The migration runs in one transaction. It drops `like`, `save`, `follow`,
+`download`, `playlist_track` and `history`, and then creates the catalogue tables
+and the six library tables from the same text a fresh file uses. `user`,
+`playlist`, `collection` and `collection_playlist` hold no catalogue id, so the
+name, the playlists in their slots, and the collections survive. A playlist
+keeps its name and loses its placeholder tracks.
+
+A failure at any statement rolls back to an intact version 1, which the next open
+migrates again.
 
 ## Start
 
@@ -244,7 +276,7 @@ The rules:
 2. On load, restore each playlist to its exact slot. Restore collections in
    `idx` order and their playlist references in `position` order.
 3. Do not derive `Serialize` on `Library`. Map rows into a fresh `Library`
-   field by field. Validate catalogue indices before a bit shift or cast.
+   field by field. Validate every catalogue id before it enters the library.
 4. Run `Library::check` on the loaded value, and assert it in a debug build. A
    row that would fail the check is dropped at the boundary, before it enters
    the library, so the loaded value always satisfies the invariant.
@@ -334,6 +366,10 @@ nothing there is a test.
 | A refresh writes no rows | Count rows before and after a refresh, `user_version` unchanged | pending: no test. A refresh writes the token store only |
 | A partial sync loses nothing | Fail the read after page 2, assert every row is still present | pending: sync PR |
 | A partial sync deletes nothing | Same test, assert the delete pass did not run | pending: sync PR |
+| A version 1 file keeps what the user wrote | Migrate a version 1 file, assert the name, playlists and collections stay and every id row is gone | test: `a_version_one_file_keeps_its_playlists_and_drops_its_catalogue_rows` |
+| A migrated file has the fresh schema | Compare `sqlite_master` of a fresh and a migrated file | test: `a_fresh_and_a_migrated_schema_match` |
+| A failed migration leaves version 1 | A view named `history` fails the last drop, assert version 1 and the `like` rows | test: `a_failed_migration_leaves_version_one` |
+| A non-text id costs only its row | Plant a blob id, assert the drop and the rest of the library | test: `a_non_text_id_is_dropped_not_fatal` |
 | An invalid history row cannot hide a valid entry | Seed an unknown track then two distinct valid ones, assert both load | test: `an_unknown_history_row_does_not_hide_a_valid_one` |
 | The sync never touches local tables | Seed a `download` and a `history` row, sync, assert both remain | pending: sync PR |
 

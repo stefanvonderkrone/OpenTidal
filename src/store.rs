@@ -12,10 +12,10 @@ use std::collections::BTreeSet;
 use crate::catalogue::{AlbumRow, ArtistRow, Catalogue, CatalogueRows, PlaylistRow, TrackRow};
 use crate::library::{
     COLLECTION_PLAYLIST_CAP, Collection, HISTORY_CAP, Library, MAX_COLLECTIONS, MAX_PLAYLISTS,
-    PLAYLIST_TRACK_CAP, Playlist, PlaylistId,
+    Members, PLAYLIST_TRACK_CAP, Playlist, PlaylistId,
 };
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 /// The tables that name no catalogue id. Version 1 created them with this text,
 /// so a migrated file and a fresh one hold the same definitions.
@@ -81,6 +81,15 @@ const CATALOGUE_PLAYLIST_TABLES: &str = "
 const COVER_COLUMNS: &str = "
     ALTER TABLE album ADD COLUMN cover TEXT NOT NULL DEFAULT '';
     ALTER TABLE catalogue_playlist ADD COLUMN cover TEXT NOT NULL DEFAULT '';";
+
+/// The member positions, new in version 5, in Tidal's order. Every path to
+/// version 5 runs this text after the cover columns, a fresh file included. A
+/// migrated row keeps position 0, so it loads in id order until the next write.
+const MEMBER_POSITIONS: &str = "
+    ALTER TABLE \"like\" ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE save ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE follow ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE tidal_playlist ADD COLUMN position INTEGER NOT NULL DEFAULT 0;";
 
 /// The version 1 tables that held an integer catalogue id, in the order the
 /// migration drops them.
@@ -202,6 +211,7 @@ impl Store {
                 tx.execute_batch(CATALOGUE_ID_TABLES)?;
                 tx.execute_batch(CATALOGUE_PLAYLIST_TABLES)?;
                 tx.execute_batch(COVER_COLUMNS)?;
+                tx.execute_batch(MEMBER_POSITIONS)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 tx.commit()?;
             }
@@ -217,6 +227,7 @@ impl Store {
                 tx.execute_batch(CATALOGUE_ID_TABLES)?;
                 tx.execute_batch(CATALOGUE_PLAYLIST_TABLES)?;
                 tx.execute_batch(COVER_COLUMNS)?;
+                tx.execute_batch(MEMBER_POSITIONS)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 tx.commit()?;
             }
@@ -227,6 +238,7 @@ impl Store {
                 let tx = conn.transaction()?;
                 tx.execute_batch(CATALOGUE_PLAYLIST_TABLES)?;
                 tx.execute_batch(COVER_COLUMNS)?;
+                tx.execute_batch(MEMBER_POSITIONS)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 tx.commit()?;
             }
@@ -235,6 +247,14 @@ impl Store {
             3 => {
                 let tx = conn.transaction()?;
                 tx.execute_batch(COVER_COLUMNS)?;
+                tx.execute_batch(MEMBER_POSITIONS)?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                tx.commit()?;
+            }
+            // Version 4 lacks only the member positions.
+            4 => {
+                let tx = conn.transaction()?;
+                tx.execute_batch(MEMBER_POSITIONS)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 tx.commit()?;
             }
@@ -273,10 +293,10 @@ impl Store {
         let mut collection_idx: Vec<usize> = Vec::new();
         let mut lib = Library {
             name,
-            liked: load_set(&tx, user_id, "like", "track_id", |raw| cat.track_id(raw), &mut dropped)?,
-            saved_albums: load_set(&tx, user_id, "save", "album_id", |raw| cat.album_id(raw), &mut dropped)?,
-            followed: load_set(&tx, user_id, "follow", "artist_id", |raw| cat.artist_id(raw), &mut dropped)?,
-            tidal_playlists: load_set(
+            liked: load_members(&tx, user_id, "like", "track_id", |raw| cat.track_id(raw), &mut dropped)?,
+            saved_albums: load_members(&tx, user_id, "save", "album_id", |raw| cat.album_id(raw), &mut dropped)?,
+            followed: load_members(&tx, user_id, "follow", "artist_id", |raw| cat.artist_id(raw), &mut dropped)?,
+            tidal_playlists: load_members(
                 &tx,
                 user_id,
                 "tidal_playlist",
@@ -469,13 +489,18 @@ impl Store {
             ("save", "album_id", lib.saved_albums.iter().map(|id| id.as_str()).collect()),
             ("follow", "artist_id", lib.followed.iter().map(|id| id.as_str()).collect()),
             ("tidal_playlist", "playlist_id", lib.tidal_playlists.iter().map(|id| id.as_str()).collect()),
-            ("download", "album_id", lib.downloaded.iter().map(|id| id.as_str()).collect()),
         ] {
             let mut stmt = tx.prepare(&format!(
-                "INSERT INTO \"{table}\"(user_id, {column}) VALUES (?1, ?2)"
+                "INSERT INTO \"{table}\"(user_id, {column}, position) VALUES (?1, ?2, ?3)"
             ))?;
-            for id in ids {
-                stmt.execute(params![user_id, id])?;
+            for (position, id) in ids.into_iter().enumerate() {
+                stmt.execute(params![user_id, id, position as i64])?;
+            }
+        }
+        {
+            let mut stmt = tx.prepare("INSERT INTO download(user_id, album_id) VALUES (?1, ?2)")?;
+            for id in &lib.downloaded {
+                stmt.execute(params![user_id, id.as_str()])?;
             }
         }
         for (slot, playlist) in lib.playlists.iter().enumerate() {
@@ -755,6 +780,33 @@ fn load_set<T: Ord>(
     Ok(set)
 }
 
+/// One account's catalogue ids from one table, by position, then by id. The id
+/// breaks a tie because `VACUUM` can renumber a rowid. A row the catalogue
+/// cannot resolve is dropped and counted.
+fn load_members<T: Ord + Clone>(
+    conn: &Connection,
+    user_id: &str,
+    table: &str,
+    column: &str,
+    resolve: impl Fn(&str) -> Option<T>,
+    dropped: &mut usize,
+) -> Result<Members<T>, StoreError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {column} FROM \"{table}\" WHERE user_id = ?1 ORDER BY position, {column}"
+    ))?;
+    let mut rows = stmt.query([user_id])?;
+    let mut members = Members::default();
+    while let Some(row) = rows.next()? {
+        match text(row, 0)?.and_then(|raw| resolve(&raw)) {
+            Some(id) => {
+                members.insert(id);
+            }
+            None => *dropped += 1,
+        }
+    }
+    Ok(members)
+}
+
 /// A catalogue id column as text, or `None` for a value of another type. A TEXT
 /// column turns an inserted number into text, but a blob stays a blob, and a blob
 /// is a damaged row to drop, not a file that cannot be read.
@@ -769,6 +821,7 @@ fn text(row: &rusqlite::Row, column: usize) -> Result<Option<String>, StoreError
 mod tests {
     use super::*;
     use crate::catalogue::{AlbumId, ArtistId, CataloguePlaylistId, TrackId};
+    use crate::library::Reach;
 
     /// The seed catalogue. Ids compare by text, so ids minted by two seeds are
     /// equal, and every test can take a fresh one.
@@ -1172,7 +1225,7 @@ mod tests {
         lib.toggle_like(seed_track(0));
         lib.toggle_like(seed_track(1));
         store.write("a", &lib, &cat()).unwrap();
-        plant(&store, "INSERT INTO \"like\" VALUES ('a', '999')");
+        plant(&store, "INSERT INTO \"like\"(user_id, track_id) VALUES ('a', '999')");
 
         let loaded = store.load("a", &mut cat()).unwrap().unwrap();
         assert_eq!(loaded.dropped, 1);
@@ -1484,6 +1537,77 @@ mod tests {
         assert_eq!(schema(&migrated), schema(&fresh), "a version 2 file migrated to another schema");
         let migrated = Store::configure(version_3_file()).unwrap();
         assert_eq!(schema(&migrated), schema(&fresh), "a version 3 file migrated to another schema");
+        let migrated = Store::configure(version_4_file()).unwrap();
+        assert_eq!(schema(&migrated), schema(&fresh), "a version 4 file migrated to another schema");
+    }
+
+    /// A version 4 file, as the version 4 build left it: no member positions, and
+    /// one account with several rows in every membership table.
+    fn version_4_file() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(USER_TABLES).unwrap();
+        conn.execute_batch(CATALOGUE_ID_TABLES).unwrap();
+        conn.execute_batch(CATALOGUE_PLAYLIST_TABLES).unwrap();
+        conn.execute_batch(COVER_COLUMNS).unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        conn.execute_batch(
+            "INSERT INTO user VALUES ('u', 'Ada', 0);
+             INSERT INTO artist VALUES ('seed-artist-0', 'Tame Impala'), ('seed-artist-1', 'Frank Ocean');
+             INSERT INTO album VALUES ('seed-album-0', 'Currents', 'seed-artist-0', ''),
+                 ('seed-album-1', 'Blonde', 'seed-artist-1', '');
+             INSERT INTO track VALUES ('seed-track-2', 'Eventually', 'seed-artist-0', 'seed-album-0', 'PT5M19S'),
+                 ('seed-track-0', 'Let It Happen', 'seed-artist-0', 'seed-album-0', 'PT7M46S'),
+                 ('seed-track-1', 'The Less I Know the Better', 'seed-artist-0', 'seed-album-0', 'PT3M38S');
+             INSERT INTO catalogue_playlist VALUES ('f6b9f0a1', 'Evening Drive', '', ''),
+                 ('a0c1', 'Morning', '', '');
+             INSERT INTO catalogue_playlist_track VALUES ('f6b9f0a1', 0, 'seed-track-1'),
+                 ('f6b9f0a1', 1, 'seed-track-0');
+             INSERT INTO \"like\" VALUES ('u', 'seed-track-2'), ('u', 'seed-track-0'), ('u', 'seed-track-1');
+             INSERT INTO save VALUES ('u', 'seed-album-1'), ('u', 'seed-album-0');
+             INSERT INTO follow VALUES ('u', 'seed-artist-1'), ('u', 'seed-artist-0');
+             INSERT INTO tidal_playlist VALUES ('u', 'f6b9f0a1'), ('u', 'a0c1');
+             INSERT INTO download VALUES ('u', 'seed-album-0');",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// A version 4 file stored no order, so every membership survives and loads
+    /// in id order, and a playlist keeps its stored track order.
+    #[test]
+    fn a_version_4_file_keeps_every_membership() {
+        let store = Store::configure(version_4_file()).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let mut next_run = cat();
+        let loaded = store.load("u", &mut next_run).unwrap().unwrap();
+        assert_eq!(loaded.dropped, 0, "the migration left a row that load had to drop");
+        let lib = loaded.lib;
+        assert_eq!(lib.liked.to_vec(), vec![seed_track(0), seed_track(1), seed_track(2)]);
+        assert_eq!(lib.saved_albums.to_vec(), vec![seed_album(0), seed_album(1)]);
+        assert_eq!(lib.followed.to_vec(), vec![seed_artist(0), seed_artist(1)]);
+        let playlists: Vec<&str> = lib.tidal_playlists.iter().map(|p| p.as_str()).collect();
+        assert_eq!(playlists, ["a0c1", "f6b9f0a1"]);
+        assert!(lib.is_downloaded(&seed_album(0)));
+        let evening = next_run.playlist(&next_run.playlist_id("f6b9f0a1").unwrap()).unwrap();
+        assert_eq!(evening.tracks.to_vec(), vec![seed_track(1), seed_track(0)]);
+    }
+
+    /// Tidal's order is the order a screen shows, so it must survive a write and
+    /// a load. The ids are listed out of id order, so a load by id would fail.
+    #[test]
+    fn remote_order_survives_a_restart() {
+        let mut store = Store::in_memory().unwrap();
+        let mut lib = Library::default();
+        lib.liked.merge(&[seed_track(9), seed_track(2), seed_track(5)], Reach::Complete);
+        lib.saved_albums.merge(&[seed_album(7), seed_album(1)], Reach::Complete);
+        lib.followed.merge(&[seed_artist(4), seed_artist(0)], Reach::Complete);
+        lib.tidal_playlists.merge(&[seed_playlist(2), seed_playlist(0)], Reach::Complete);
+        store.write("a", &lib, &cat()).unwrap();
+        let loaded = loaded_lib(&store, "a").unwrap();
+        assert_eq!(loaded.liked.to_vec(), vec![seed_track(9), seed_track(2), seed_track(5)]);
+        assert_eq!(loaded.saved_albums.to_vec(), vec![seed_album(7), seed_album(1)]);
+        assert_eq!(loaded.followed.to_vec(), vec![seed_artist(4), seed_artist(0)]);
+        assert_eq!(loaded.tidal_playlists.to_vec(), vec![seed_playlist(2), seed_playlist(0)]);
     }
 
     /// A version 2 file, as the version 2 build left it: the tables without the
@@ -1645,7 +1769,7 @@ mod tests {
         assert_eq!(loaded.dropped, 1, "the unknown playlist was not counted");
         assert_eq!(
             loaded.lib.tidal_playlists,
-            BTreeSet::from([seed_playlist(1)]),
+            Members::from_ordered([seed_playlist(1)]),
             "an unknown playlist hid a valid one"
         );
     }
@@ -1676,7 +1800,7 @@ mod tests {
         store.load("a", &mut next_run).unwrap();
         let playlist = next_run.playlist(&next_run.playlist_id("f6b9f0a1").unwrap()).unwrap();
         assert_eq!(playlist.name, "Evening Drive");
-        assert_eq!(playlist.tracks, vec![seed_track(4), seed_track(2)], "the tracks or their order were lost");
+        assert_eq!(playlist.tracks.to_vec(), vec![seed_track(4), seed_track(2)], "the tracks or their order were lost");
     }
 
     /// A migration that fails partway leaves the version 1 file whole, so the next
@@ -1722,7 +1846,7 @@ mod tests {
         lib.toggle_like(seed_track(0));
         lib.toggle_like(seed_track(1));
         store.write("a", &lib, &cat()).unwrap();
-        plant(&store, "INSERT INTO \"like\" VALUES ('a', X'00')");
+        plant(&store, "INSERT INTO \"like\"(user_id, track_id) VALUES ('a', X'00')");
 
         let loaded = store.load("a", &mut cat()).unwrap().unwrap();
         assert_eq!(loaded.dropped, 1);

@@ -54,17 +54,126 @@ pub struct Collection {
     pub playlists: Vec<PlaylistId>,
 }
 
-/// The single local user's data. The sets are `BTreeSet`, not `HashSet`, because
-/// a `BTreeSet` is `Hash`, so `Library` and `State` stay hashable for the proof.
+/// An ordered, duplicate-free list of ids, in Tidal's order. The fields are
+/// private, so no caller can insert a duplicate. `index` holds the same ids as
+/// `order`, so `contains` stays logarithmic for a screen that asks per row.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct Members<T> {
+    order: Vec<T>,
+    index: BTreeSet<T>,
+}
+
+impl<T> Default for Members<T> {
+    fn default() -> Self {
+        Members { order: Vec::new(), index: BTreeSet::new() }
+    }
+}
+
+impl<T> std::ops::Deref for Members<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.order
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Members<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.order.iter()
+    }
+}
+
+/// Whether a confirmed list is the whole remote list or only its first pages.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reach {
+    Partial,
+    Complete,
+}
+
+impl<T: Ord + Clone> Members<T> {
+    /// Keeps the first occurrence of each id.
+    pub fn from_ordered(ids: impl IntoIterator<Item = T>) -> Self {
+        let mut members = Members::default();
+        for id in ids {
+            members.insert(id);
+        }
+        members
+    }
+
+    pub fn contains(&self, id: &T) -> bool {
+        self.index.contains(id)
+    }
+
+    /// Append an id that is not yet a member. Returns whether it was added.
+    pub fn insert(&mut self, id: T) -> bool {
+        if !self.index.insert(id.clone()) {
+            return false;
+        }
+        self.order.push(id);
+        true
+    }
+
+    /// Returns whether the id was a member.
+    pub fn remove(&mut self, id: &T) -> bool {
+        if !self.index.remove(id) {
+            return false;
+        }
+        self.order.retain(|x| x != id);
+        true
+    }
+
+    /// Remove a member, or add a new one at the front, because Tidal lists a
+    /// collection newest first.
+    pub fn toggle(&mut self, id: T) {
+        if !self.remove(&id) {
+            self.index.insert(id.clone());
+            self.order.insert(0, id);
+        }
+    }
+
+    /// Apply a confirmed list. `Partial` keeps every member the confirmed list
+    /// omits, after it, so it adds and reorders but never removes. `Complete`
+    /// makes the members exactly the confirmed list. Applying the same list
+    /// twice changes nothing. Returns whether the members changed.
+    pub fn merge(&mut self, confirmed: &[T], reach: Reach) -> bool {
+        let mut next = Members::from_ordered(confirmed.iter().cloned());
+        if reach == Reach::Partial {
+            for id in &self.order {
+                next.insert(id.clone());
+            }
+        }
+        let changed = next != *self;
+        *self = next;
+        changed
+    }
+}
+
+/// One remote list that a paged read fills. Not `Collection`, which names a
+/// folder of user playlists.
+#[expect(dead_code, reason = "no paged read names a list yet")]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum RemoteList {
+    Liked,
+    Albums,
+    Artists,
+    Playlists,
+    /// The tracks of one Tidal playlist. Never a seed playlist.
+    Playlist(CataloguePlaylistId),
+}
+
+/// The single local user's data. `downloaded` is a `BTreeSet`, not a `HashSet`,
+/// because a `BTreeSet` is `Hash`, so `Library` and `State` stay hashable for
+/// the proof.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Library {
     pub name: String,
-    pub liked: BTreeSet<TrackId>,
-    pub saved_albums: BTreeSet<AlbumId>,
-    pub followed: BTreeSet<ArtistId>,
+    pub liked: Members<TrackId>,
+    pub saved_albums: Members<AlbumId>,
+    pub followed: Members<ArtistId>,
     /// Playlists the account owns or favorites on Tidal. Read-only here: the
     /// content lives in the catalogue, and no edit method takes this id type.
-    pub tidal_playlists: BTreeSet<CataloguePlaylistId>,
+    pub tidal_playlists: Members<CataloguePlaylistId>,
     /// Albums taken offline.
     pub downloaded: BTreeSet<AlbumId>,
     /// Recently played tracks, most recent first, never longer than
@@ -80,10 +189,10 @@ impl Default for Library {
     fn default() -> Self {
         Library {
             name: "You".to_string(),
-            liked: BTreeSet::new(),
-            saved_albums: BTreeSet::new(),
-            followed: BTreeSet::new(),
-            tidal_playlists: BTreeSet::new(),
+            liked: Members::default(),
+            saved_albums: Members::default(),
+            followed: Members::default(),
+            tidal_playlists: Members::default(),
             downloaded: BTreeSet::new(),
             history: Vec::new(),
             playlists: std::array::from_fn(|_| None),
@@ -116,19 +225,12 @@ pub struct SyncReport {
     pub dropped: usize,
 }
 
-/// The members of one list that the catalogue resolves. Each one it cannot
-/// resolve is counted in `dropped`.
-fn resolve<T: Ord>(raw: Vec<String>, id: impl Fn(&str) -> Option<T>, dropped: &mut usize) -> BTreeSet<T> {
-    let mut set = BTreeSet::new();
-    for member in raw {
-        match id(&member) {
-            Some(id) => {
-                set.insert(id);
-            }
-            None => *dropped += 1,
-        }
-    }
-    set
+/// The members of one list that the catalogue resolves, in order. Each one it
+/// cannot resolve is counted in `dropped`.
+fn resolve<T>(raw: Vec<String>, id: impl Fn(&str) -> Option<T>, dropped: &mut usize) -> Vec<T> {
+    let resolved: Vec<T> = raw.iter().filter_map(|member| id(member)).collect();
+    *dropped += raw.len() - resolved.len();
+    resolved
 }
 
 /// A safety violation, named so the random-walk test reports what broke.
@@ -163,21 +265,21 @@ impl Library {
     // --- Like / save / follow / download ----------------------------------
 
     pub fn toggle_like(&mut self, t: TrackId) {
-        toggle(&mut self.liked, t);
+        self.liked.toggle(t);
     }
     pub fn is_liked(&self, t: &TrackId) -> bool {
         self.liked.contains(t)
     }
 
     pub fn toggle_save_album(&mut self, a: AlbumId) {
-        toggle(&mut self.saved_albums, a);
+        self.saved_albums.toggle(a);
     }
     pub fn is_saved_album(&self, a: &AlbumId) -> bool {
         self.saved_albums.contains(a)
     }
 
     pub fn toggle_follow(&mut self, a: ArtistId) {
-        toggle(&mut self.followed, a);
+        self.followed.toggle(a);
     }
     pub fn is_following(&self, a: &ArtistId) -> bool {
         self.followed.contains(a)
@@ -348,10 +450,14 @@ impl Library {
     /// twice change nothing. A member that does not resolve is counted, not kept.
     pub fn sync(&mut self, cat: &mut Catalogue, rows: LibraryRows) -> SyncReport {
         let mut dropped = cat.absorb(rows.catalogue);
-        self.liked = resolve(rows.liked, |raw| cat.track_id(raw), &mut dropped);
-        self.saved_albums = resolve(rows.saved_albums, |raw| cat.album_id(raw), &mut dropped);
-        self.followed = resolve(rows.followed, |raw| cat.artist_id(raw), &mut dropped);
-        self.tidal_playlists = resolve(rows.tidal_playlists, |raw| cat.playlist_id(raw), &mut dropped);
+        let liked = resolve(rows.liked, |raw| cat.track_id(raw), &mut dropped);
+        self.liked.merge(&liked, Reach::Complete);
+        let saved_albums = resolve(rows.saved_albums, |raw| cat.album_id(raw), &mut dropped);
+        self.saved_albums.merge(&saved_albums, Reach::Complete);
+        let followed = resolve(rows.followed, |raw| cat.artist_id(raw), &mut dropped);
+        self.followed.merge(&followed, Reach::Complete);
+        let tidal_playlists = resolve(rows.tidal_playlists, |raw| cat.playlist_id(raw), &mut dropped);
+        self.tidal_playlists.merge(&tidal_playlists, Reach::Complete);
         SyncReport {
             liked: self.liked.len(),
             saved_albums: self.saved_albums.len(),
@@ -624,17 +730,17 @@ mod tests {
         let album = bigger.album_id("x-album").unwrap();
         let artist = bigger.artist_id("x-artist").unwrap();
 
-        let l = Library { liked: BTreeSet::from([track.clone()]), ..Default::default() };
+        let l = Library { liked: Members::from_ordered([track.clone()]), ..Default::default() };
         assert_eq!(l.check(&seed), Err(Violation::LikedNotInCatalogue));
         assert_eq!(l.check(&bigger), Ok(()));
 
-        let l = Library { saved_albums: BTreeSet::from([album.clone()]), ..Default::default() };
+        let l = Library { saved_albums: Members::from_ordered([album.clone()]), ..Default::default() };
         assert_eq!(l.check(&seed), Err(Violation::SavedAlbumNotInCatalogue));
 
-        let l = Library { followed: BTreeSet::from([artist]), ..Default::default() };
+        let l = Library { followed: Members::from_ordered([artist]), ..Default::default() };
         assert_eq!(l.check(&seed), Err(Violation::FollowedNotInCatalogue));
 
-        let l = Library { tidal_playlists: BTreeSet::from([playlist]), ..Default::default() };
+        let l = Library { tidal_playlists: Members::from_ordered([playlist]), ..Default::default() };
         assert_eq!(l.check(&seed), Err(Violation::TidalPlaylistNotInCatalogue));
         assert_eq!(l.check(&bigger), Ok(()));
 
@@ -698,10 +804,10 @@ mod tests {
                 ..LibraryRows::default()
             },
         );
-        assert_eq!(lib.liked, BTreeSet::from([cat.track_id("seed-track-1").unwrap()]));
-        assert_eq!(lib.saved_albums, BTreeSet::from([cat.album_id("seed-album-1").unwrap()]));
-        assert_eq!(lib.followed, BTreeSet::from([cat.artist_id("seed-artist-1").unwrap()]));
-        assert_eq!(lib.tidal_playlists, BTreeSet::from([cat.playlist_id("seed-playlist-2").unwrap()]));
+        assert_eq!(lib.liked, Members::from_ordered([cat.track_id("seed-track-1").unwrap()]));
+        assert_eq!(lib.saved_albums, Members::from_ordered([cat.album_id("seed-album-1").unwrap()]));
+        assert_eq!(lib.followed, Members::from_ordered([cat.artist_id("seed-artist-1").unwrap()]));
+        assert_eq!(lib.tidal_playlists, Members::from_ordered([cat.playlist_id("seed-playlist-2").unwrap()]));
         assert_eq!(
             report,
             SyncReport { liked: 1, saved_albums: 1, followed: 1, tidal_playlists: 1, dropped: 0 }
@@ -747,6 +853,50 @@ mod tests {
         assert_eq!(report.liked, 1);
         assert!(lib.tidal_playlists.is_empty());
         assert_eq!(lib.check(&cat), Ok(()));
+    }
+
+    fn tracks(cat: &Catalogue, ns: &[usize]) -> Vec<TrackId> {
+        ns.iter().map(|n| cat.track_id(&format!("seed-track-{n}")).unwrap()).collect()
+    }
+
+    /// A partial list is only the first pages, so a member it omits may sit on a
+    /// later page. It is kept after the confirmed list, a local like included.
+    #[test]
+    fn a_partial_merge_adds_and_reorders_but_never_removes() {
+        let cat = Catalogue::seed();
+        let mut lib = Library::default();
+        lib.liked.merge(&tracks(&cat, &[1, 2]), Reach::Complete);
+        lib.toggle_like(tracks(&cat, &[9])[0].clone());
+        assert_eq!(lib.liked.to_vec(), tracks(&cat, &[9, 1, 2]));
+        assert!(lib.liked.merge(&tracks(&cat, &[2, 3]), Reach::Partial));
+        assert_eq!(lib.liked.to_vec(), tracks(&cat, &[2, 3, 9, 1]), "a partial merge removed or misplaced a member");
+    }
+
+    /// A complete list is the whole remote list, so it is the only merge that
+    /// removes, and it removes exactly what the list omits.
+    #[test]
+    fn a_complete_merge_removes_exactly_the_omitted_members() {
+        let cat = Catalogue::seed();
+        let mut lib = Library::default();
+        lib.liked.merge(&tracks(&cat, &[1, 2, 3, 4]), Reach::Complete);
+        lib.liked.merge(&tracks(&cat, &[3, 1, 5]), Reach::Complete);
+        assert_eq!(lib.liked.to_vec(), tracks(&cat, &[3, 1, 5]));
+    }
+
+    /// A retried page lands twice. The second landing changes nothing and says so.
+    #[test]
+    fn the_same_merge_twice_changes_nothing() {
+        let cat = Catalogue::seed();
+        for reach in [Reach::Partial, Reach::Complete] {
+            let mut lib = Library::default();
+            lib.liked.merge(&tracks(&cat, &[1, 2]), Reach::Complete);
+            lib.toggle_like(tracks(&cat, &[9])[0].clone());
+            let confirmed = tracks(&cat, &[2, 3]);
+            lib.liked.merge(&confirmed, reach);
+            let once = lib.clone();
+            assert!(!lib.liked.merge(&confirmed, reach), "{reach:?} reported a change on a repeat");
+            assert_eq!(lib, once, "a repeated {reach:?} merge changed the library");
+        }
     }
 
     /// Renaming actually changes the name. The invariant does not constrain

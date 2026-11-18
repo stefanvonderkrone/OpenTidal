@@ -13,7 +13,7 @@ use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::library::Library;
+use crate::library::{Library, Members, Reach};
 
 macro_rules! id {
     ($(#[$doc:meta])* $name:ident) => {
@@ -102,7 +102,9 @@ pub struct CataloguePlaylist {
     pub id: CataloguePlaylistId,
     pub name: String,
     pub description: String,
-    pub tracks: Vec<TrackId>,
+    /// Written only by `Catalogue::merge_tracks`, so a row with no tracks
+    /// cannot erase the tracks a playlist already has.
+    pub tracks: Members<TrackId>,
     /// `None` when Tidal named no cover, or named one with a malformed id.
     pub cover: Option<ArtworkId>,
 }
@@ -183,7 +185,8 @@ pub struct PlaylistRow {
 }
 
 /// The catalogue. Insertion order is display order. `absorb` is the only writer
-/// of both the vectors and the indexes, so the two cannot disagree.
+/// of the indexes and the only one that adds an entry, so the two cannot
+/// disagree. `merge_tracks` writes a playlist's tracks and nothing else.
 #[derive(Default, Debug)]
 pub struct Catalogue {
     artists: Vec<Artist>,
@@ -194,6 +197,7 @@ pub struct Catalogue {
     album_at: BTreeMap<AlbumId, usize>,
     track_at: BTreeMap<TrackId, usize>,
     playlist_at: BTreeMap<CataloguePlaylistId, usize>,
+    revision: u64,
 }
 
 impl Catalogue {
@@ -212,16 +216,18 @@ impl Catalogue {
     /// catalogue playlists with their known tracks. A row with a malformed id or
     /// duration is dropped. A malformed or empty cover never drops a row: it
     /// keeps the cover the entry already has, or none. A known id updates its
-    /// fields in place and keeps its position. Absorbing the same rows twice
-    /// changes nothing.
+    /// fields in place and keeps its position. A playlist row with no tracks
+    /// keeps the tracks the playlist has. Absorbing the same rows twice changes
+    /// nothing.
     pub fn absorb(&mut self, rows: CatalogueRows) -> usize {
         let mut dropped = 0;
+        let mut changed = false;
         for row in rows.artists {
             let Some(id) = mint(&row.id).map(ArtistId) else {
                 dropped += 1;
                 continue;
             };
-            upsert(&mut self.artists, &mut self.artist_at, Artist { id, name: row.name }, |a| &a.id);
+            changed |= upsert(&mut self.artists, &mut self.artist_at, Artist { id, name: row.name }, |a| &a.id);
         }
         for row in rows.albums {
             let (Some(id), Some(artist)) = (mint(&row.id).map(AlbumId), self.artist_id(&row.artist))
@@ -232,7 +238,7 @@ impl Catalogue {
             let known = self.album(&id).and_then(|a| a.cover.clone());
             let cover = mint(&row.cover).map(ArtworkId).or(known);
             let album = Album { id, title: row.title, artist, cover };
-            upsert(&mut self.albums, &mut self.album_at, album, |a| &a.id);
+            changed |= upsert(&mut self.albums, &mut self.album_at, album, |a| &a.id);
         }
         for row in rows.tracks {
             let (Some(id), Some(artist), Some(album), Some(duration)) = (
@@ -245,22 +251,47 @@ impl Catalogue {
                 continue;
             };
             let track = Track { id, title: row.title, artist, album, duration };
-            upsert(&mut self.tracks, &mut self.track_at, track, |t| &t.id);
+            changed |= upsert(&mut self.tracks, &mut self.track_at, track, |t| &t.id);
         }
         for row in rows.playlists {
             let Some(id) = mint(&row.id).map(CataloguePlaylistId) else {
                 dropped += 1;
                 continue;
             };
-            let tracks: Vec<TrackId> = row.tracks.iter().filter_map(|t| self.track_id(t)).collect();
-            dropped += row.tracks.len() - tracks.len();
-            let known = self.playlist(&id).and_then(|p| p.cover.clone());
-            let cover = mint(&row.cover).map(ArtworkId).or(known);
+            let known = self.playlist(&id);
+            let tracks = known.map(|p| p.tracks.clone()).unwrap_or_default();
+            let cover = mint(&row.cover).map(ArtworkId).or(known.and_then(|p| p.cover.clone()));
             let playlist =
-                CataloguePlaylist { id, name: row.name, description: row.description, tracks, cover };
-            upsert(&mut self.playlists, &mut self.playlist_at, playlist, |p| &p.id);
+                CataloguePlaylist { id: id.clone(), name: row.name, description: row.description, tracks, cover };
+            changed |= upsert(&mut self.playlists, &mut self.playlist_at, playlist, |p| &p.id);
+            if !row.tracks.is_empty() {
+                dropped += self.merge_tracks(&id, &row.tracks, Reach::Complete).unwrap_or(0);
+            }
+        }
+        if changed {
+            self.revision += 1;
         }
         dropped
+    }
+
+    /// Merge one playlist's tracks by the rule of `Members::merge`, and return
+    /// how many it could not resolve. A playlist the catalogue lacks is ignored
+    /// and returns `None`.
+    pub fn merge_tracks(&mut self, id: &CataloguePlaylistId, confirmed: &[String], reach: Reach) -> Option<usize> {
+        let &at = self.playlist_at.get(id)?;
+        let resolved: Vec<TrackId> = confirmed.iter().filter_map(|t| self.track_id(t)).collect();
+        if self.playlists[at].tracks.merge(&resolved, reach) {
+            self.revision += 1;
+        }
+        Some(confirmed.len() - resolved.len())
+    }
+
+    /// Rises each time `absorb` or `merge_tracks` changes an entry, and only
+    /// then, so a writer can tell whether the catalogue changed since it last
+    /// looked.
+    #[cfg_attr(not(test), expect(dead_code, reason = "no writer compares revisions yet"))]
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn artist_id(&self, raw: &str) -> Option<ArtistId> {
@@ -393,17 +424,23 @@ fn cover_text(cover: &Option<ArtworkId>) -> String {
 }
 
 /// Insert a new entry at the end, or replace a known one where it stands.
-fn upsert<I: Ord + Clone, T>(
+/// Returns whether anything changed.
+fn upsert<I: Ord + Clone, T: PartialEq>(
     items: &mut Vec<T>,
     at: &mut BTreeMap<I, usize>,
     item: T,
     id: impl Fn(&T) -> &I,
-) {
+) -> bool {
     match at.get(id(&item)) {
-        Some(&i) => items[i] = item,
+        Some(&i) if items[i] == item => false,
+        Some(&i) => {
+            items[i] = item;
+            true
+        }
         None => {
             at.insert(id(&item).clone(), items.len());
             items.push(item);
+            true
         }
     }
 }
@@ -640,7 +677,7 @@ mod tests {
         assert!(cat.track_id("102").is_none(), "a track with an unknown artist got in");
         assert!(cat.track_id("100").is_some());
         let e = cat.playlists().find(|p| p.id.as_str() == "e").unwrap();
-        assert_eq!(e.tracks, vec![cat.track_id("100").unwrap()]);
+        assert_eq!(e.tracks.to_vec(), vec![cat.track_id("100").unwrap()]);
     }
 
     /// Absorbing new rows never removes an earlier id, so an id held by a route or
@@ -795,6 +832,55 @@ mod tests {
         let mut fresh = Catalogue::default();
         assert_eq!(fresh.absorb(rows), 0);
         assert_eq!(fresh.album(&fresh.album_id("10").unwrap()).unwrap().cover, cat.album(&cat.album_id("10").unwrap()).unwrap().cover);
+    }
+
+    fn listed(id: &str, name: &str, tracks: &[&str]) -> PlaylistRow {
+        PlaylistRow {
+            id: id.into(),
+            name: name.into(),
+            description: String::new(),
+            tracks: tracks.iter().map(|t| t.to_string()).collect(),
+            cover: String::new(),
+        }
+    }
+
+    /// A playlist listing page names a playlist without its tracks. That row
+    /// updates the name and must not erase the tracks a track page gave.
+    #[test]
+    fn a_listing_row_without_tracks_keeps_the_cached_tracks() {
+        let mut cat = Catalogue::seed();
+        cat.absorb(CatalogueRows {
+            playlists: vec![listed("p-1", "Old", &["seed-track-4", "seed-track-2"])],
+            ..CatalogueRows::default()
+        });
+        cat.absorb(CatalogueRows { playlists: vec![listed("p-1", "New", &[])], ..CatalogueRows::default() });
+        let p = cat.playlist(&cat.playlist_id("p-1").unwrap()).unwrap();
+        assert_eq!(p.name, "New");
+        let held: Vec<&str> = p.tracks.iter().map(TrackId::as_str).collect();
+        assert_eq!(held, ["seed-track-4", "seed-track-2"], "a listing row erased the tracks");
+    }
+
+    /// The revision tells a writer the catalogue changed. It rises on a new or
+    /// changed entry and on new playlist tracks, and holds on a repeat.
+    #[test]
+    fn the_revision_rises_only_on_a_real_change() {
+        let mut cat = Catalogue::seed();
+        let rows = CatalogueRows {
+            artists: vec![artist("1")],
+            playlists: vec![listed("p-1", "P", &["seed-track-0"])],
+            ..CatalogueRows::default()
+        };
+        let start = cat.revision();
+        cat.absorb(rows.clone());
+        let after_new = cat.revision();
+        assert!(after_new > start, "a new entry did not raise the revision");
+        cat.absorb(rows);
+        assert_eq!(cat.revision(), after_new, "an identical absorb raised the revision");
+        let id = cat.playlist_id("p-1").unwrap();
+        cat.merge_tracks(&id, &["seed-track-0".into()], Reach::Complete);
+        assert_eq!(cat.revision(), after_new, "identical tracks raised the revision");
+        cat.merge_tracks(&id, &["seed-track-1".into()], Reach::Partial);
+        assert!(cat.revision() > after_new, "new tracks did not raise the revision");
     }
 
     /// Tidal sends a duration as ISO 8601. A track whose duration does not parse

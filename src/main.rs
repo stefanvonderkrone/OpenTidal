@@ -30,7 +30,7 @@ const HEART: Icon = Icon { name: "heart", view: 24.0, body: "<path d=\"M12 21s-6
 
 type Scene = (&'static str, fn(&mut App));
 
-const SCENES: [Scene; 8] = [
+const SCENES: [Scene; 9] = [
     ("default", |_| {}),
     ("accent-blue", |a| a.core.accent = 0),
     ("accent-pink", |a| a.core.accent = 2),
@@ -44,6 +44,7 @@ const SCENES: [Scene; 8] = [
     ("signed-in-stored", signed_in_stored_scene),
     ("signed-in-synced", signed_in_synced_scene),
     ("signed-in-covers", signed_in_covers_scene),
+    ("signed-in-paged", signed_in_paged_scene),
 ];
 
 /// Signs in as a user the database can key on, so a driven scene proves the write
@@ -156,6 +157,32 @@ fn signed_in_covers_scene(a: &mut App) {
         ..tidal::FakeService::default()
     });
     a.wait_for_decode = true;
+}
+
+/// The stored scene, with a fake service whose saved albums run to 145 over
+/// eight pages: five on the first, so they leave room below, then 20 a page.
+/// Entering a list reads its first page, and only scrolling reads past what is
+/// in view, as a live session does.
+fn signed_in_paged_scene(a: &mut App) {
+    use catalogue::{AlbumRow, CatalogueRows};
+    signed_in_stored_scene(a);
+    a.revalidate_on_entry = true;
+    let ids: Vec<String> = (0..145).map(|n| format!("paged-album-{n}")).collect();
+    let mut pages = Vec::new();
+    let mut start = 0;
+    for size in std::iter::once(5).chain(std::iter::repeat_n(20, 7)) {
+        let members = ids[start..start + size].to_vec();
+        let albums = members
+            .iter()
+            .map(|id| AlbumRow { id: id.clone(), title: format!("Album {}", &id[12..]), artist: "seed-artist-0".to_string(), cover: String::new() })
+            .collect();
+        pages.push(Ok(tidal::Page { rows: CatalogueRows { albums, ..CatalogueRows::default() }, members, next: None }));
+        start += size;
+    }
+    a.service = std::sync::Arc::new(tidal::FakeService {
+        pages: [(library::RemoteList::Albums, pages)].into(),
+        ..tidal::FakeService::default()
+    });
 }
 
 fn view(app: &App, _cx: &mut Cx<App>) -> El {
@@ -490,4 +517,228 @@ fn main() {
             app.quit();
         })
         .run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+
+    use catalogue::CoverRequest;
+    use library::RemoteList;
+    use rune::{Env, Runtime};
+    use tidal::{Cursor, MusicService, Page, ServiceError, User};
+
+    /// The paged scene's fake service behind a gate. An open gate answers at
+    /// once. A held gate makes each page wait for a verdict: `Ok` reads the
+    /// fake page, `Err` answers that error instead.
+    struct Gate {
+        inner: Arc<dyn MusicService>,
+        held: AtomicBool,
+        verdicts: Mutex<mpsc::Receiver<Result<(), ServiceError>>>,
+        pages: AtomicUsize,
+    }
+
+    impl MusicService for Gate {
+        fn current_user(&self, token: &str) -> Result<User, ServiceError> {
+            self.inner.current_user(token)
+        }
+        fn page(&self, token: &str, user: &str, of: &RemoteList, after: Option<&Cursor>) -> Result<Page, ServiceError> {
+            self.pages.fetch_add(1, Ordering::SeqCst);
+            if self.held.load(Ordering::SeqCst) {
+                let verdict = self.verdicts.lock().expect("gate").recv().unwrap_or(Ok(()));
+                verdict?;
+            }
+            self.inner.page(token, user, of, after)
+        }
+        fn cover(&self, token: &str, cover: &CoverRequest) -> Result<Vec<u8>, ServiceError> {
+            self.inner.cover(token, cover)
+        }
+    }
+
+    struct Paged {
+        rt: Runtime<App>,
+        gate: Arc<Gate>,
+        verdicts: mpsc::Sender<Result<(), ServiceError>>,
+    }
+
+    impl Paged {
+        /// The `signed-in-paged` scene on `db`, drawn in a window of the app's size.
+        fn open(db: &std::path::Path, held: bool) -> Paged {
+            let mut app = App::default();
+            app.db_override = Some(db.to_path_buf());
+            signed_in_paged_scene(&mut app);
+            let (verdicts, rx) = mpsc::channel();
+            let gate = Arc::new(Gate {
+                inner: app.service.clone(),
+                held: AtomicBool::new(held),
+                verdicts: Mutex::new(rx),
+                pages: AtomicUsize::new(0),
+            });
+            app.service = gate.clone();
+            let mut rt = Runtime::new(app, view, (1280.0, 800.0), Env::new(true, 1.0));
+            rt.poll = Some(|app, _, _| app.drain());
+            rt.frame(0.0);
+            Paged { rt, gate, verdicts }
+        }
+
+        fn open_albums(&mut self) {
+            self.rt.update(|a, _| state::open_section(&mut a.core, Route::Albums));
+        }
+
+        fn status(&self) -> PassStatusLine {
+            let line = self.rt.elements().into_iter().find(|e| e.key.as_deref() == Some("pass-status")).and_then(|e| e.text);
+            PassStatusLine(line)
+        }
+
+        fn shows(&self, key: &str) -> bool {
+            self.rt.find(key).is_some()
+        }
+
+        /// Draws frames until `done`, giving the workers real time to answer.
+        fn until(&mut self, what: &str, done: impl Fn(&Paged) -> bool) {
+            for _ in 0..400 {
+                self.rt.frame(1.0 / 60.0);
+                if done(self) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            panic!("never {what}: status {:?}", self.status());
+        }
+
+        /// Frames until no page is in flight and nothing more is wanted.
+        fn settle(&mut self) {
+            self.until("settled", |p| p.rt.state.pass_status(RemoteList::Albums) != pager::PassStatus::Loading);
+            for _ in 0..30 {
+                self.rt.frame(1.0 / 60.0);
+            }
+        }
+
+        /// Opens the gate, answers the page that waits on it, and settles.
+        fn release(&mut self) {
+            self.gate.held.store(false, Ordering::SeqCst);
+            self.verdicts.send(Ok(())).expect("gate");
+            self.settle();
+        }
+
+        fn scroll(&mut self, dy: f32) {
+            self.rt.wheel(700.0, 400.0, dy);
+            for _ in 0..30 {
+                self.rt.frame(1.0 / 60.0);
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct PassStatusLine(Option<String>);
+
+    impl PassStatusLine {
+        fn says(&self, start: &str) -> bool {
+            self.0.as_deref().is_some_and(|line| line.starts_with(start))
+        }
+    }
+
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!("opentidal-paged-{name}-{}", std::process::id()));
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir_all(&dir).expect("scratch directory");
+            Scratch(dir)
+        }
+        fn db(&self) -> std::path::PathBuf {
+            self.0.join("scene.db")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    /// The first page holds five albums, so the rows in view want more, and
+    /// album 50 sits on a page only a scroll asks for.
+    #[test]
+    fn a_scroll_reads_the_page_its_rows_need() {
+        let scratch = Scratch::new("scroll");
+        let mut p = Paged::open(&scratch.db(), false);
+        p.open_albums();
+        p.settle();
+        assert!(p.shows("paged-album-0"), "the first page did not show");
+        assert!(!p.shows("paged-album-50"), "a page no row needs was read");
+        p.scroll(-900.0);
+        p.settle();
+        assert!(p.shows("paged-album-50"), "the scroll did not read the next page, status {:?}", p.status());
+    }
+
+    /// A restart shows the albums the file holds while page one is still out.
+    #[test]
+    fn cached_rows_show_before_the_first_page_lands() {
+        let scratch = Scratch::new("cached");
+        let mut first = Paged::open(&scratch.db(), false);
+        first.open_albums();
+        first.settle();
+        assert!(first.rt.state.quit(), "the first run did not write its library");
+        drop(first);
+
+        let mut p = Paged::open(&scratch.db(), true);
+        p.open_albums();
+        p.until("asked for page one", |p| p.gate.pages.load(Ordering::SeqCst) == 1);
+        for _ in 0..10 {
+            p.rt.frame(1.0 / 60.0);
+        }
+        assert!(p.shows("paged-album-0") && p.shows("paged-album-10"), "the cached rows waited for the page");
+        assert_eq!(p.status(), PassStatusLine(Some("Loading from Tidal…".to_string())));
+        p.release();
+        assert!(p.shows("paged-album-10"), "page one dropped the cached rows");
+    }
+
+    /// Coming back to a list read to its end reads page one again, behind the
+    /// rows already shown.
+    #[test]
+    fn reentering_a_cached_screen_shows_rows_before_the_refresh_lands() {
+        let scratch = Scratch::new("reenter");
+        let mut p = Paged::open(&scratch.db(), false);
+        p.open_albums();
+        p.rt.update(|a, _| a.sync());
+        p.until("read to the end", |p| p.rt.state.pass_status(RemoteList::Albums) == pager::PassStatus::Complete);
+        p.rt.update(|a, _| state::open_section(&mut a.core, Route::Home));
+        p.settle();
+        p.gate.held.store(true, Ordering::SeqCst);
+        let before = p.gate.pages.load(Ordering::SeqCst);
+        p.open_albums();
+        p.until("asked for the refresh", |p| p.gate.pages.load(Ordering::SeqCst) == before + 1);
+        for _ in 0..10 {
+            p.rt.frame(1.0 / 60.0);
+        }
+        assert!(p.shows("paged-album-0") && p.shows("paged-album-10"), "reentry hid the rows until the refresh");
+        assert!(p.status().says("Loading"), "the refresh is not shown: {:?}", p.status());
+        p.release();
+    }
+
+    /// A failed page says so, and a scroll that wants more rows reads it again.
+    #[test]
+    fn a_stalled_pass_says_so_and_a_larger_scroll_retries_it() {
+        let scratch = Scratch::new("stall");
+        let mut p = Paged::open(&scratch.db(), false);
+        p.open_albums();
+        p.settle();
+        p.gate.held.store(true, Ordering::SeqCst);
+        let before = p.gate.pages.load(Ordering::SeqCst);
+        p.scroll(-700.0);
+        p.until("asked for the next page", |p| p.gate.pages.load(Ordering::SeqCst) == before + 1);
+        p.verdicts.send(Err(ServiceError::Http("500".to_string()))).expect("gate");
+        p.until("stalled", |p| p.status().says("Tidal did not send the rest"));
+        assert!(!p.shows("paged-album-50"));
+
+        p.verdicts.send(Ok(())).expect("gate");
+        p.scroll(-900.0);
+        p.until("read the page again", |p| p.gate.pages.load(Ordering::SeqCst) >= before + 2);
+        p.release();
+        assert!(p.shows("paged-album-50"), "the retry did not land, status {:?}", p.status());
+    }
 }

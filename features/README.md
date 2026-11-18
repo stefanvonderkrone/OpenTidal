@@ -24,6 +24,8 @@ the catalogue holds. The seed keeps today's order, so `album-0` on Home is
 - `new-collection`, `add-to-col-<idx>`, `del-col-<idx>`, and `rm-from-col-<idx>-<pos>` are collection actions.
 - `dl-<pos>` and `rm-dl-<pos>` name download rows on the Downloads screen.
 - `track-<pos>` names a track row in a list, including a playlist row with its actions.
+- `pass-status` is the line under a Tidal list that says a page is loading, the pass stalled, or the list is read to its end.
+- A long Tidal list builds only the rows near the viewport. Each built row is keyed by the id of its first member, such as `paged-album-50`. A row outside the built window has no element in the tree, so assert on a row key, never on a count of rows.
 
 The journeys:
 
@@ -41,6 +43,7 @@ The journeys:
 | `tidal-sync-local` | After a sync, a local playlist still opens with its edit actions. |
 | `tidal-sync-status` | The Account screen reports what the sync left. |
 | `covers` | A synced album shows its fetched cover, and a second run shows it from disk with no fetch. |
+| `paged` | A scroll on a long Albums list reads the page its rows need. |
 
 The `sign-in` journey runs against the deterministic fake service, which signs
 in at once, so no browser or network is needed headless. The `signed-in` scene
@@ -88,4 +91,16 @@ grep "fetched 1 of 1 covers" artifacts/covers/run.log
 scripts/control-opentidal drive features/covers/script.json artifacts/covers-hit --scene signed-in-covers
 scripts/pixel-assert.py artifacts/covers-hit/frame.png artifacts/covers-hit/tree.json cover-image ff00ff 0.9
 grep "fetched 0 of 1 covers" artifacts/covers-hit/run.log
+```
+
+The `paged` journey starts from the `signed-in-paged` scene. Its fake service
+holds 145 saved albums over eight pages: five on the first, then 20 a page.
+Opening Albums reads the pages the rows in view need, which stop short of album
+50. The scroll reads further, so the row that starts with album 50 appears. A
+build where the rows in view ask for nothing fails the last two predicates:
+
+```sh
+export OPENTIDAL_DB="$(mktemp -d)/scene.db"
+scripts/control-opentidal drive features/paged/script.json artifacts/paged --scene signed-in-paged
+scripts/tree-assert.py artifacts/paged/tree.json has=paged-album-0 has=paged-album-50 has=album-50
 ```

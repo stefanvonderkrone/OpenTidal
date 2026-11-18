@@ -275,6 +275,20 @@ pass that reads the first page only. Reopening the route that shows does not
 start another. A view that needs more rows than a pass read asks for the next
 page.
 
+The Liked Songs, Albums, Artists and Playlists screens, and a Tidal playlist's
+tracks, draw the library's ordered lists in Tidal's order. They build only the
+rows near the viewport. The rows in view ask for the members up to the last
+visible row plus 20 more, so a scroll toward the end reads the next page before
+the reader gets there. A line keyed `pass-status` under the list says whether a
+page is loading, whether the pass stalled, or whether the list is read to its
+end. A stalled pass reads again when a scroll asks for more rows than before, or
+when the screen opens again. A pass that stalls with the last row already in
+view therefore waits for the screen to open again.
+
+Returning to a list read to its end reads its first page again behind the rows
+already shown. Returning to a list whose pass stopped part way resumes that pass
+and does not read the first page again.
+
 A pass obeys five rules.
 
 1. Apply each page as it lands. An earlier page adds and reorders members, but
@@ -465,6 +479,11 @@ names the test that covers the code path, and no hand check has happened.
 | A catalogue-only change reaches disk | Read a Tidal playlist's tracks, assert the library is unchanged and a new run loads the tracks | test: `a_catalogue_only_change_reaches_disk` |
 | Entering a route starts one pass | Open Liked Songs twice, assert one page, then Albums, assert one more | test: `entering_a_route_starts_one_pass_and_reentering_does_not` |
 | A larger view reads the next page | Enter a two-page list, assert one page, ask for two rows, assert both pages | test: `a_larger_want_reads_the_next_page` |
+| A scroll reads the page its rows need | Open Albums in the paged scene, assert album 50 is absent, scroll, assert its row | test: `a_scroll_reads_the_page_its_rows_need`. The paged journey asserts the same row headless |
+| Cached rows show before page one lands | Write a read library, restart with page one held, assert the rows and the loading line | test: `cached_rows_show_before_the_first_page_lands` |
+| Reentry refreshes behind the rows | Read Albums to its end, leave, hold page one, return, assert the rows and the loading line | test: `reentering_a_cached_screen_shows_rows_before_the_refresh_lands` |
+| A stalled pass says so and a larger scroll retries it | Fail the page a scroll asked for, assert the stall line, scroll further, assert the page lands | test: `a_stalled_pass_says_so_and_a_larger_scroll_retries_it` |
+| A live library pages on scroll | Sign in with a large real account, open Albums, scroll, watch later rows arrive | pending: no live run in this unit |
 | A merge keeps no unresolvable member | Merge a member the catalogue lacks, assert it is counted and left out | test: `an_unresolvable_member_is_counted_not_kept` |
 | A merge cannot break the invariant | Three merge successors in the exhaustive library proof | test: `every_reachable_library_satisfies_check` |
 | A bad cover never hides its album or playlist | Absorb rows with malformed covers, assert each row is kept with no cover and nothing is counted | test: `a_bad_cover_does_not_hide_its_album`, `a_bad_cover_does_not_hide_its_playlist` |

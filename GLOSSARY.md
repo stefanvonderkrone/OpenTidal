@@ -28,6 +28,12 @@ catalogue rows the store holds, and no operation removes an entry.
 - **Tidal playlist.** A catalogue playlist the account owns or favorites on
   Tidal. The library holds its id in `tidal_playlists`, and the catalogue holds
   its content. It is never a user playlist and never takes a slot.
+- **artwork id.** The id in an album's or a catalogue playlist's `coverArt`
+  relationship. In code it is `ArtworkId`. Only a `Catalogue` mints one, with
+  the same shape rule as every other id, so it is also a safe file name.
+- **cover.** The image of an album or a catalogue playlist. An artist and a
+  user playlist have no cover, and keep the **placeholder**.
+- **placeholder.** The gradient a screen draws where no cover is ready.
 
 ## Library
 
@@ -59,6 +65,13 @@ The on-disk half, in `src/store.rs`. One SQLite file, one row set per account.
 - **slot**: a position in the fixed playlist array. A slot is empty after a
   delete, and a create reuses the first empty one. Routes are never persisted,
   so a slot means the same playlist across a restart.
+- **cover cache**: one account's directory of cover files, at
+  `$XDG_CACHE_HOME/opentidal/covers/<user id>/`, with `~/.cache` as the
+  fallback. In code it is `CoverCache`. It is never the **store** and never the
+  **tokens**.
+- **put**: replace one cover file through `atomic::replace`. This is
+  `CoverCache::put`. It never means **write** (the library) or **save** (an
+  album).
 - **write**: replace one account's whole library in one transaction. This is
   `Store::write` in code. It never means the album verb **save**, and an edit the
   write has not landed yet is **unwritten**.
@@ -95,6 +108,9 @@ A sync mirrors the library from Tidal. Nothing writes back.
 - **sync.** Read the whole Tidal library of the signed-in account, then
   replace likes, saves, follows, and Tidal playlists in one step. `Library::sync`
   applies it. A fetch that fails on any page changes nothing.
+- **cover state.** Where one cover is in its life: wanted by a screen, held
+  by a batch, shown, or unavailable until the next sync. In code it is
+  `CoverState`, one map per open library. It is not a **slot**.
 - **ticket.** The session and user id a worker started under. In code it is
   `Ticket`, checked by `App::ticket_holds`. A result is applied only when both
   still match the open library.

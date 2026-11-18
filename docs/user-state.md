@@ -51,14 +51,15 @@ directory.
 
 ## Schema
 
-`PRAGMA user_version` is 3.
+`PRAGMA user_version` is 4.
 
 ```
 user(id TEXT PRIMARY KEY, name TEXT NOT NULL, updated_at INTEGER NOT NULL)
 
 artist(id TEXT PRIMARY KEY, name TEXT NOT NULL)
 album(id TEXT PRIMARY KEY, title TEXT NOT NULL,
-      artist_id TEXT NOT NULL REFERENCES artist)
+      artist_id TEXT NOT NULL REFERENCES artist,
+      cover TEXT NOT NULL DEFAULT '')
 track(id TEXT PRIMARY KEY, title TEXT NOT NULL,
       artist_id TEXT NOT NULL REFERENCES artist,
       album_id TEXT NOT NULL REFERENCES album, duration TEXT NOT NULL)
@@ -96,7 +97,7 @@ history(user_id TEXT NOT NULL REFERENCES user, position INTEGER NOT NULL,
         PRIMARY KEY (user_id, position))
 
 catalogue_playlist(id TEXT PRIMARY KEY, name TEXT NOT NULL,
-                   description TEXT NOT NULL)
+                   description TEXT NOT NULL, cover TEXT NOT NULL DEFAULT '')
 catalogue_playlist_track(playlist_id TEXT NOT NULL REFERENCES catalogue_playlist,
                          position INTEGER NOT NULL,
                          track_id TEXT NOT NULL REFERENCES track,
@@ -127,6 +128,10 @@ Notes:
   catalogue tables. `tidal_playlist` is the per-account membership. The local
   slots keep the `playlist` table.
 - `duration` is ISO 8601 text such as `PT3M26S`, the shape Tidal sends.
+- `cover` is the artwork id from the `coverArt` relationship, or empty for none.
+  A non-text or malformed cover reads as none and never costs its album or
+  playlist. The cover image itself is not in the store. It lives in the cover
+  cache, one directory per account under `$XDG_CACHE_HOME/opentidal/covers`.
 - No `is_active` column. The token store decides who is active. A stored
   flag would be a second source of truth and could disagree after a crash.
 
@@ -148,6 +153,13 @@ migrates again.
 
 Version 2 holds every row version 3 keeps. The migration adds the three catalogue
 playlist tables in one transaction and changes nothing else.
+
+### Migration from version 3
+
+Version 3 lacks only the two `cover` columns. The migration adds them with
+`ALTER TABLE` in one transaction, and every row keeps an empty cover until the
+next sync names one. Every path to version 4 runs the same `ALTER TABLE` text,
+a fresh file included, so a fresh and a migrated file hold the same definitions.
 
 ## Start
 
@@ -444,6 +456,39 @@ names the test that covers the code path, and no hand check has happened.
 | A sync is idempotent | Apply the same rows twice, assert the library and the report are unchanged | test: `a_sync_twice_changes_nothing` |
 | A sync keeps no unresolvable member | Sync a member the catalogue lacks, assert it is counted and left out | test: `an_unresolvable_member_is_counted_not_kept` |
 | A sync cannot break the invariant | Two sync successors in the exhaustive library proof | test: `every_reachable_library_satisfies_check` |
+| A bad cover never hides its album or playlist | Absorb rows with malformed covers, assert each row is kept with no cover and nothing is counted | test: `a_bad_cover_does_not_hide_its_album`, `a_bad_cover_does_not_hide_its_playlist` |
+| A row without a cover keeps the known cover | Absorb a cover, then the same album and playlist with an empty and a malformed one | test: `a_row_without_a_cover_keeps_the_known_cover` |
+| The decoder reads the cover id | Decode the synthetic fixtures, assert each album and playlist cover id | test: `the_fixtures_decode_into_a_whole_library` |
+| A cover id survives a restart | Write an album and a playlist with covers, load into the seed alone, compare the entries whole | test: `a_cover_survives_a_restart`, `rows_for_carries_the_cover` |
+| A damaged cover column costs only the cover | Plant a blob and a malformed cover, assert the library loads whole with no cover | test: `a_non_text_cover_keeps_its_album` |
+| A version 3 file gains empty covers | Migrate a version 3 file, assert every row loads with no cover | test: `a_version_3_file_gains_empty_covers`, `a_fresh_and_a_migrated_schema_match` |
+| The cover cache lives under the XDG cache root | Ask for the root with and without `XDG_CACHE_HOME`, relative and empty included | test: `the_cover_cache_lives_under_xdg_cache_home`, `without_xdg_cache_home_the_cover_cache_falls_back_to_dot_cache` |
+| A put cover survives a restart | Put the fixture, rebuild the cache from the same root, assert the bytes | test: `a_put_cover_survives_a_restart` |
+| A failed put leaves no partial cover | Block the rename with a directory, assert no cover and no temporary file | test: `a_failed_put_leaves_no_partial_cover` |
+| Putting a cover twice changes nothing | Put the same bytes twice, compare the directory and the bytes | test: `putting_a_cover_twice_changes_nothing` |
+| Bytes that are not an image are never put | Put HTML, empty and truncated bodies, assert no file | test: `bytes_that_are_not_an_image_are_never_put` |
+| A damaged cover reads as a miss | Overwrite a cover with junk, assert a miss and the file removed | test: `a_damaged_cover_reads_as_a_miss`, `an_evicted_cover_is_a_miss` |
+| A stray file cannot push out a valid cover | Plant stray names, prune to one, assert the valid cover stays and the strays are untouched | test: `an_invalid_cache_entry_does_not_count_against_the_limit` |
+| A crashed replace leaves nothing behind | Plant a temporary file, sweep, assert only the cover remains | test: `a_leftover_temporary_file_is_swept` |
+| One account cannot read another's covers | Put a cover for account A, assert a miss for B | test: `one_account_cannot_read_another_accounts_covers`, `a_user_id_cannot_leave_the_cover_root` |
+| The cover cache is private | Assert mode 0600 on a cover and 0700 on its directory | test: `the_cover_cache_is_private` |
+| A cover fetch reads the pinned relationship | Read the synthetic artwork fixture, assert the path, the artwork by id and the file | test: `a_cover_link_is_read_from_the_artwork_files`, `the_smallest_file_at_or_above_the_width_wins` |
+| A cover link must be https | Serve http, relative, protocol-relative, file and ftp links, assert no image request | test: `a_cover_link_that_is_not_https_is_refused` |
+| A cover with no file is an error | Serve artworks with no usable file and a missing artwork | test: `a_cover_with_no_files_is_a_decode_error` |
+| The image request carries no token and a cap | A loopback server checks the header and serves an over-cap body | test: `an_image_body_over_the_cap_is_refused` |
+| A miss fetches and a hit does not | Resolve twice over one root, count the fetches | test: `a_miss_fetches_and_puts_the_cover`, `a_hit_makes_no_fetch` |
+| One failed cover costs only itself | Resolve a batch with an error, an HTML body and a good cover | test: `a_failed_cover_does_not_block_the_batch` |
+| A rejected token stops the fetches | Reject the first cover, assert one fetch and the hits still served | test: `a_rejected_token_stops_further_fetches`, `no_token_still_serves_hits` |
+| Only fetches count toward the batch cap | Plant a cap of hits and more damaged files, assert the cap counts fetches only | test: `only_fetches_count_toward_the_cap` |
+| Every wanted cover arrives | Want more covers than one batch fetches, drain until idle, assert all shown | test: `every_wanted_cover_is_fetched_across_batches`, `a_cover_wanted_during_a_batch_is_fetched_next` |
+| A cover batch for another account is dropped | Start a batch, open another account in the same session, assert nothing shown and no file in its directory | test: `a_cover_batch_from_another_account_is_dropped` |
+| A cover batch waits for the profile fetch | Hold the profile fetch, want a cover, assert no batch, then release | test: `a_cover_batch_waits_for_the_profile_fetch` |
+| Sign-out forgets the shown covers | Show a cover, sign out, assert no cover and an empty map on reopen | test: `sign_out_forgets_the_shown_covers` |
+| A restart fetches no cover it has | Two apps on one root, assert the second fetches nothing | test: `a_cover_restart_fetches_nothing` |
+| Setup does no cover work | Restore a session in setup, drain, assert no batch, no fetch and no cover root | test: `no_cover_work_runs_at_setup` |
+| A put cover decodes through Rune | Put the fixture, decode it with `ImageCache::file`, assert its size | test: `a_ready_cover_decodes_to_its_pixels` |
+| A decoded cover appears on screen | Drive `features/covers` twice with one database, assert `cover-image`, the magenta share inside its rect, and a second run with no fetch | `scripts/pixel-assert.py` on the `features/covers` drive, by hand on 2026-11-18 against the fake service: both runs pass. This is not a live check |
+| A real account shows a real cover | Sign in with a real account, sync, open Albums, compare a cover with the Tidal app | live: not run. No token exists, and the cover response shape is synthetic, so this stays open. The read is covered by `a_cover_link_is_read_from_the_artwork_files`() |
 
 ## Confirmed live
 

@@ -488,7 +488,11 @@ names the test that covers the code path, and no hand check has happened.
 | Setup does no cover work | Restore a session in setup, drain, assert no batch, no fetch and no cover root | test: `no_cover_work_runs_at_setup` |
 | A put cover decodes through Rune | Put the fixture, decode it with `ImageCache::file`, assert its size | test: `a_ready_cover_decodes_to_its_pixels` |
 | A decoded cover appears on screen | Drive `features/covers` twice with one database, assert `cover-image`, the magenta share inside its rect, and a second run with no fetch | `scripts/pixel-assert.py` on the `features/covers` drive, by hand on 2026-11-18 against the fake service: both runs pass. This is not a live check |
-| A real account shows a real cover | Sign in with a real account, sync, open Albums, compare a cover with the Tidal app | live: not run. No token exists, and the cover response shape is synthetic, so this stays open. The read is covered by `a_cover_link_is_read_from_the_artwork_files`() |
+| A real account shows a real cover | Sign in with a real account, sync, open Albums, compare a cover with the Tidal app | live: not run. The response shape is confirmed live, but a full sync of this account did not finish in the drive window, so the screen stays open. The read is covered by `a_cover_link_is_read_from_the_artwork_files`() |
+| A live next link is followed | Read a live collection page, follow its `links.next`, read the second page | live: 2026-11-18, plus `a_next_link_without_the_base_path_is_followed`() |
+| A live cover reads an artwork file | Read a live album coverArt response, pick a file, fetch the image with no token | live: 2026-11-18, plus `a_cover_link_is_read_from_the_artwork_files`() and `the_smallest_file_at_or_above_the_width_wins`() |
+| The live library needs cover includes | Read live collections with and without the coverArt include, compare the relationships | live: 2026-11-18. The include assertions are covered by `http_library_reads_through_a_loopback_server`() |
+| Tidal limits rapid requests | Send ten rapid paced-free page requests, observe `429 Too Many Requests` | live: 2026-11-18, plus `a_rate_limited_page_is_retried_and_lands`() |
 
 ## Confirmed live
 

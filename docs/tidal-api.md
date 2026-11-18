@@ -116,6 +116,32 @@ Read these against a real account on 2026-11-15.
 - Track titles live in `included[].attributes.title`; duration is ISO 8601
   (`PT3M26S`). Artist and album names need `include=artists,albums`.
 
+### Confirmed live on 2026-11-18
+
+Read these with read-only requests against the signed-in account.
+
+- A `links.next` value is an absolute path from the host root, such as
+  `/userCollectionAlbums/me/relationships/items?include=...&page%5Bcursor%5D=...`.
+  It has no `/v2` prefix. The pager accepts that shape and the older `/v2`
+  shape.
+- Nested includes work. Saved albums answer to `include=items,items.artists,items.coverArt`.
+  Liked tracks and playlist items answer to
+  `include=items,items.albums,items.artists,items.albums.coverArt`. Favorited
+  playlists answer to `include=items,items.coverArt`.
+- An album or playlist resource carries `relationships.coverArt.data` only when
+  the request includes the cover. Without that include the relationship is
+  absent.
+- `GET /albums/{id}/relationships/coverArt?include=coverArt` returns an
+  `included` resource of type `artworks`. Its `attributes.files` entries carry
+  `href` and `meta.width`. This matches the synthetic fixture shape.
+- A cover `href` serves `image/jpeg` with no `Authorization` header. The cover
+  request sends no token to the image host.
+- `GET /playlists?filter[owners.id]=<uid>` returned twelve owned playlists and
+  no `next` link.
+- Tidal answered `429 Too Many Requests` on the tenth rapid unpaced page
+  request. The saved-albums cursor chain passed twenty five paced pages with no
+  end.
+
 ## Throughput checkpoint
 
 Blocking first steps. The boundary, types, and auth machine must exist before

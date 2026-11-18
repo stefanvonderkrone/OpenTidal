@@ -13,11 +13,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::catalogue::{ArtworkId, is_id_shaped};
+use crate::catalogue::{ArtworkId, CoverRequest, is_id_shaped};
+use crate::tidal::{MusicService, ServiceError};
 
 /// The most cover files one account keeps. Only files whose name parses as
 /// `<artwork id>.cover` count toward it.
 const MAX_COVERS: usize = 4000;
+
+/// The most covers one batch fetches. Hits and damaged files do not count, so
+/// they can never use up the batch. Requests past the cap are left out of the
+/// result, and the app asks for them again in the next batch.
+pub const MAX_FETCHES: usize = 24;
 
 /// The extension of a cover file.
 const COVER_EXTENSION: &str = "cover";
@@ -129,6 +135,69 @@ impl CoverCache {
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+/// What one cover request came to. One value per request, no loose flags.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CoverOutcome {
+    /// The cover is on disk at this path.
+    Ready(PathBuf),
+    /// No cover can come now: Tidal names no file, the body is not an image,
+    /// the put failed, or there is no usable token. The app asks again after
+    /// the next sync lands.
+    Unavailable,
+}
+
+/// The cover worker body. It first sweeps leftover temporary files. Then, for
+/// each request, a hit is `Ready` with no network. A miss with a token fetches
+/// through the service and puts the bytes, while fewer than [`MAX_FETCHES`]
+/// fetches ran. A miss with no token is `Unavailable`. One failure never stops
+/// the other requests, except `Unauthorized`, which marks the remaining misses
+/// `Unavailable` rather than spending more requests on a rejected token. The
+/// worker never refreshes a token, so it never races the sync or the profile
+/// fetch over one refresh token.
+pub fn resolve(
+    cache: &CoverCache,
+    service: &dyn MusicService,
+    token: Option<&str>,
+    requests: Vec<CoverRequest>,
+) -> Vec<(ArtworkId, CoverOutcome)> {
+    cache.sweep();
+    let mut fetches = 0;
+    let mut rejected = false;
+    let mut outcomes = Vec::with_capacity(requests.len());
+    for request in requests {
+        if let Some(path) = cache.get(&request.artwork) {
+            outcomes.push((request.artwork, CoverOutcome::Ready(path)));
+            continue;
+        }
+        let Some(token) = token.filter(|_| !rejected) else {
+            outcomes.push((request.artwork, CoverOutcome::Unavailable));
+            continue;
+        };
+        if fetches == MAX_FETCHES {
+            continue;
+        }
+        fetches += 1;
+        let outcome = match service.cover(token, &request) {
+            Ok(bytes) => match cache.put(&request.artwork, &bytes) {
+                Ok(path) => CoverOutcome::Ready(path),
+                Err(error) => {
+                    eprintln!("opentidal: cannot keep cover {}: {error:?}", request.artwork.as_str());
+                    CoverOutcome::Unavailable
+                }
+            },
+            Err(error) => {
+                if error == ServiceError::Unauthorized {
+                    rejected = true;
+                }
+                eprintln!("opentidal: cannot fetch cover {}: {error:?}", request.artwork.as_str());
+                CoverOutcome::Unavailable
+            }
+        };
+        outcomes.push((request.artwork, outcome));
+    }
+    outcomes
 }
 
 /// Whether a file name is `<artwork id>.cover`.
@@ -304,6 +373,149 @@ pub(crate) mod tests {
         cache.prune(1);
         assert_eq!(cache.get(&kept), None, "the oldest valid cover was not pruned");
         assert!(cache.get(&newer).is_some());
+    }
+
+    /// A service whose covers are the given artwork ids, answering `answer`.
+    fn service(answers: &[(&str, Result<Vec<u8>, ServiceError>)]) -> crate::tidal::FakeService {
+        crate::tidal::FakeService {
+            covers: answers.iter().map(|(id, a)| (id.to_string(), a.clone())).collect(),
+            ..crate::tidal::FakeService::default()
+        }
+    }
+
+    fn calls(service: &crate::tidal::FakeService) -> usize {
+        service.cover_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A request for an album cover with this artwork id.
+    fn request(artwork_id: &str) -> CoverRequest {
+        let mut cat = Catalogue::seed();
+        cat.absorb(CatalogueRows {
+            albums: vec![AlbumRow {
+                id: format!("album-{artwork_id}"),
+                title: "Cover test".into(),
+                artist: "seed-artist-0".into(),
+                cover: artwork_id.into(),
+            }],
+            ..CatalogueRows::default()
+        });
+        cat.album(&cat.album_id(&format!("album-{artwork_id}")).unwrap()).unwrap().cover_request().unwrap()
+    }
+
+    /// A miss fetches once, lands the bytes on disk, and reports the path. A
+    /// leftover temporary file from a crash is gone after the batch.
+    #[test]
+    fn a_miss_fetches_and_puts_the_cover() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(root.path());
+        std::fs::create_dir_all(&cache.dir).unwrap();
+        std::fs::write(cache.dir.join("old.cover.99.tmp"), b"half").unwrap();
+        let svc = service(&[("art-1", Ok(magenta()))]);
+
+        let outcomes = resolve(&cache, &svc, Some("tok"), vec![request("art-1")]);
+        let path = cache.path(&artwork("art-1"));
+        assert_eq!(outcomes, [(artwork("art-1"), CoverOutcome::Ready(path.clone()))]);
+        assert_eq!(std::fs::read(&path).unwrap(), magenta());
+        assert_eq!(calls(&svc), 1);
+        assert_eq!(names(&cache.dir), ["art-1.cover"], "the batch left a temporary file");
+    }
+
+    /// A second batch over the same root, as after a restart, fetches nothing.
+    #[test]
+    fn a_hit_makes_no_fetch() {
+        let root = tempfile::tempdir().unwrap();
+        let svc = service(&[("art-1", Ok(magenta()))]);
+        let first = resolve(&cache(root.path()), &svc, Some("tok"), vec![request("art-1")]);
+        let second = resolve(&cache(root.path()), &svc, Some("tok"), vec![request("art-1")]);
+        assert_eq!(first, second);
+        assert_eq!(calls(&svc), 1, "a hit fetched the cover again");
+    }
+
+    /// One cover that fails, or that is not an image, costs only itself.
+    #[test]
+    fn a_failed_cover_does_not_block_the_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(root.path());
+        let svc = service(&[
+            ("bad", Err(ServiceError::Http("500".to_string()))),
+            ("html", Ok(b"<html>".to_vec())),
+            ("good", Ok(magenta())),
+        ]);
+        let outcomes = resolve(&cache, &svc, Some("tok"), vec![request("bad"), request("html"), request("good")]);
+        assert_eq!(
+            outcomes,
+            [
+                (artwork("bad"), CoverOutcome::Unavailable),
+                (artwork("html"), CoverOutcome::Unavailable),
+                (artwork("good"), CoverOutcome::Ready(cache.path(&artwork("good")))),
+            ]
+        );
+        assert_eq!(names(&cache.dir), ["good.cover"]);
+    }
+
+    /// A rejected token stops the batch spending requests, but hits still land.
+    #[test]
+    fn a_rejected_token_stops_further_fetches() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(root.path());
+        cache.put(&artwork("hit"), &magenta()).unwrap();
+        let svc = service(&[
+            ("first", Err(ServiceError::Unauthorized)),
+            ("second", Ok(magenta())),
+        ]);
+        let outcomes = resolve(&cache, &svc, Some("tok"), vec![request("first"), request("hit"), request("second")]);
+        assert_eq!(calls(&svc), 1, "the batch kept fetching on a rejected token");
+        assert_eq!(outcomes[0], (artwork("first"), CoverOutcome::Unavailable));
+        assert_eq!(outcomes[1], (artwork("hit"), CoverOutcome::Ready(cache.path(&artwork("hit")))));
+        assert_eq!(outcomes[2], (artwork("second"), CoverOutcome::Unavailable));
+    }
+
+    /// With no usable token, hits are still served and misses are unavailable.
+    #[test]
+    fn no_token_still_serves_hits() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(root.path());
+        cache.put(&artwork("hit"), &magenta()).unwrap();
+        let svc = service(&[("miss", Ok(magenta()))]);
+        let outcomes = resolve(&cache, &svc, None, vec![request("hit"), request("miss")]);
+        assert_eq!(
+            outcomes,
+            [
+                (artwork("hit"), CoverOutcome::Ready(cache.path(&artwork("hit")))),
+                (artwork("miss"), CoverOutcome::Unavailable),
+            ]
+        );
+        assert_eq!(calls(&svc), 0);
+    }
+
+    /// Hits and damaged files never use up the cap. Past the cap a miss is left
+    /// out of the result, so it stays wanted for the next batch.
+    #[test]
+    fn only_fetches_count_toward_the_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(root.path());
+        let mut requests = Vec::new();
+        let mut answers = Vec::new();
+        for n in 0..MAX_FETCHES {
+            cache.put(&artwork(&format!("hit-{n}")), &magenta()).unwrap();
+            requests.push(request(&format!("hit-{n}")));
+        }
+        for n in 0..=MAX_FETCHES {
+            let id = format!("damaged-{n}");
+            std::fs::write(cache.path(&artwork(&id)), b"damaged").unwrap();
+            requests.push(request(&id));
+            answers.push((id, Ok(magenta())));
+        }
+        let answers: Vec<(&str, Result<Vec<u8>, ServiceError>)> =
+            answers.iter().map(|(id, a)| (id.as_str(), a.clone())).collect();
+        let svc = service(&answers);
+
+        let outcomes = resolve(&cache, &svc, Some("tok"), requests);
+        assert_eq!(calls(&svc), MAX_FETCHES, "the cap did not stop the fetches");
+        assert_eq!(outcomes.len(), 2 * MAX_FETCHES, "hits or damaged files used up the cap");
+        assert!(outcomes.iter().all(|(_, o)| matches!(o, CoverOutcome::Ready(_))));
+        let last = artwork(&format!("damaged-{MAX_FETCHES}"));
+        assert!(outcomes.iter().all(|(id, _)| id != &last), "a request past the cap got an outcome");
     }
 
     /// A cover whose decode failed is evicted, so the next request fetches it.

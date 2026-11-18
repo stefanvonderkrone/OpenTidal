@@ -151,7 +151,7 @@ impl<T: Ord + Clone> Members<T> {
 
 /// One remote list that a paged read fills. Not `Collection`, which names a
 /// folder of user playlists.
-#[expect(dead_code, reason = "no paged read names a list yet")]
+#[cfg_attr(not(test), expect(dead_code, reason = "the page worker is the first caller"))]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum RemoteList {
     Liked,

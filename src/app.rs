@@ -1423,6 +1423,15 @@ mod tests {
             fn library(&self, _token: &str, _user: &str) -> Result<crate::library::LibraryRows, ServiceError> {
                 Err(ServiceError::Unauthorized)
             }
+            fn page(
+                &self,
+                _token: &str,
+                _user: &str,
+                _of: &crate::library::RemoteList,
+                _after: Option<&tidal::Cursor>,
+            ) -> Result<tidal::Page, ServiceError> {
+                Err(ServiceError::Unauthorized)
+            }
             fn cover(&self, _token: &str, _cover: &crate::catalogue::CoverRequest) -> Result<Vec<u8>, ServiceError> {
                 Err(ServiceError::Unauthorized)
             }
@@ -2118,6 +2127,15 @@ mod tests {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(tidal_rows("A"))
             }
+            fn page(
+                &self,
+                _token: &str,
+                _user: &str,
+                _of: &crate::library::RemoteList,
+                _after: Option<&tidal::Cursor>,
+            ) -> Result<tidal::Page, ServiceError> {
+                Err(ServiceError::Http("unused".to_string()))
+            }
             fn cover(&self, _token: &str, _cover: &crate::catalogue::CoverRequest) -> Result<Vec<u8>, ServiceError> {
                 Err(ServiceError::Http("unused".to_string()))
             }
@@ -2407,6 +2425,15 @@ mod tests {
         }
         fn library(&self, token: &str, user: &str) -> Result<LibraryRows, ServiceError> {
             self.inner.library(token, user)
+        }
+        fn page(
+            &self,
+            token: &str,
+            user: &str,
+            of: &crate::library::RemoteList,
+            after: Option<&tidal::Cursor>,
+        ) -> Result<tidal::Page, ServiceError> {
+            self.inner.page(token, user, of, after)
         }
         fn cover(&self, token: &str, cover: &crate::catalogue::CoverRequest) -> Result<Vec<u8>, ServiceError> {
             let _ = self.gate.lock().unwrap().recv();

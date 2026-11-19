@@ -311,8 +311,9 @@ A pass obeys six rules.
    token. A fresh token Tidal rejects too ends the session. A renewal that
    fails without ending the grant stalls every pass that waited on it, and a
    later scroll retries the pass.
-6. Start no page while a cover batch runs. Pages and covers share one request
-   pacer, so a long sync would otherwise hold back the covers on screen. A page
+6. Start no page while a cover batch runs. Pages and the JSON reads of covers
+   share one request pacer, so a long sync would otherwise hold back the covers
+   on screen. Image downloads are not paced. A page
    already in flight finishes. Once the batch lands, the next page starts
    before the next batch does.
 
@@ -571,12 +572,19 @@ names the test that covers the code path, and no hand check has happened.
 | An artist page brings its albums | Read the artist albums fixture, assert the three albums, the report and an unchanged library | test: `an_artist_page_brings_its_albums` |
 | A detail route names its own read, a seed one none | Map Tidal and seed album and artist routes to their remote lists | test: `a_detail_route_names_its_remote_list_unless_it_is_seed` |
 | Opening an artist and then an album shows their details | Drive the details scene, open the artist, assert the albums only its read brings, open an album, assert its tracks and an unchanged library | test: `opening_an_artist_and_an_album_reads_their_details`. The two detail journeys assert the same headless |
-| An artist picture reads its profile art | Read the synthetic profile art fixture, assert the path and the file of the named artwork | test: `an_artist_cover_is_read_from_its_profile_art`, `only_a_tidal_artist_asks_for_a_cover` |
+| An artist picture reads its profile art | Serve a synthetic batched artist read for one artist, assert the `filter[id]` path and the file of the named artwork | test: `a_single_artist_cover_uses_the_batched_read`, `only_a_tidal_artist_asks_for_a_cover` |
+| Artist pictures come in one read per 20 artists | Serve a synthetic batched read for 21 artists, one dead and one with an empty `profileArt`, assert two `filter[id]` paths, each picture under its own artist, and no image read for the two with none | test: `a_batched_artist_read_maps_each_picture_to_its_artist` |
+| A failed batched read fails its whole chunk | Fail the read with a rate limit, assert every artist gets it and no image is read | test: `a_failed_batched_read_fails_its_whole_chunk` |
+| Twenty artist misses make one read | Resolve 20 artist misses, assert one batched read, no single cover read, and each picture on disk | test: `twenty_artist_misses_make_one_batched_read` |
+| An artist with no picture is unavailable | Resolve a dead artist and one with no profile art, assert both `Unavailable` and no file | test: `an_artist_with_no_picture_is_unavailable` |
+| A mixed batch keeps every outcome in place | Resolve albums and artists interleaved, assert each outcome in request order, three album reads and one artist read | test: `a_mixed_batch_keeps_every_outcome_in_place` |
+| Each artist picture counts toward the cap | Fill the cap with artist misses, add an album, assert the album gets no outcome and no read | test: `the_cap_counts_artist_pictures` |
+| Image downloads are not paced | A loopback server answers one JSON read and three image reads, assert the fake clock never slept | test: `an_image_read_is_not_paced`, `the_pacer_keeps_its_minimum_gap` |
 | A decoded artist picture appears on screen | Drive `features/artist-detail`, assert `hero-cover-image` and the magenta share inside its rect | `scripts/pixel-assert.py` on the `features/artist-detail` drive, by hand on 2026-11-19 against the fake service. This is not a live check |
 | An artist card in the Artists grid shows the artist picture | Drive the details scene, open Artists, assert `cover-image` on `artist-0` and no gradient | test: `an_artist_card_shows_the_artist_picture`. The artist-grid journey asserts the same headless. A scratch live drive on 2026-11-19 showed 70 cover-image nodes on the Artists grid with a warm cache |
 | An album whose artist no page includes keeps its tracks | Absorb an album and a track that name an absent artist, assert both resolve under "Unknown artist" with no drop, then absorb the artist and assert the name changes in place | test: `an_album_whose_artist_is_missing_keeps_its_tracks` |
 | A live liked page keeps its albums | Sign in with a real account, read Liked Songs, assert no drop in the log | live: 2026-11-19. The old build dropped 18 albums and 20 tracks per liked page. After the artist stub fix, a scratch drive that opened the album, artist and playlist details logged zero drop lines. The include is covered by `http_pages_read_one_response_per_call`() and the stub by `an_album_whose_artist_is_missing_keeps_its_tracks`() |
-| A real artist shows its albums and picture | Sign in with a real account, open an artist, compare with the Tidal app | live: 2026-11-19. A scratch drive showed 11 album cards and a decoded `hero-cover-image` on the artist screen. The read is covered by `an_artist_page_brings_its_albums`() and `an_artist_cover_is_read_from_its_profile_art`() |
+| A real artist shows its albums and picture | Sign in with a real account, open an artist, compare with the Tidal app | live: 2026-11-19. A scratch drive showed 11 album cards and a decoded `hero-cover-image` on the artist screen. The read is covered by `an_artist_page_brings_its_albums`() and `a_single_artist_cover_uses_the_batched_read`(). That drive used the old per-artist profileArt read. No live drive of the batched read ran with this change |
 | A real album shows its tracks | Sign in with a real account, open an album, assert its track rows | live: 2026-11-19. A scratch drive showed 23 track rows on the album screen and the status `Up to date with Tidal.` |
 | A real Tidal playlist shows its tracks | Sign in with a real account, open a Tidal playlist, assert its track rows | live: 2026-11-19. A scratch drive showed track rows on the playlist detail screen |
 | Tidal limits rapid requests | Send ten rapid paced-free page requests, observe `429 Too Many Requests` | live: 2026-11-18, plus `a_rate_limited_page_call_is_retried_and_lands`() |

@@ -88,8 +88,28 @@ remote list has its own pass and its own endpoints:
 
 An album's tracks and an artist's albums own no list in the library. Their
 pages fill the catalogue, and the album and artist screens draw what the
-catalogue holds for that album or artist. An artist's picture comes from
-`GET /artists/<id>/relationships/profileArt?include=profileArt`.
+catalogue holds for that album or artist.
+
+Artist pictures come from one batched read per 20 artists:
+`GET /artists?filter%5Bid%5D=<id>%2C<id>...&include=profileArt`. Each artist
+in `data` names its artwork in `relationships.profileArt.data[0].id`, and the
+artwork in `included` carries `files[].href` and `meta.width`, the shape an
+album cover has. The read takes at most 20 ids, because 50 ids answered `400`.
+The answers come back in request order, one per artist. An artist with an
+empty `profileArt`, an id Tidal does not know, or an artwork missing from
+`included` has no picture. That is not an error, so it is not logged. The cover
+is `Unavailable`, so the app asks again only after the next page lands, not in
+the next batch. A read that fails fails every artist of its chunk
+with the same error, so a rate limit defers them all.
+
+An artist picture is cached under the key `artist-<id>`, not under its artwork
+id, because only the batched read names the artwork. A cached picture is
+therefore never fetched again, and a picture the artist changes on Tidal stays
+stale until its cache file is removed.
+
+The request pacer spaces only the JSON:API reads on `openapi.tidal.com`. Image
+downloads from `resources.tidal.com` go out with no pacing, because that host
+answered 30 rapid requests with no `429`.
 
 The live reads below cover these endpoints and the nested include strings.
 
@@ -195,6 +215,14 @@ change that uses them. No live run of the app followed.
   tried.
 - `GET /artists/{id}/relationships/profileArt?include=profileArt` returned one
   artwork with `files[].href` and `meta.width`, the shape of an album cover.
+  The app no longer uses this read. The batched read below replaced it.
+- `GET /artists?filter%5Bid%5D=<20 ids>&include=profileArt` returned `200`
+  with 20 artists in `data`, 20 artworks in `included`, and no `links.next`.
+  The same read with 50 ids and with 100 ids answered `400`.
+- The batched read with 7 ids, one of them dead, returned 6 artists and 6
+  artworks. The dead id was absent, with no error.
+- 30 rapid unpaced GETs to `resources.tidal.com` all answered `200`, in 1.39 s
+  in total.
 
 ## Throughput checkpoint
 

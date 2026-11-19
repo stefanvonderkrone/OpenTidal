@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::auth::{OAuthConfig, Token};
-use crate::catalogue::{AlbumRow, ArtistRow, CatalogueRows, CoverOwner, CoverRequest, PlaylistRow, TrackRow};
+use crate::catalogue::{AlbumRow, ArtistRow, ArtworkId, CatalogueRows, CoverOwner, CoverRequest, PlaylistRow, TrackRow};
 use crate::library::RemoteList;
 
 /// A Tidal user id, an opaque string. The newtype keeps it from being mistaken
@@ -47,6 +47,9 @@ pub enum ServiceError {
     Paging(String),
     /// The service kept answering `429` after every retry the pacer allows.
     RateLimited(String),
+    /// The artist has no profile art, or Tidal does not know the artist. Not a
+    /// failure, so it is never logged.
+    NoPicture,
 }
 
 /// Where the next page of a remote list starts. The fields are private, so only
@@ -97,7 +100,16 @@ pub trait MusicService: Send + Sync {
     /// The bytes of one cover, near [`COVER_PX`] wide. Unchecked: the cover
     /// cache checks them before a put.
     fn cover(&self, token: &str, cover: &CoverRequest) -> Result<Vec<u8>, ServiceError>;
+    /// The pictures of many artists, one result per request, in request order.
+    /// An artist with no picture is [`ServiceError::NoPicture`].
+    fn artist_pictures(&self, token: &str, requests: &[CoverRequest]) -> Vec<(ArtworkId, Result<Vec<u8>, ServiceError>)> {
+        requests.iter().map(|request| (request.artwork.clone(), self.cover(token, request))).collect()
+    }
 }
+
+/// The most artist ids one `filter[id]` read takes. 20 answered live, and 50
+/// answered `400`.
+const ARTIST_BATCH: usize = 20;
 
 /// The width a cover fetch asks for: 168 pt cards and 200 pt heroes at 2x.
 pub const COVER_PX: u64 = 640;
@@ -115,6 +127,9 @@ pub struct FakeService {
     pub covers: BTreeMap<String, Result<Vec<u8>, ServiceError>>,
     /// How many times `cover` ran, so a test proves a hit made no fetch.
     pub cover_calls: AtomicUsize,
+    /// How many batched artist reads `HttpService` would make for the
+    /// `artist_pictures` calls so far: one per [`ARTIST_BATCH`] requests.
+    pub artist_picture_calls: AtomicUsize,
 }
 
 impl Default for FakeService {
@@ -124,6 +139,7 @@ impl Default for FakeService {
             pages: BTreeMap::new(),
             covers: BTreeMap::new(),
             cover_calls: AtomicUsize::new(0),
+            artist_picture_calls: AtomicUsize::new(0),
         }
     }
 }
@@ -157,6 +173,17 @@ impl MusicService for FakeService {
             .cloned()
             .unwrap_or_else(|| Err(ServiceError::Http("404".to_string())))
     }
+    /// Answers from the cover map. An artist with no entry has no picture.
+    fn artist_pictures(&self, _token: &str, requests: &[CoverRequest]) -> Vec<(ArtworkId, Result<Vec<u8>, ServiceError>)> {
+        self.artist_picture_calls.fetch_add(requests.chunks(ARTIST_BATCH).count(), Ordering::SeqCst);
+        requests
+            .iter()
+            .map(|request| {
+                let answer = self.covers.get(request.artwork.as_str()).cloned().unwrap_or(Err(ServiceError::NoPicture));
+                (request.artwork.clone(), answer)
+            })
+            .collect()
+    }
 }
 
 /// The time source the pacer waits on. Tests pass a fake, so no test sleeps.
@@ -186,9 +213,11 @@ const MAX_RETRIES: u32 = 4;
 /// The most one request waits on `429` answers before it gives up.
 const MAX_WAIT: Duration = Duration::from_secs(60);
 
-/// Spaces every request of one service by [`MIN_GAP`] and retries a `429`.
-/// The service and the cover worker share it, so a `429` on one thread holds
-/// back the other as well.
+/// Spaces every JSON:API request of one service by [`MIN_GAP`] and retries a
+/// `429`. It paces only `openapi.tidal.com`. Image downloads go to
+/// `resources.tidal.com`, which answered 30 rapid requests with no `429`. The
+/// service and the cover worker share it, so a `429` on one thread holds back
+/// the other as well.
 struct Pacer {
     clock: Arc<dyn Clock>,
     /// The earliest time the next request may start.
@@ -299,16 +328,16 @@ impl HttpService {
 
     /// GET an image with no `Authorization` header, a 15 s timeout, and a body
     /// cap of [`MAX_COVER_BYTES`]. It takes no token, so the token cannot reach
-    /// the image host.
+    /// the image host. The pacer does not hold it back, because the image host
+    /// is not the JSON:API host the pacer protects.
     fn get_image(&self, url: &reqwest::Url) -> Result<Vec<u8>, ServiceError> {
         use std::io::Read;
-        let resp = self.pacer.send("a cover image", || {
-            self.client
-                .get(url.clone())
-                .timeout(std::time::Duration::from_secs(15))
-                .send()
-                .map_err(|e| ServiceError::Http(e.to_string()))
-        })?;
+        let resp = self
+            .client
+            .get(url.clone())
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .map_err(|e| ServiceError::Http(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(ServiceError::Http(format!("{status} for a cover image")));
@@ -350,6 +379,10 @@ impl MusicService for HttpService {
 
     fn cover(&self, token: &str, cover: &CoverRequest) -> Result<Vec<u8>, ServiceError> {
         fetch_cover(&mut |path: &str| self.get_doc(token, path), &mut |url| self.get_image(url), cover)
+    }
+
+    fn artist_pictures(&self, token: &str, requests: &[CoverRequest]) -> Vec<(ArtworkId, Result<Vec<u8>, ServiceError>)> {
+        fetch_artist_pictures(&mut |path: &str| self.get_doc(token, path), &mut |url| self.get_image(url), requests)
     }
 }
 
@@ -755,47 +788,97 @@ fn fetch_page(
     Ok(Page { rows, members, next })
 }
 
-/// The relationship read of a cover's owner, with the artwork included. These
-/// are the three pinned third-party endpoints in the manifest.
-fn cover_path(owner: &CoverOwner) -> String {
+/// The `coverArt` read of an album or a playlist, with the artwork included.
+fn cover_path(owner: &CoverOwner) -> Option<String> {
     match owner {
-        CoverOwner::Album(id) => format!("/albums/{}/relationships/coverArt?include=coverArt", id.as_str()),
-        CoverOwner::Playlist(id) => format!("/playlists/{}/relationships/coverArt?include=coverArt", id.as_str()),
-        CoverOwner::Artist(id) => format!("/artists/{}/relationships/profileArt?include=profileArt", id.as_str()),
+        CoverOwner::Album(id) => Some(format!("/albums/{}/relationships/coverArt?include=coverArt", id.as_str())),
+        CoverOwner::Playlist(id) => Some(format!("/playlists/{}/relationships/coverArt?include=coverArt", id.as_str())),
+        CoverOwner::Artist(_) => None,
     }
 }
 
+/// The batched read of up to [`ARTIST_BATCH`] artists with their profile art.
+/// The brackets and the commas are percent-encoded.
+fn artists_path(ids: &[&str]) -> String {
+    format!("/artists?filter%5Bid%5D={}&include=profileArt", ids.join("%2C"))
+}
+
+type ImageSource<'a> = dyn FnMut(&reqwest::Url) -> Result<Vec<u8>, ServiceError> + 'a;
+
 /// The whole cover read, over any sources. `get_doc` carries the bearer token
 /// to the service. `get_image` takes only a URL, so the token cannot reach the
-/// image host by construction.
+/// image host by construction. An artist goes through the batched read.
 ///
-/// The response shape is synthetic: the included artwork is matched by id
-/// only, because its type is `coverArts` in the library fixtures and
-/// `artworks` in the spec, and neither is proven live.
-fn fetch_cover(
-    get_doc: &mut PageSource,
-    get_image: &mut dyn FnMut(&reqwest::Url) -> Result<Vec<u8>, ServiceError>,
-    cover: &CoverRequest,
-) -> Result<Vec<u8>, ServiceError> {
-    let doc = get_doc(&cover_path(&cover.owner))?;
-    // An artist's cover is keyed by the artist, so its artwork is the one the
-    // relationship names.
-    let named = match &cover.owner {
-        CoverOwner::Artist(_) => doc.resources().next().map(|r| r.id.as_str()),
-        CoverOwner::Album(_) | CoverOwner::Playlist(_) => Some(cover.artwork.as_str()),
+/// The included artwork is matched by id only, because its type is
+/// `coverArts` in the library fixtures and `artworks` in the spec.
+fn fetch_cover(get_doc: &mut PageSource, get_image: &mut ImageSource, cover: &CoverRequest) -> Result<Vec<u8>, ServiceError> {
+    let Some(path) = cover_path(&cover.owner) else {
+        let mut one = fetch_artist_pictures(get_doc, get_image, std::slice::from_ref(cover));
+        return one.pop().map_or(Err(ServiceError::NoPicture), |(_, result)| result);
     };
+    let doc = get_doc(&path)?;
     let artwork = doc
         .included
         .iter()
-        .find(|r| Some(r.id.as_str()) == named)
+        .find(|r| r.id == cover.artwork.as_str())
         .ok_or_else(|| ServiceError::Decode("the cover response does not include its artwork".to_string()))?;
+    get_image(&file_url(artwork)?)
+}
+
+/// The pictures of many artists, one `filter[id]` read per [`ARTIST_BATCH`]
+/// requests, then one image read per picture. One result per request, in
+/// request order. A failed read fails every request of its chunk. An id Tidal
+/// does not know is absent from the answer, so it has no picture, the same as
+/// an artist with an empty `profileArt`. A request that is not an artist's
+/// takes the single cover read.
+fn fetch_artist_pictures(
+    get_doc: &mut PageSource,
+    get_image: &mut ImageSource,
+    requests: &[CoverRequest],
+) -> Vec<(ArtworkId, Result<Vec<u8>, ServiceError>)> {
+    let mut results = Vec::with_capacity(requests.len());
+    for chunk in requests.chunks(ARTIST_BATCH) {
+        let ids: Vec<&str> = chunk
+            .iter()
+            .filter_map(|r| match &r.owner {
+                CoverOwner::Artist(id) => Some(id.as_str()),
+                CoverOwner::Album(_) | CoverOwner::Playlist(_) => None,
+            })
+            .collect();
+        let doc = if ids.is_empty() { None } else { Some(get_doc(&artists_path(&ids))) };
+        for request in chunk {
+            let result = match (&request.owner, &doc) {
+                (CoverOwner::Artist(id), Some(Ok(doc))) => artist_picture(doc, id.as_str(), get_image),
+                (CoverOwner::Artist(_), Some(Err(error))) => Err(error.clone()),
+                _ => fetch_cover(get_doc, get_image, request),
+            };
+            results.push((request.artwork.clone(), result));
+        }
+    }
+    results
+}
+
+/// One artist's picture from a batched read: the artwork its `profileArt`
+/// names, found in `included`.
+fn artist_picture(doc: &Document, artist: &str, get_image: &mut ImageSource) -> Result<Vec<u8>, ServiceError> {
+    let named = doc
+        .resources()
+        .find(|r| r.id == artist)
+        .map(|r| r.first("profileArt"))
+        .filter(|id| !id.is_empty())
+        .ok_or(ServiceError::NoPicture)?;
+    let artwork = doc.included.iter().find(|r| r.id == named).ok_or(ServiceError::NoPicture)?;
+    get_image(&file_url(artwork)?)
+}
+
+/// The https URL of the file [`pick_file`] chooses from an artwork.
+fn file_url(artwork: &Resource) -> Result<reqwest::Url, ServiceError> {
     let href = pick_file(artwork.attributes.as_ref())
         .ok_or_else(|| ServiceError::Decode("the artwork names no file".to_string()))?;
-    let url = reqwest::Url::parse(&href)
+    reqwest::Url::parse(&href)
         .ok()
         .filter(|url| url.scheme() == "https" && url.host_str().is_some_and(|h| !h.is_empty()))
-        .ok_or_else(|| ServiceError::Decode(format!("a cover link is not an https URL: {href}")))?;
-    get_image(&url)
+        .ok_or_else(|| ServiceError::Decode(format!("a cover link is not an https URL: {href}")))
 }
 
 /// The href of the smallest file at least [`COVER_PX`] wide, else the widest.
@@ -1299,20 +1382,125 @@ mod tests {
         assert_eq!(
             cover_path(&CoverOwner::Playlist(
                 crate::catalogue::Catalogue::seed().playlist_id("seed-playlist-0").unwrap()
-            )),
-            "/playlists/seed-playlist-0/relationships/coverArt?include=coverArt"
+            ))
+            .as_deref(),
+            Some("/playlists/seed-playlist-0/relationships/coverArt?include=coverArt")
         );
     }
 
-    /// An artist's cover reads its `profileArt` relationship and fetches a file
-    /// of the artwork the relationship names, not of another included one.
+    /// Artist cover requests for these Tidal artist ids, in order.
+    fn artist_requests(ids: &[String]) -> Vec<CoverRequest> {
+        let mut cat = crate::catalogue::Catalogue::seed();
+        cat.absorb(CatalogueRows {
+            artists: ids.iter().map(|id| ArtistRow { id: id.clone(), name: format!("Artist {id}") }).collect(),
+            ..CatalogueRows::default()
+        });
+        ids.iter().map(|id| cat.artist(&cat.artist_id(id).unwrap()).unwrap().cover_request().unwrap()).collect()
+    }
+
+    /// A batched artist read in the live shape: each artist names its artwork
+    /// in `relationships.profileArt`, and the artworks are in `included`, in
+    /// another order than the artists. `art` maps an artist id to its artwork
+    /// id, or to `None` for an empty `profileArt`.
+    fn artists_doc(art: &[(&str, Option<String>)]) -> Document {
+        let data: Vec<Value> = art
+            .iter()
+            .map(|(id, artwork)| {
+                let named: Vec<Value> = artwork.iter().map(|a| serde_json::json!({ "type": "artworks", "id": a })).collect();
+                serde_json::json!({ "type": "artists", "id": id, "attributes": { "name": id },
+                    "relationships": { "profileArt": { "data": named } } })
+            })
+            .collect();
+        let included: Vec<Value> = art
+            .iter()
+            .rev()
+            .filter_map(|(id, artwork)| {
+                let artwork = artwork.as_ref()?;
+                Some(serde_json::json!({ "type": "artworks", "id": artwork, "attributes": { "files": [
+                    { "href": format!("https://resources.tidal.com/images/{id}/160x160.jpg"), "meta": { "width": 160 } },
+                    { "href": format!("https://resources.tidal.com/images/{id}/750x750.jpg"), "meta": { "width": 750 } },
+                ] } }))
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({ "data": data, "included": included })).unwrap()
+    }
+
+    /// Twenty-one artists take two reads: one `filter[id]` read of the first
+    /// twenty, then one of the last. Each artist gets the image of the artwork
+    /// its own `profileArt` names. A dead id is absent from the answer and an
+    /// empty `profileArt` names nothing, so both have no picture and cost no
+    /// image read.
     #[test]
-    fn an_artist_cover_is_read_from_its_profile_art() {
-        let cat = holding_currents();
-        let request = cat.artist(&cat.artist_id(TAME_IMPALA).unwrap()).unwrap().cover_request().unwrap();
-        let (result, paths, images) = read_cover(&fixture_body("artist-profile-art.json"), &request);
+    fn a_batched_artist_read_maps_each_picture_to_its_artist() {
+        let ids: Vec<String> = (1000..1021).map(|n| n.to_string()).collect();
+        let requests = artist_requests(&ids);
+        let dead = "1019";
+        let bare = "1020";
+        let art: Vec<(&str, Option<String>)> = ids
+            .iter()
+            .filter(|id| id.as_str() != dead)
+            .map(|id| (id.as_str(), (id != bare).then(|| format!("{id}-art"))))
+            .collect();
+        let mut paths = Vec::new();
+        let mut images = Vec::new();
+        let results = fetch_artist_pictures(
+            &mut |path: &str| {
+                paths.push(path.to_owned());
+                Ok(artists_doc(&art))
+            },
+            &mut |url| {
+                images.push(url.to_string());
+                Ok(url.to_string().into_bytes())
+            },
+            &requests,
+        );
+
+        let first: Vec<&str> = ids[..20].iter().map(String::as_str).collect();
+        assert_eq!(
+            paths,
+            [
+                format!("/artists?filter%5Bid%5D={}&include=profileArt", first.join("%2C")),
+                "/artists?filter%5Bid%5D=1020&include=profileArt".to_string(),
+            ]
+        );
+        assert_eq!(results.len(), ids.len(), "a request got no result");
+        for ((artwork, result), id) in results.iter().zip(&ids) {
+            assert_eq!(artwork.as_str(), format!("artist-{id}"), "a result is out of request order");
+            let expected = if id == dead || id == bare {
+                Err(ServiceError::NoPicture)
+            } else {
+                Ok(format!("https://resources.tidal.com/images/{id}/750x750.jpg").into_bytes())
+            };
+            assert_eq!(result, &expected, "artist {id} got the wrong picture");
+        }
+        assert_eq!(images.len(), 19, "an artist with no picture made an image read");
+    }
+
+    /// A failed batched read fails every artist of its chunk with that error,
+    /// so a rate limit defers them all rather than calling them pictureless.
+    #[test]
+    fn a_failed_batched_read_fails_its_whole_chunk() {
+        let ids: Vec<String> = (2000..2003).map(|n| n.to_string()).collect();
+        let results = fetch_artist_pictures(
+            &mut |_: &str| Err(ServiceError::RateLimited("429".to_string())),
+            &mut |_| panic!("an image was read after a failed read"),
+            &artist_requests(&ids),
+        );
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|(_, r)| r == &Err(ServiceError::RateLimited("429".to_string()))));
+    }
+
+    /// A single artist cover goes through the same batched read.
+    #[test]
+    fn a_single_artist_cover_uses_the_batched_read() {
+        let request = artist_requests(&["1566".to_string()]).remove(0);
+        let doc = r#"{"data":[{"type":"artists","id":"1566","attributes":{},
+            "relationships":{"profileArt":{"data":[{"type":"artworks","id":"a1b2c3d4"}]}}}],
+            "included":[{"type":"artworks","id":"a1b2c3d4","attributes":{"files":[
+            {"href":"https://resources.tidal.com/images/a1b2c3d4/750x750.jpg","meta":{"width":750}}]}}]}"#;
+        let (result, paths, images) = read_cover(doc, &request);
         assert_eq!(result, Ok(b"image".to_vec()));
-        assert_eq!(paths, ["/artists/1566/relationships/profileArt?include=profileArt"]);
+        assert_eq!(paths, ["/artists?filter%5Bid%5D=1566&include=profileArt"]);
         assert_eq!(images, ["https://resources.tidal.com/images/a1b2c3d4/750x750.jpg"]);
     }
 
@@ -1663,16 +1851,31 @@ mod tests {
         let (base, server) = serve(3, move |_, _| {
             seen.lock().unwrap().push(server_clock.now());
             server_clock.advance(Duration::from_millis(100));
-            reply("200 OK", "", "img")
+            reply("200 OK", "", "{}")
         });
         let svc = HttpService::with_clock(&format!("{base}/v2"), clock.clone());
-        let url = reqwest::Url::parse(&format!("{base}/image.jpg")).unwrap();
         for _ in 0..3 {
-            assert_eq!(svc.get_image(&url), Ok(b"img".to_vec()));
+            assert!(svc.get_doc("tok", "/users/me").is_ok());
         }
         server.join().unwrap();
         let started = started.lock().unwrap();
         let gaps: Vec<Duration> = started.windows(2).map(|w| w[1] - w[0]).collect();
         assert_eq!(gaps, [MIN_GAP, MIN_GAP], "requests went closer than the minimum gap");
+    }
+
+    /// Image reads go to the image host, which the pacer does not guard, so
+    /// back-to-back image reads never wait, even right after a paced read.
+    #[test]
+    fn an_image_read_is_not_paced() {
+        let clock = FakeClock::new();
+        let (base, server) = serve(4, |_, _| reply("200 OK", "", "{}"));
+        let svc = HttpService::with_clock(&format!("{base}/v2"), clock.clone());
+        assert!(svc.get_doc("tok", "/users/me").is_ok());
+        let url = reqwest::Url::parse(&format!("{base}/image.jpg")).unwrap();
+        for _ in 0..3 {
+            assert_eq!(svc.get_image(&url), Ok(b"{}".to_vec()));
+        }
+        server.join().unwrap();
+        assert_eq!(clock.sleeps(), [] as [Duration; 0], "an image read waited on the pacer");
     }
 }

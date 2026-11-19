@@ -47,6 +47,7 @@ The journeys:
 | `paged` | A scroll on a long Albums list reads the page its rows need. |
 | `artist-detail` | Opening an artist reads its albums and shows its picture. |
 | `album-detail` | Opening an album from an artist reads the album's tracks. |
+| `artist-grid` | The Artists grid shows a followed artist's picture on its card. |
 
 The `sign-in` journey runs against the deterministic fake service, which signs
 in at once, so no browser or network is needed headless. The `signed-in` scene
@@ -108,12 +109,13 @@ scripts/control-opentidal drive features/paged/script.json artifacts/paged --sce
 scripts/tree-assert.py artifacts/paged/tree.json has=paged-album-0 has=paged-album-50 has=album-50
 ```
 
-The two detail journeys start from the `signed-in-details` scene. Its fake
-service follows one artist. The artist's read brings three albums, and the
-second album's read brings two tracks. Only the artist read brings
-`album-1` and `album-2`, and only the album read brings `detail-track-1`. The
+The two detail journeys and `artist-grid` start from the `signed-in-details`
+scene. Its fake service follows one artist. The artist's read brings three
+albums, and the second album's read brings two tracks. Only the artist read
+brings `album-1` and `album-2`, and only the album read brings `detail-track-1`. The
 artist's profile art is the magenta PNG, so the pixel check reads it inside the
-`hero-cover-image` rect:
+`hero-cover-image` rect on the artist screen and inside the `cover-image` rect
+of the artist's card in the Artists grid:
 
 ```sh
 export OPENTIDAL_DB="$(mktemp -d)/scene.db"
@@ -123,4 +125,9 @@ scripts/pixel-assert.py artifacts/artist-detail/frame.png artifacts/artist-detai
 
 scripts/control-opentidal drive features/album-detail/script.json artifacts/album-detail --scene signed-in-details
 scripts/tree-assert.py artifacts/album-detail/tree.json "text=hero-title=Second Album" has=detail-track-1 has=track-0 has=track-1
+
+export OPENTIDAL_DB="$(mktemp -d)/scene.db"
+scripts/control-opentidal drive features/artist-grid/script.json artifacts/artist-grid --scene signed-in-details
+scripts/tree-assert.py artifacts/artist-grid/tree.json has=artist-0 has=cover-image absent=cover
+scripts/pixel-assert.py artifacts/artist-grid/frame.png artifacts/artist-grid/tree.json cover-image ff00ff 0.9
 ```

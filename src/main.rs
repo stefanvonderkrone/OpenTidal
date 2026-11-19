@@ -743,6 +743,16 @@ mod tests {
         assert_eq!(p.rt.state.core.lib, before, "a detail read changed the library");
     }
 
+    /// The Artists grid draws each artist's profile art, not only the gradient.
+    #[test]
+    fn an_artist_card_shows_the_artist_picture() {
+        let scratch = Scratch::new("artist-card");
+        let mut p = Paged::open_scene(&scratch.db(), false, signed_in_details_scene);
+        p.rt.update(|a, _| state::open_section(&mut a.core, Route::Artists));
+        p.until("showed the artist's picture on its card", |p| p.shows("artist-0/cover-image"));
+        assert!(!p.shows("artist-0/cover"), "the card kept its gradient beside the picture");
+    }
+
     /// The first page holds five albums, so the rows in view want more, and
     /// album 50 sits on a page only a scroll asks for.
     #[test]

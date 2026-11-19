@@ -82,7 +82,7 @@ fn album_card(pos: usize, a: &Album, cat: &Catalogue, covers: Covers<'_>, t: tok
     card(&format!("album-{pos}"), art, &a.title, artist_name(cat, &a.artist), Route::Album(a.id.clone()), t)
 }
 
-fn artist_card(pos: usize, a: &Artist, t: tok::Theme) -> El {
+fn artist_card(pos: usize, a: &Artist, covers: Covers<'_>, t: tok::Theme) -> El {
     let id = a.id.clone();
     col().key(format!("artist-{pos}"))
         .w(120.0)
@@ -91,7 +91,7 @@ fn artist_card(pos: usize, a: &Artist, t: tok::Theme) -> El {
             app.rename.clear();
             state::open_detail(&mut app.core, &app.catalogue, Route::Artist(id.clone()))
         })
-        .child(placeholder_art("cover", placeholder_seed(a.id.as_str()), 120.0, 60.0, t))
+        .child(cover_art("cover", &covers.artist(a), 120.0, 60.0, t))
         .child(text(&a.name).key("name").font(type_::BODY).color(t.text).center())
 }
 
@@ -307,8 +307,8 @@ fn all_albums_grid(cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
     grid(cards, 5)
 }
 
-fn all_artists_grid(cat: &Catalogue, t: tok::Theme) -> El {
-    let cards: Vec<El> = cat.artists().enumerate().map(|(i, a)| artist_card(i, a, t)).collect();
+fn all_artists_grid(cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
+    let cards: Vec<El> = cat.artists().enumerate().map(|(i, a)| artist_card(i, a, covers, t)).collect();
     grid(cards, 6)
 }
 
@@ -358,7 +358,7 @@ pub fn popular(s: &State, cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) ->
         .child(tab("Albums", PopularTab::Albums, s, t))
         .child(tab("Tracks", PopularTab::Tracks, s, t));
     let body = match s.popular_tab {
-        PopularTab::Artists => all_artists_grid(cat, t),
+        PopularTab::Artists => all_artists_grid(cat, covers, t),
         PopularTab::Albums => all_albums_grid(cat, covers, t),
         PopularTab::Tracks => track_list(cat.tracks().collect(), s.now_playing.as_ref(), cat, t),
     };
@@ -439,7 +439,7 @@ pub fn artists(app: &App, t: tok::Theme) -> El {
     } else {
         remote_rows(app, "rows", list.clone(), |a: &App| Cow::Borrowed(&a.core.lib.followed[..]), 6, 160.0, move |a: &App, pos, id: &ArtistId| {
             match a.catalogue.artist(id) {
-                Some(artist) => artist_card(pos, artist, t),
+                Some(artist) => artist_card(pos, artist, a.covers(), t),
                 None => el(),
             }
         })
@@ -661,7 +661,7 @@ pub fn search(cat: &Catalogue, covers: Covers<'_>, t: tok::Theme, edit: &TextEdi
             .enumerate().map(|(i, a)| album_card(i, a, cat, covers, t)).collect();
         let artists: Vec<El> = cat.artists()
             .filter(|a| matches(&a.name))
-            .enumerate().map(|(i, a)| artist_card(i, a, t)).collect();
+            .enumerate().map(|(i, a)| artist_card(i, a, covers, t)).collect();
         let tracks: Vec<El> = cat.tracks()
             .filter(|tr| matches(&tr.title) || matches(artist_name(cat, &tr.artist)))
             .enumerate().map(|(i, tr)| track_row(i, tr, false, cat, t)).collect();

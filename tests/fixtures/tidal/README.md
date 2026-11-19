@@ -14,8 +14,11 @@ Track credits arrive through `include=credits` on a track request. The separate
 credits endpoints need internal access, so no fixture uses them.
 
 Each track carries `albums` and `artists` relationships, and each page includes
-the album and artist resources it names, because the sync asks for
-`include=items,items.albums,items.artists`. `owned-playlists.json` answers
+the album and artist resources it names, because the read asks for
+`include=items,items.albums,items.artists,items.albums.coverArt,items.albums.artists`.
+Each included album carries its own `artists` relationship. Without
+`items.albums.artists` the live service sends an album with no artist, and the
+catalogue drops it and every track on it. `owned-playlists.json` answers
 `/playlists?filter[owners.id]=<uid>`. It lists one playlist that is also
 favorited, so a test can prove that the read fetches its items once.
 `owned-playlist-items.json` holds the items of the other one.

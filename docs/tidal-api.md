@@ -70,7 +70,7 @@ A pass reads one remote list from its first page, one page per call. Each
 remote list has its own pass and its own endpoints:
 
 - Liked tracks:
-  `GET /userCollectionTracks/me/relationships/items?include=items,items.albums,items.artists,items.albums.coverArt`
+  `GET /userCollectionTracks/me/relationships/items?include=items,items.albums,items.artists,items.albums.coverArt,items.albums.artists`
 - Saved albums:
   `GET /userCollectionAlbums/me/relationships/items?include=items,items.artists,items.coverArt`
 - Followed artists: `GET /userCollectionArtists/me/relationships/items?include=items`
@@ -78,7 +78,7 @@ remote list has its own pass and its own endpoints:
   `GET /userCollectionPlaylists/me/relationships/items?include=items,items.coverArt`,
   then the owned playlists from `GET /playlists?filter%5Bowners.id%5D=<uid>`
 - The tracks of one Tidal playlist:
-  `GET /playlists/<id>/relationships/items?include=items,items.albums,items.artists,items.albums.coverArt`
+  `GET /playlists/<id>/relationships/items?include=items,items.albums,items.artists,items.albums.coverArt,items.albums.artists`
 
 The live reads below cover these endpoints and the nested include strings.
 

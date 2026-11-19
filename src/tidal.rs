@@ -693,7 +693,7 @@ fn under_base(prefix: &str, next: &str) -> Result<String, ServiceError> {
 }
 
 const LIKED: &str =
-    "/userCollectionTracks/me/relationships/items?include=items,items.albums,items.artists,items.albums.coverArt";
+    "/userCollectionTracks/me/relationships/items?include=items,items.albums,items.artists,items.albums.coverArt,items.albums.artists";
 const SAVED: &str = "/userCollectionAlbums/me/relationships/items?include=items,items.artists,items.coverArt";
 const FOLLOWED: &str = "/userCollectionArtists/me/relationships/items?include=items";
 const FAVORITED: &str = "/userCollectionPlaylists/me/relationships/items?include=items,items.coverArt";
@@ -705,7 +705,9 @@ fn owned(user: &str) -> String {
 }
 
 fn playlist_items(id: &str) -> String {
-    format!("/playlists/{id}/relationships/items?include=items,items.albums,items.artists,items.albums.coverArt")
+    format!(
+        "/playlists/{id}/relationships/items?include=items,items.albums,items.artists,items.albums.coverArt,items.albums.artists"
+    )
 }
 
 /// One page of `of`, over any page source. `after: None` starts at the first
@@ -1106,6 +1108,8 @@ mod tests {
         assert!(includes("/v2/userCollectionAlbums/").contains(&"items.coverArt".into()), "{log:?}");
         assert!(includes("/v2/userCollectionPlaylists/").contains(&"items.coverArt".into()), "{log:?}");
         assert!(includes(&format!("/v2/playlists/{EVENING}/")).contains(&"items.albums.coverArt".into()), "{log:?}");
+        assert!(includes("/v2/userCollectionTracks/").contains(&"items.albums.artists".into()), "{log:?}");
+        assert!(includes(&format!("/v2/playlists/{EVENING}/")).contains(&"items.albums.artists".into()), "{log:?}");
     }
 
     /// The playlists list reads the favorited playlists, then the owned ones,

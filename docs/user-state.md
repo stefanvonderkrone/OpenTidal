@@ -312,6 +312,16 @@ A pass obeys five rules.
    fails without ending the grant stalls every pass that waited on it, and a
    later scroll retries the pass.
 
+Opening a Tidal album or a Tidal artist starts a pass of its own. An album's
+pass reads its tracks, and an artist's pass reads its albums. Neither list owns
+a membership in the library, so these pages only fill the catalogue, and the
+complete or partial rule has nothing to remove. The album screen draws the
+catalogue's tracks on that album, and the artist screen draws the catalogue's
+albums by that artist. Both build only the rows near the viewport and show the
+`pass-status` line, like the other remote lists. A seed album or artist is not
+on Tidal and starts no pass. The catalogue rows these pages bring are not
+written unless the library names them, so a restart reads them again.
+
 A Tidal playlist is a catalogue playlist, not a user playlist. Its name and
 tracks live in the catalogue, and the library holds only its id in
 `tidal_playlists`. No edit operation takes a catalogue playlist id, so a local
@@ -551,6 +561,15 @@ names the test that covers the code path, and no hand check has happened.
 | A live next link is followed | Read a live collection page, follow its `links.next`, read the second page | live: 2026-11-18, plus `a_next_link_without_the_base_path_is_followed`() |
 | A live cover reads an artwork file | Read a live album coverArt response, pick a file, fetch the image with no token | live: 2026-11-18, plus `a_cover_link_is_read_from_the_artwork_files`() and `the_smallest_file_at_or_above_the_width_wins`() |
 | The live library needs cover includes | Read live collections with and without the coverArt include, compare the relationships | live: 2026-11-18. The include assertions are covered by `http_pages_read_one_response_per_call`() |
+| The track reads ask for each album's artists | A loopback server logs the liked-tracks and playlist-items paths, assert `items.albums.artists` in each include | test: `http_pages_read_one_response_per_call` |
+| An album page brings its tracks | Read the album items fixture into a catalogue that holds the album, assert its tracks, the report and an unchanged library | test: `an_album_page_brings_its_tracks` |
+| An artist page brings its albums | Read the artist albums fixture, assert the three albums, the report and an unchanged library | test: `an_artist_page_brings_its_albums` |
+| A detail route names its own read, a seed one none | Map Tidal and seed album and artist routes to their remote lists | test: `a_detail_route_names_its_remote_list_unless_it_is_seed` |
+| Opening an artist and then an album shows their details | Drive the details scene, open the artist, assert the albums only its read brings, open an album, assert its tracks and an unchanged library | test: `opening_an_artist_and_an_album_reads_their_details`. The two detail journeys assert the same headless |
+| An artist picture reads its profile art | Read the synthetic profile art fixture, assert the path and the file of the named artwork | test: `an_artist_cover_is_read_from_its_profile_art`, `only_a_tidal_artist_asks_for_a_cover` |
+| A decoded artist picture appears on screen | Drive `features/artist-detail`, assert `hero-cover-image` and the magenta share inside its rect | `scripts/pixel-assert.py` on the `features/artist-detail` drive, by hand on 2026-11-19 against the fake service. This is not a live check |
+| A live liked page keeps its albums | Sign in with a real account, read Liked Songs, assert no drop in the log | live: not run. A read-only probe on 2026-11-19 returned every included album with its artist under the new include, but no live run of this build followed. The include is covered by `http_pages_read_one_response_per_call`() |
+| A real artist shows its albums and picture | Sign in with a real account, open an artist, compare with the Tidal app | live: not run. The read is covered by `an_artist_page_brings_its_albums`() and `an_artist_cover_is_read_from_its_profile_art`() |
 | Tidal limits rapid requests | Send ten rapid paced-free page requests, observe `429 Too Many Requests` | live: 2026-11-18, plus `a_rate_limited_page_call_is_retried_and_lands`() |
 
 ## Confirmed live

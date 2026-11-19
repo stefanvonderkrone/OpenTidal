@@ -62,9 +62,11 @@ Each milestone passes the preflight before the next one starts.
 4. Track credits arrive through `include=credits` on a track request. The album
    page shows the track list with the credits of each track. There is no album
    credit object.
-5. The artist page shows albums, EPs and singles, top songs sorted by popularity
-   in the app, and similar artists. Compilations and appears-on stay unproven
-   until a live check against a real account.
+5. The artist page shows the artist's albums, EPs and singles from
+   `/artists/{id}/relationships/albums`, the tracks by that artist that the
+   catalogue already holds, and the artist's `profileArt`. The artist tracks
+   endpoint answered `400` live, so there are no top songs. Similar artists,
+   compilations and appears-on are not built.
 
 A pass reads one remote list from its first page, one page per call. Each
 remote list has its own pass and its own endpoints:
@@ -79,11 +81,21 @@ remote list has its own pass and its own endpoints:
   then the owned playlists from `GET /playlists?filter%5Bowners.id%5D=<uid>`
 - The tracks of one Tidal playlist:
   `GET /playlists/<id>/relationships/items?include=items,items.albums,items.artists,items.albums.coverArt,items.albums.artists`
+- The tracks of one Tidal album:
+  `GET /albums/<id>/relationships/items?include=items,items.artists,items.albums,items.albums.coverArt,items.albums.artists`
+- The albums of one Tidal artist:
+  `GET /artists/<id>/relationships/albums?include=albums,albums.artists,albums.coverArt`
+
+An album's tracks and an artist's albums own no list in the library. Their
+pages fill the catalogue, and the album and artist screens draw what the
+catalogue holds for that album or artist. An artist's picture comes from
+`GET /artists/<id>/relationships/profileArt?include=profileArt`.
 
 The live reads below cover these endpoints and the nested include strings.
 
-A sync reads the first four lists to their last page. A Tidal playlist's tracks
-are read only when the user opens that playlist. In the live build, opening a
+A sync reads the first four lists to their last page. A Tidal playlist's
+tracks, an album's tracks, and an artist's albums are read only when the user
+opens that playlist, album or artist. A seed item has no read. In the live build, opening a
 list's screen starts a pass that reads the first page, and a scroll that needs
 more rows reads the next page. The list on screen reads first.
 
@@ -157,6 +169,27 @@ Read these with read-only requests against the signed-in account.
 - Tidal answered `429 Too Many Requests` on the tenth rapid unpaced page
   request. The saved-albums cursor chain passed twenty five paced pages with no
   end.
+
+### Confirmed live on 2026-11-19
+
+Read these with read-only requests against the signed-in account, before the
+change that uses them. No live run of the app followed.
+
+- Liked tracks asked for with `include=items,items.albums,items.artists,items.albums.coverArt`
+  return each included album with an empty artist. The catalogue dropped 18
+  albums and 20 tracks on every page, and the log said
+  `a page named 58 item(s) the catalogue cannot hold`. Adding
+  `items.albums.artists` returned 18 albums, 21 artists, 18 artworks and 20
+  tracks, and each album carried `relationships.artists.data`.
+- `GET /albums/{id}/relationships/items` with
+  `include=items,items.artists,items.albums,items.albums.coverArt,items.albums.artists`
+  returned 20 tracks in `data`, with their album, artist and artwork included.
+- `GET /artists/{id}/relationships/albums?include=albums,albums.artists,albums.coverArt`
+  returned 20 albums in `data`, with 19 artists and 20 artworks included.
+- `GET /artists/{id}/relationships/tracks` answered `400` with every include
+  tried.
+- `GET /artists/{id}/relationships/profileArt?include=profileArt` returned one
+  artwork with `files[].href` and `meta.width`, the shape of an album cover.
 
 ## Throughput checkpoint
 

@@ -30,9 +30,11 @@ catalogue rows the store holds, and no operation removes an entry.
   its content. It is never a user playlist and never takes a slot.
 - **artwork id.** The id in an album's or a catalogue playlist's `coverArt`
   relationship. In code it is `ArtworkId`. Only a `Catalogue` mints one, with
-  the same shape rule as every other id, so it is also a safe file name.
-- **cover.** The image of an album or a catalogue playlist. An artist and a
-  user playlist have no cover, and keep the **placeholder**.
+  the same shape rule as every other id, so it is also a safe file name. No
+  read names an artist's artwork, so an artist's cover is keyed `artist-<id>`.
+- **cover.** The image of an album, a catalogue playlist, or a Tidal artist.
+  An artist's cover is its `profileArt`. A seed artist and a user playlist
+  have no cover, and keep the **placeholder**.
 - **placeholder.** The gradient a screen draws where no cover is ready.
 
 ## Library

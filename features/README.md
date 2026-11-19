@@ -15,7 +15,8 @@ the catalogue holds. The seed keeps today's order, so `album-0` on Home is
 - `album-<pos>`, `artist-<pos>`, and `seed-playlist-<pos>` name a catalogue card on a screen.
 - `playlist-<slot>` names a user playlist card on the Playlists screen.
 - `tidal-playlist-<pos>` names a Tidal playlist card in the From Tidal grid on the Playlists screen.
-- `cover` is a card's placeholder gradient, and `cover-image` is its cover once the image decoded with no error. A card has one or the other. The hero uses `hero-cover` and `hero-cover-image` the same way.
+- `cover` is a card's placeholder gradient, and `cover-image` is its cover once the image decoded with no error. A card has one or the other. The hero uses `hero-cover` and `hero-cover-image` the same way, an artist's hero included.
+- `albums` is the grid of an artist's albums on the artist screen. Its cards are `album-<pos>`.
 - `sync-library` is the Sync with Tidal button on the Account screen, and `sync-status` is the line under it.
 - `like` is the heart on the now-playing bar. Its label changes from `Like` to `Unlike`.
 - `save`, `follow`, and `download` are the toggle buttons on a detail hero.
@@ -44,6 +45,8 @@ The journeys:
 | `tidal-sync-status` | The Account screen reports what the sync left. |
 | `covers` | A synced album shows its fetched cover, and a second run shows it from disk with no fetch. |
 | `paged` | A scroll on a long Albums list reads the page its rows need. |
+| `artist-detail` | Opening an artist reads its albums and shows its picture. |
+| `album-detail` | Opening an album from an artist reads the album's tracks. |
 
 The `sign-in` journey runs against the deterministic fake service, which signs
 in at once, so no browser or network is needed headless. The `signed-in` scene
@@ -103,4 +106,21 @@ build where the rows in view ask for nothing fails the last two predicates:
 export OPENTIDAL_DB="$(mktemp -d)/scene.db"
 scripts/control-opentidal drive features/paged/script.json artifacts/paged --scene signed-in-paged
 scripts/tree-assert.py artifacts/paged/tree.json has=paged-album-0 has=paged-album-50 has=album-50
+```
+
+The two detail journeys start from the `signed-in-details` scene. Its fake
+service follows one artist. The artist's read brings three albums, and the
+second album's read brings two tracks. Only the artist read brings
+`album-1` and `album-2`, and only the album read brings `detail-track-1`. The
+artist's profile art is the magenta PNG, so the pixel check reads it inside the
+`hero-cover-image` rect:
+
+```sh
+export OPENTIDAL_DB="$(mktemp -d)/scene.db"
+scripts/control-opentidal drive features/artist-detail/script.json artifacts/artist-detail --scene signed-in-details
+scripts/tree-assert.py artifacts/artist-detail/tree.json "text=hero-title=Detail Artist" has=album-1 has=album-2 has=hero-cover-image absent=hero-cover
+scripts/pixel-assert.py artifacts/artist-detail/frame.png artifacts/artist-detail/tree.json hero-cover-image ff00ff 0.9
+
+scripts/control-opentidal drive features/album-detail/script.json artifacts/album-detail --scene signed-in-details
+scripts/tree-assert.py artifacts/album-detail/tree.json "text=hero-title=Second Album" has=detail-track-1 has=track-0 has=track-1
 ```

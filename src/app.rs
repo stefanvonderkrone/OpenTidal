@@ -64,6 +64,9 @@ pub struct App {
     /// drawing frames at rest, so without this a click in the last frame before
     /// idle would sit unwritten until the next input.
     waker: Option<Waker>,
+    /// The key of the card the pointer rests on, so only that card scrolls a
+    /// label too long for it. It is view state, so it stays out of `State`.
+    pub hovered_card: Option<String>,
     /// Whether the live client is on, from `OPENTIDAL_LIVE` or the config file.
     pub live: bool,
     /// A counter bumped on sign-out and new sign-ins. In-flight profile results
@@ -1082,6 +1085,7 @@ impl Default for App {
             db_override: None,
             profile_error: None,
             waker: None,
+            hovered_card: None,
             live,
             session: 0,
             auth_flow: Latest::default(),

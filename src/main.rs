@@ -433,11 +433,12 @@ fn screen_body(app: &App, t: tok::Theme, accent: Color) -> El {
     let s = &app.core;
     let cat = &app.catalogue;
     let covers = app.covers();
+    let hovered = app.hovered_card.as_deref();
     match state::current(s) {
-        Route::Home => screens::home(cat, covers, t),
+        Route::Home => screens::home(cat, covers, hovered, t),
         Route::Feed => screens::feed(t),
-        Route::Popular => screens::popular(s, cat, covers, t),
-        Route::ForYou => screens::for_you(cat, covers, t),
+        Route::Popular => screens::popular(s, cat, covers, hovered, t),
+        Route::ForYou => screens::for_you(cat, covers, hovered, t),
         Route::LikedSongs => screens::liked_songs(app, t),
         Route::Albums => screens::albums(app, t),
         Route::Artists => screens::artists(app, t),
@@ -447,7 +448,7 @@ fn screen_body(app: &App, t: tok::Theme, accent: Color) -> El {
         Route::History => screens::history(s, cat, t),
         Route::Stats => screens::stats(s, cat, t),
         Route::Downloads => screens::downloads(s, cat, t),
-        Route::Search => screens::search(cat, covers, t, &app.search),
+        Route::Search => screens::search(cat, covers, hovered, t, &app.search),
         Route::Settings => screens::settings(t),
         Route::SettingsPage(p) => screens::settings_page(*p, app, t),
         route => screens::detail(route, app, accent, t),
@@ -837,5 +838,98 @@ mod tests {
         p.until("read the page again", |p| p.gate.pages.load(Ordering::SeqCst) >= before + 2);
         p.release();
         assert!(p.shows("paged-album-50"), "the retry did not land, status {:?}", p.status());
+    }
+
+    /// The Home screen with its last card, `album-4`, renamed to a title far
+    /// wider than the card. No card stands to its right, so a spilled title
+    /// would draw over empty space. The first album keeps its short title,
+    /// "Currents".
+    fn long_title_home() -> Runtime<App> {
+        use catalogue::{AlbumRow, CatalogueRows};
+        let mut app = App::default();
+        let title = "A Title Much Too Long To Fit Inside One Album Card".to_string();
+        let row = AlbumRow { id: "seed-album-4".into(), title, artist: "seed-artist-4".into(), cover: String::new() };
+        app.catalogue.absorb(CatalogueRows { albums: vec![row], ..CatalogueRows::default() });
+        let mut rt = Runtime::new(app, view, (1280.0, 800.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        rt
+    }
+
+    /// The drawn rect of the element keyed `key` inside the card keyed `card`.
+    fn card_part(rt: &Runtime<App>, card: &str, key: &str) -> Option<[f32; 4]> {
+        let inside = format!("/{card}/");
+        rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key) && e.path.contains(&inside)).map(|e| e.rect)
+    }
+
+    /// How many glyphs show, after their clips, beside the card keyed `card`:
+    /// in the gap before it or anywhere to its right on its rows. The card must
+    /// be the last in its row, so only its own text could draw there.
+    fn glyphs_beside(rt: &Runtime<App>, card: &str) -> usize {
+        let [x, y, w, h] = rt.elements().into_iter().find(|e| e.key.as_deref() == Some(card)).expect("the card").rect;
+        rt.instances.iter()
+            .filter(|i| i.params[1] == rune::render::KIND_GLYPH)
+            .filter(|i| i.rect[1] >= y && i.rect[1] < y + h)
+            .filter(|i| {
+                let left = i.rect[0].max(i.clip[0]);
+                let right = (i.rect[0] + i.rect[2]).min(i.clip[2]);
+                let in_gap = left < x - 0.5 && right > x - tok::space::S3 + 0.5;
+                right > left && (in_gap || right > x + w + 0.5)
+            })
+            .count()
+    }
+
+    /// Rests the pointer on the cover of the card keyed `card` past the hover delay.
+    fn rest_on(rt: &mut Runtime<App>, card: &str) {
+        let (x, y) = rt.find(&format!("{card}/cover")).expect("the card has a cover");
+        rt.pointer_move(x, y);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+    }
+
+    #[test]
+    fn a_long_title_at_rest_stays_one_line_inside_its_card() {
+        let rt = long_title_home();
+        assert_eq!(glyphs_beside(&rt, "album-4"), 0, "the title spills past its card");
+        assert!(card_part(&rt, "album-4", "title").is_some(), "the card lost its title");
+        assert!(card_part(&rt, "album-4", "title-clip").is_none(), "a card at rest scrolls its title");
+    }
+
+    #[test]
+    fn a_long_title_scrolls_while_its_card_is_hovered() {
+        let mut rt = long_title_home();
+        rest_on(&mut rt, "album-4");
+        assert!(card_part(&rt, "album-4", "title-clip").is_some(), "the hovered card does not scroll its title");
+        assert!(card_part(&rt, "album-4", "title-echo").is_some(), "the title has no copy to follow it");
+        assert!(card_part(&rt, "album-0", "title-clip").is_none(), "a card that is not hovered scrolls too");
+        let start = card_part(&rt, "album-4", "title").expect("the title")[0];
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        let later = card_part(&rt, "album-4", "title").expect("the title")[0];
+        assert!(later < start, "the title does not move left: {start} then {later}");
+        assert_eq!(glyphs_beside(&rt, "album-4"), 0, "the scrolling title shows outside its card");
+    }
+
+    #[test]
+    fn leaving_a_card_stops_its_title_scrolling() {
+        let mut rt = long_title_home();
+        rest_on(&mut rt, "album-4");
+        assert!(card_part(&rt, "album-4", "title-clip").is_some(), "the hovered card does not scroll its title");
+        rt.pointer_move(1270.0, 790.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(card_part(&rt, "album-4", "title-clip").is_none(), "the title still scrolls after the pointer left");
+        assert_eq!(glyphs_beside(&rt, "album-4"), 0, "the title spills past its card after a leave");
+    }
+
+    #[test]
+    fn a_short_title_never_scrolls() {
+        let mut rt = long_title_home();
+        rest_on(&mut rt, "album-0");
+        assert_eq!(rt.state.hovered_card.as_deref(), Some("album-0"), "the pointer never rested on the card");
+        assert!(card_part(&rt, "album-0", "title-clip").is_none(), "a title that fits its card scrolls");
+        assert!(card_part(&rt, "album-0", "title").is_some(), "the card lost its title");
     }
 }

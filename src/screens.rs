@@ -4,9 +4,10 @@
 //! the proven operations.
 
 use std::borrow::{Borrow, Cow};
+use std::time::Duration;
 
 use rune::tok::{self, radius, space, type_};
-use rune::{Color, El, GrowthSpec, ScrollSpec, TextEdit, col, el, oklch, row, text, text_input};
+use rune::{Color, Easing, El, GrowthSpec, LoopSpec, ScrollSpec, TextEdit, col, el, oklch, row, text, text_input};
 use crate::app::{App, Cover, Covers};
 use crate::catalogue::{Album, AlbumId, Artist, ArtistId, Catalogue, CataloguePlaylist, CataloguePlaylistId, Track, TrackId};
 use crate::library::{self, PlaylistId, RemoteList};
@@ -61,9 +62,51 @@ fn cover_art(key: &str, cover: &Cover, size: f32, round: f32, t: tok::Theme) -> 
     }
 }
 
+/// The gap between a scrolling label and its copy, in points.
+const MARQUEE_GAP: f32 = 32.0;
+/// How fast a scrolling label moves, in points per second.
+const MARQUEE_SPEED: f32 = 30.0;
+
+/// A card's one-line label keyed `key` in a `width` cell, cut with an ellipsis.
+/// While its card is hovered and the label is wider than the cell, the label
+/// scrolls instead in a window keyed `<key>-clip`, followed by a copy keyed
+/// `<key>-echo`, so the copy reaches the start just as the sweep wraps.
+fn card_label(label: &str, key: &str, width: f32, hovered: bool, centered: bool, t: tok::Theme) -> El {
+    let line = |k: &str| text(label).key(k).font(type_::BODY).color(t.text);
+    let label_w = if hovered { rune::text::measure(label, &[], type_::BODY, None).0 } else { 0.0 };
+    if label_w <= width {
+        let line = line(key).truncate();
+        return if centered { line.center() } else { line };
+    }
+    let step = label_w + MARQUEE_GAP;
+    let content_w = step + label_w;
+    let sweep = LoopSpec::slide(f64::from(step / MARQUEE_SPEED), [0.0, 0.0], [-step / content_w, 0.0]).easing(Easing::LINEAR);
+    el().key(format!("{key}-clip")).w(width).clip_fade(0.0, 0.0, 12.0, 0.0).child(
+        row().key(format!("{key}-marquee")).w(content_w).gap(MARQUEE_GAP)
+            .looping(sweep)
+            .trace_name("card-title-marquee")
+            .child(line(key))
+            .child(line(&format!("{key}-echo"))),
+    )
+}
+
+/// Reports the pointer resting on the card keyed `key`. A leave clears the
+/// hover only when no other card has taken it since.
+fn hover_card(card: El, key: &str) -> El {
+    let key = key.to_owned();
+    card.hover_delays(Duration::from_millis(250), Duration::ZERO)
+        .on_hover_change(move |a: &mut App, inside, _| {
+            if inside {
+                a.hovered_card = Some(key.clone());
+            } else if a.hovered_card.as_deref() == Some(key.as_str()) {
+                a.hovered_card = None;
+            }
+        })
+}
+
 /// A square media card that drills into a detail route on press.
-fn card(key: &str, art: El, title: &str, subtitle: &str, route: Route, t: tok::Theme) -> El {
-    col().key(key)
+fn card(key: &str, art: El, title: &str, subtitle: &str, route: Route, hovered: Option<&str>, t: tok::Theme) -> El {
+    let column = col().key(key)
         .w(168.0)
         .gap(space::S2)
         .on_press(move |a: &mut App| {
@@ -71,20 +114,22 @@ fn card(key: &str, art: El, title: &str, subtitle: &str, route: Route, t: tok::T
             state::open_detail(&mut a.core, &a.catalogue, route.clone())
         })
         .child(art)
-        .child(text(title).key("title").font(type_::BODY).color(t.text))
-        .child(text(subtitle).key("subtitle").font(type_::LABEL).color(t.text_secondary))
+        .child(card_label(title, "title", 168.0, hovered == Some(key), false, t))
+        .child(text(subtitle).key("subtitle").font(type_::LABEL).color(t.text_secondary).truncate());
+    hover_card(column, key)
 }
 
 /// Keys are positions on the screen, so a script taps the same visible card
 /// whatever the catalogue holds.
-fn album_card(pos: usize, a: &Album, cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
+fn album_card(pos: usize, a: &Album, cat: &Catalogue, covers: Covers<'_>, hovered: Option<&str>, t: tok::Theme) -> El {
     let art = cover_art("cover", &covers.album(a), 168.0, radius::MD, t);
-    card(&format!("album-{pos}"), art, &a.title, artist_name(cat, &a.artist), Route::Album(a.id.clone()), t)
+    card(&format!("album-{pos}"), art, &a.title, artist_name(cat, &a.artist), Route::Album(a.id.clone()), hovered, t)
 }
 
-fn artist_card(pos: usize, a: &Artist, covers: Covers<'_>, t: tok::Theme) -> El {
+fn artist_card(pos: usize, a: &Artist, covers: Covers<'_>, hovered: Option<&str>, t: tok::Theme) -> El {
     let id = a.id.clone();
-    col().key(format!("artist-{pos}"))
+    let key = format!("artist-{pos}");
+    let column = col().key(key.as_str())
         .w(120.0)
         .gap(space::S2)
         .on_press(move |app: &mut App| {
@@ -92,17 +137,18 @@ fn artist_card(pos: usize, a: &Artist, covers: Covers<'_>, t: tok::Theme) -> El 
             state::open_detail(&mut app.core, &app.catalogue, Route::Artist(id.clone()))
         })
         .child(cover_art("cover", &covers.artist(a), 120.0, 60.0, t))
-        .child(text(&a.name).key("name").font(type_::BODY).color(t.text).center())
+        .child(card_label(&a.name, "name", 120.0, hovered == Some(key.as_str()), true, t));
+    hover_card(column, &key)
 }
 
-fn catalogue_playlist_card(key: String, p: &CataloguePlaylist, subtitle: &str, covers: Covers<'_>, t: tok::Theme) -> El {
+fn catalogue_playlist_card(key: String, p: &CataloguePlaylist, subtitle: &str, covers: Covers<'_>, hovered: Option<&str>, t: tok::Theme) -> El {
     let art = cover_art("cover", &covers.playlist(p), 168.0, radius::MD, t);
-    card(&key, art, &p.name, subtitle, Route::CataloguePlaylist(p.id.clone()), t)
+    card(&key, art, &p.name, subtitle, Route::CataloguePlaylist(p.id.clone()), hovered, t)
 }
 
-fn playlist_card(id: PlaylistId, name: &str, t: tok::Theme) -> El {
+fn playlist_card(id: PlaylistId, name: &str, hovered: Option<&str>, t: tok::Theme) -> El {
     let art = placeholder_art("cover", id.0 as usize + 10, 168.0, radius::MD, t);
-    card(&format!("playlist-{}", id.0), art, name, "Your playlist", Route::UserPlaylist(id), t)
+    card(&format!("playlist-{}", id.0), art, name, "Your playlist", Route::UserPlaylist(id), hovered, t)
 }
 
 // --- Shelves and grids ---------------------------------------------------
@@ -302,13 +348,13 @@ fn pass_status(app: &App, list: Option<RemoteList>, t: tok::Theme) -> Option<El>
     Some(text(line).key("pass-status").font(type_::LABEL).color(t.text_secondary))
 }
 
-fn all_albums_grid(cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
-    let cards: Vec<El> = cat.albums().enumerate().map(|(i, a)| album_card(i, a, cat, covers, t)).collect();
+fn all_albums_grid(cat: &Catalogue, covers: Covers<'_>, hovered: Option<&str>, t: tok::Theme) -> El {
+    let cards: Vec<El> = cat.albums().enumerate().map(|(i, a)| album_card(i, a, cat, covers, hovered, t)).collect();
     grid(cards, 5)
 }
 
-fn all_artists_grid(cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
-    let cards: Vec<El> = cat.artists().enumerate().map(|(i, a)| artist_card(i, a, covers, t)).collect();
+fn all_artists_grid(cat: &Catalogue, covers: Covers<'_>, hovered: Option<&str>, t: tok::Theme) -> El {
+    let cards: Vec<El> = cat.artists().enumerate().map(|(i, a)| artist_card(i, a, covers, hovered, t)).collect();
     grid(cards, 6)
 }
 
@@ -321,11 +367,11 @@ pub fn home_playlists(cat: &Catalogue) -> impl Iterator<Item = &CataloguePlaylis
     cat.seed_playlists()
 }
 
-pub fn home(cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
-    let rec: Vec<El> = cat.albums().take(5).enumerate().map(|(i, a)| album_card(i, a, cat, covers, t)).collect();
+pub fn home(cat: &Catalogue, covers: Covers<'_>, hovered: Option<&str>, t: tok::Theme) -> El {
+    let rec: Vec<El> = cat.albums().take(5).enumerate().map(|(i, a)| album_card(i, a, cat, covers, hovered, t)).collect();
     let edits: Vec<El> = home_playlists(cat)
         .enumerate()
-        .map(|(i, p)| catalogue_playlist_card(format!("seed-playlist-{i}"), p, &p.description, covers, t))
+        .map(|(i, p)| catalogue_playlist_card(format!("seed-playlist-{i}"), p, &p.description, covers, hovered, t))
         .collect();
     page("Home", "Your music, your way", t,
         col().gap(space::S6)
@@ -352,14 +398,14 @@ pub fn feed(t: tok::Theme) -> El {
     page("Feed", "Activity from artists you follow", t, rows)
 }
 
-pub fn popular(s: &State, cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
+pub fn popular(s: &State, cat: &Catalogue, covers: Covers<'_>, hovered: Option<&str>, t: tok::Theme) -> El {
     let tabs = row().gap(space::S2).pb(space::S3)
         .child(tab("Artists", PopularTab::Artists, s, t))
         .child(tab("Albums", PopularTab::Albums, s, t))
         .child(tab("Tracks", PopularTab::Tracks, s, t));
     let body = match s.popular_tab {
-        PopularTab::Artists => all_artists_grid(cat, covers, t),
-        PopularTab::Albums => all_albums_grid(cat, covers, t),
+        PopularTab::Artists => all_artists_grid(cat, covers, hovered, t),
+        PopularTab::Albums => all_albums_grid(cat, covers, hovered, t),
         PopularTab::Tracks => track_list(cat.tracks().collect(), s.now_playing.as_ref(), cat, t),
     };
     page("Popular", "Global charts", t,
@@ -380,9 +426,9 @@ fn tab(label: &str, tab: PopularTab, s: &State, t: tok::Theme) -> El {
         .child(text(label).key("label").font(type_::BODY).color(if active { t.bg } else { t.text }))
 }
 
-pub fn for_you(cat: &Catalogue, covers: Covers<'_>, t: tok::Theme) -> El {
+pub fn for_you(cat: &Catalogue, covers: Covers<'_>, hovered: Option<&str>, t: tok::Theme) -> El {
     // One position count across both shelves, so no two cards share a key.
-    let mut cards: Vec<El> = cat.albums().enumerate().map(|(i, x)| album_card(i, x, cat, covers, t)).collect();
+    let mut cards: Vec<El> = cat.albums().enumerate().map(|(i, x)| album_card(i, x, cat, covers, hovered, t)).collect();
     let b = cards.split_off(cards.len().min(5));
     let a = cards;
     page("For You", "Built from what you play", t,
@@ -424,7 +470,7 @@ pub fn albums(app: &App, t: tok::Theme) -> El {
     } else {
         remote_rows(app, "rows", list.clone(), |a: &App| Cow::Borrowed(&a.core.lib.saved_albums[..]), 5, 232.0, move |a: &App, pos, id: &AlbumId| {
             match a.catalogue.album(id) {
-                Some(album) => album_card(pos, album, &a.catalogue, a.covers(), t),
+                Some(album) => album_card(pos, album, &a.catalogue, a.covers(), a.hovered_card.as_deref(), t),
                 None => el(),
             }
         })
@@ -439,7 +485,7 @@ pub fn artists(app: &App, t: tok::Theme) -> El {
     } else {
         remote_rows(app, "rows", list.clone(), |a: &App| Cow::Borrowed(&a.core.lib.followed[..]), 6, 160.0, move |a: &App, pos, id: &ArtistId| {
             match a.catalogue.artist(id) {
-                Some(artist) => artist_card(pos, artist, a.covers(), t),
+                Some(artist) => artist_card(pos, artist, a.covers(), a.hovered_card.as_deref(), t),
                 None => el(),
             }
         })
@@ -460,7 +506,7 @@ pub fn playlists(app: &App, t: tok::Theme) -> El {
     let cards: Vec<El> = s.lib.playlists.iter()
         .enumerate()
         .filter_map(|(i, p)| p.as_ref().map(|p| (PlaylistId(i as u8), p.name.clone())))
-        .map(|(id, name)| playlist_card(id, &name, t))
+        .map(|(id, name)| playlist_card(id, &name, app.hovered_card.as_deref(), t))
         .collect();
     let mut body = if cards.is_empty() {
         col().gap(space::S3).child(new_btn).child(empty("No playlists yet. Create one.", t))
@@ -475,7 +521,7 @@ pub fn playlists(app: &App, t: tok::Theme) -> El {
     } else {
         let rows = remote_rows(app, "rows", list.clone(), |a: &App| Cow::Borrowed(&a.core.lib.tidal_playlists[..]), 5, 232.0, move |a: &App, n, id: &CataloguePlaylistId| {
             match a.catalogue.playlist(id) {
-                Some(p) => catalogue_playlist_card(format!("tidal-playlist-{n}"), p, "From Tidal", a.covers(), t),
+                Some(p) => catalogue_playlist_card(format!("tidal-playlist-{n}"), p, "From Tidal", a.covers(), a.hovered_card.as_deref(), t),
                 None => el(),
             }
         });
@@ -649,19 +695,19 @@ pub fn downloads(s: &State, cat: &Catalogue, t: tok::Theme) -> El {
     page("Downloads", "Your download queue", t, rows)
 }
 
-pub fn search(cat: &Catalogue, covers: Covers<'_>, t: tok::Theme, edit: &TextEdit) -> El {
+pub fn search(cat: &Catalogue, covers: Covers<'_>, hovered: Option<&str>, t: tok::Theme, edit: &TextEdit) -> El {
     let query = edit.text.trim();
     let results = if query.is_empty() {
-        all_albums_grid(cat, covers, t)
+        all_albums_grid(cat, covers, hovered, t)
     } else {
         let q = query.to_lowercase();
         let matches = |s: &str| s.to_lowercase().contains(&q);
         let albums: Vec<El> = cat.albums()
             .filter(|a| matches(&a.title) || matches(artist_name(cat, &a.artist)))
-            .enumerate().map(|(i, a)| album_card(i, a, cat, covers, t)).collect();
+            .enumerate().map(|(i, a)| album_card(i, a, cat, covers, hovered, t)).collect();
         let artists: Vec<El> = cat.artists()
             .filter(|a| matches(&a.name))
-            .enumerate().map(|(i, a)| artist_card(i, a, covers, t)).collect();
+            .enumerate().map(|(i, a)| artist_card(i, a, covers, hovered, t)).collect();
         let tracks: Vec<El> = cat.tracks()
             .filter(|tr| matches(&tr.title) || matches(artist_name(cat, &tr.artist)))
             .enumerate().map(|(i, tr)| track_row(i, tr, false, cat, t)).collect();
@@ -1012,7 +1058,7 @@ fn artist_detail(id: &ArtistId, app: &App, accent: Color, t: tok::Theme) -> El {
         Cow::Owned(a.catalogue.albums().filter(|x| x.artist == subject).map(|x| x.id.clone()).collect())
     }, 5, 232.0, move |a: &App, pos, id: &AlbumId| {
         match a.catalogue.album(id) {
-            Some(album) => album_card(pos, album, &a.catalogue, a.covers(), t),
+            Some(album) => album_card(pos, album, &a.catalogue, a.covers(), a.hovered_card.as_deref(), t),
             None => el(),
         }
     });

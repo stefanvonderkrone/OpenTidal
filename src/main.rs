@@ -734,6 +734,10 @@ mod tests {
         let mut p = Paged::open_scene(&scratch.db(), false, signed_in_details_scene);
         let artist = p.rt.state.catalogue.artist_id("detail-artist-1").expect("the scene artist");
         let album = p.rt.state.catalogue.album_id("detail-album-2").expect("the scene album");
+        // The stored scene starts a profile fetch before this test holds the
+        // service. Let it land first, or a name change from that fetch is blamed
+        // on the detail read. This failed on Linux and passed on Mac.
+        p.until("settled the profile", |p| p.rt.state.core.lib.name == "Fake User");
         let before = p.rt.state.core.lib.clone();
         p.rt.update(|a, _| state::open_detail(&mut a.core, &a.catalogue, Route::Artist(artist.clone())));
         p.until("showed the artist's albums", |p| p.shows("album-2"));

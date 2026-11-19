@@ -115,16 +115,19 @@ pub struct CataloguePlaylist {
     pub cover: Option<ArtworkId>,
 }
 
-/// Whose `coverArt` relationship names a cover. A fetch needs the owner,
-/// because the pinned spec has no third-party read of an artwork by its id.
+/// Whose relationship names a cover: the `coverArt` of an album or a playlist,
+/// or the `profileArt` of an artist. A fetch needs the owner, because the
+/// pinned spec has no third-party read of an artwork by its id.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum CoverOwner {
     Album(AlbumId),
     Playlist(CataloguePlaylistId),
+    Artist(ArtistId),
 }
 
 /// One cover to show: the artwork and the owner whose relationship reads it.
-/// Built only from an `Album` or a `CataloguePlaylist` that has a cover.
+/// Built only from an `Album` or a `CataloguePlaylist` that has a cover, or
+/// from a Tidal `Artist`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CoverRequest {
     pub artwork: ArtworkId,
@@ -135,6 +138,19 @@ impl Album {
     pub fn cover_request(&self) -> Option<CoverRequest> {
         let artwork = self.cover.clone()?;
         Some(CoverRequest { artwork, owner: CoverOwner::Album(self.id.clone()) })
+    }
+}
+
+impl Artist {
+    /// No artist read names its profile art, so the cover is keyed by the
+    /// artist as `artist-<id>`, and the fetch takes the artwork the
+    /// `profileArt` relationship names. A seed artist is not on Tidal.
+    pub fn cover_request(&self) -> Option<CoverRequest> {
+        if self.id.is_seed() {
+            return None;
+        }
+        let artwork = mint(&format!("artist-{}", self.id.as_str())).map(ArtworkId)?;
+        Some(CoverRequest { artwork, owner: CoverOwner::Artist(self.id.clone()) })
     }
 }
 
@@ -796,6 +812,19 @@ mod tests {
             let id = cat.album_id(&format!("bad-{n}")).expect("a bad cover hid its album");
             assert_eq!(cat.album(&id).unwrap().cover, None);
         }
+    }
+
+    /// A Tidal artist asks for its profile art under a key of its own. A seed
+    /// artist is not on Tidal and asks for nothing.
+    #[test]
+    fn only_a_tidal_artist_asks_for_a_cover() {
+        let mut cat = Catalogue::seed();
+        cat.absorb(CatalogueRows { artists: vec![artist("12979")], ..CatalogueRows::default() });
+        let request = cat.artist(&cat.artist_id("12979").unwrap()).unwrap().cover_request().unwrap();
+        assert_eq!(request.artwork.as_str(), "artist-12979");
+        assert_eq!(request.owner, CoverOwner::Artist(cat.artist_id("12979").unwrap()));
+        let seed = cat.artist(&cat.artist_id("seed-artist-0").unwrap()).unwrap();
+        assert_eq!(seed.cover_request(), None);
     }
 
     /// The playlist twin of the album rule.

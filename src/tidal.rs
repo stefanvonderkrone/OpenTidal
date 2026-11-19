@@ -755,12 +755,13 @@ fn fetch_page(
     Ok(Page { rows, members, next })
 }
 
-/// The `coverArt` relationship read of a cover's owner, with the artwork
-/// included. These are the two pinned third-party endpoints in the manifest.
+/// The relationship read of a cover's owner, with the artwork included. These
+/// are the three pinned third-party endpoints in the manifest.
 fn cover_path(owner: &CoverOwner) -> String {
     match owner {
         CoverOwner::Album(id) => format!("/albums/{}/relationships/coverArt?include=coverArt", id.as_str()),
         CoverOwner::Playlist(id) => format!("/playlists/{}/relationships/coverArt?include=coverArt", id.as_str()),
+        CoverOwner::Artist(id) => format!("/artists/{}/relationships/profileArt?include=profileArt", id.as_str()),
     }
 }
 
@@ -777,10 +778,16 @@ fn fetch_cover(
     cover: &CoverRequest,
 ) -> Result<Vec<u8>, ServiceError> {
     let doc = get_doc(&cover_path(&cover.owner))?;
+    // An artist's cover is keyed by the artist, so its artwork is the one the
+    // relationship names.
+    let named = match &cover.owner {
+        CoverOwner::Artist(_) => doc.resources().next().map(|r| r.id.as_str()),
+        CoverOwner::Album(_) | CoverOwner::Playlist(_) => Some(cover.artwork.as_str()),
+    };
     let artwork = doc
         .included
         .iter()
-        .find(|r| r.id == cover.artwork.as_str())
+        .find(|r| Some(r.id.as_str()) == named)
         .ok_or_else(|| ServiceError::Decode("the cover response does not include its artwork".to_string()))?;
     let href = pick_file(artwork.attributes.as_ref())
         .ok_or_else(|| ServiceError::Decode("the artwork names no file".to_string()))?;
@@ -1295,6 +1302,18 @@ mod tests {
             )),
             "/playlists/seed-playlist-0/relationships/coverArt?include=coverArt"
         );
+    }
+
+    /// An artist's cover reads its `profileArt` relationship and fetches a file
+    /// of the artwork the relationship names, not of another included one.
+    #[test]
+    fn an_artist_cover_is_read_from_its_profile_art() {
+        let cat = holding_currents();
+        let request = cat.artist(&cat.artist_id(TAME_IMPALA).unwrap()).unwrap().cover_request().unwrap();
+        let (result, paths, images) = read_cover(&fixture_body("artist-profile-art.json"), &request);
+        assert_eq!(result, Ok(b"image".to_vec()));
+        assert_eq!(paths, ["/artists/1566/relationships/profileArt?include=profileArt"]);
+        assert_eq!(images, ["https://resources.tidal.com/images/a1b2c3d4/750x750.jpg"]);
     }
 
     /// The smallest file at least `COVER_PX` wide wins. With none that wide,

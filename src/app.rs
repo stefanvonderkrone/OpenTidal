@@ -15,7 +15,7 @@ use std::sync::Arc;
 use rune::{Image, ImageCache, Latest, TextEdit, Waker};
 use serde::Deserialize;
 use crate::auth::{self, Auth, OAuthConfig, Token, TokenStore};
-use crate::catalogue::{Album, ArtworkId, Catalogue, CataloguePlaylist, CoverOwner, CoverRequest};
+use crate::catalogue::{Album, Artist, ArtworkId, Catalogue, CataloguePlaylist, CoverOwner, CoverRequest};
 use crate::covers::{self, CoverCache, CoverOutcome};
 use crate::library::{Library, RemoteList};
 use crate::pager::{Landed, PageResult, PassStatus, Passes};
@@ -1089,6 +1089,10 @@ impl Covers<'_> {
 
     pub fn playlist(self, playlist: &CataloguePlaylist) -> Cover {
         self.cover(playlist.cover_request(), playlist.id.as_str())
+    }
+
+    pub fn artist(self, artist: &Artist) -> Cover {
+        self.cover(artist.cover_request(), artist.id.as_str())
     }
 
     fn cover(self, request: Option<CoverRequest>, seed: &str) -> Cover {

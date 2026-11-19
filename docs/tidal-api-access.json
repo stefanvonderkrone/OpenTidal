@@ -472,6 +472,11 @@
       "method": "get",
       "path": "/playlists/{id}/relationships/coverArt",
       "spec": "playlists"
+    },
+    {
+      "method": "get",
+      "path": "/artists/{id}/relationships/profileArt",
+      "spec": "artists"
     }
   ],
   "version": "1.10.14"

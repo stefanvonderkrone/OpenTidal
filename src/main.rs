@@ -30,7 +30,7 @@ const HEART: Icon = Icon { name: "heart", view: 24.0, body: "<path d=\"M12 21s-6
 
 type Scene = (&'static str, fn(&mut App));
 
-const SCENES: [Scene; 9] = [
+const SCENES: [Scene; 10] = [
     ("default", |_| {}),
     ("accent-blue", |a| a.core.accent = 0),
     ("accent-pink", |a| a.core.accent = 2),
@@ -45,6 +45,7 @@ const SCENES: [Scene; 9] = [
     ("signed-in-synced", signed_in_synced_scene),
     ("signed-in-covers", signed_in_covers_scene),
     ("signed-in-paged", signed_in_paged_scene),
+    ("signed-in-details", signed_in_details_scene),
 ];
 
 /// Signs in as a user the database can key on, so a driven scene proves the write
@@ -183,6 +184,67 @@ fn signed_in_paged_scene(a: &mut App) {
         pages: [(library::RemoteList::Albums, pages)].into(),
         ..tidal::FakeService::default()
     });
+}
+
+/// The stored scene, with a fake service whose account follows one artist.
+/// Opening the artist reads its three albums, and opening the second album
+/// reads its two tracks. Only the artist read brings the first and third
+/// albums, and only the album read brings the tracks. The artist's profile art
+/// is the solid magenta PNG, and each decode is waited on, so it lands before
+/// the snap.
+fn signed_in_details_scene(a: &mut App) {
+    use catalogue::{AlbumRow, ArtistRow, CatalogueRows, TrackRow};
+    signed_in_stored_scene(a);
+    a.revalidate_on_entry = true;
+    let artist = || ArtistRow { id: "detail-artist-1".to_string(), name: "Detail Artist".to_string() };
+    let album = |n: usize, title: &str| AlbumRow {
+        id: format!("detail-album-{n}"),
+        title: title.to_string(),
+        artist: "detail-artist-1".to_string(),
+        cover: String::new(),
+    };
+    let track = |n: usize, title: &str| TrackRow {
+        id: format!("detail-track-{n}"),
+        title: title.to_string(),
+        artist: "detail-artist-1".to_string(),
+        album: "detail-album-2".to_string(),
+        duration: "PT3M".to_string(),
+    };
+    a.catalogue.absorb(CatalogueRows { artists: vec![artist()], ..CatalogueRows::default() });
+    let artist_id = a.catalogue.artist_id("detail-artist-1").expect("the scene artist");
+    let followed = one_page(CatalogueRows { artists: vec![artist()], ..CatalogueRows::default() }, "detail-artist-1");
+    let discography = vec![Ok(tidal::Page {
+        rows: CatalogueRows {
+            artists: vec![artist()],
+            albums: vec![album(1, "First Album"), album(2, "Second Album"), album(3, "Third Album")],
+            ..CatalogueRows::default()
+        },
+        members: (1..=3).map(|n| format!("detail-album-{n}")).collect(),
+        next: None,
+    })];
+    let mut pages: std::collections::BTreeMap<_, _> =
+        [(library::RemoteList::Artists, followed), (library::RemoteList::Artist(artist_id), discography)].into();
+    // The album read is keyed by an id only the catalogue mints, so the second
+    // album is absorbed here to name it. It is the first card of the artist's
+    // grid, because the grid keeps catalogue order.
+    a.catalogue.absorb(CatalogueRows { albums: vec![album(2, "Second Album")], ..CatalogueRows::default() });
+    let album_id = a.catalogue.album_id("detail-album-2").expect("the scene album");
+    let tracks = vec![Ok(tidal::Page {
+        rows: CatalogueRows {
+            tracks: vec![track(1, "Detail Track One"), track(2, "Detail Track Two")],
+            ..CatalogueRows::default()
+        },
+        members: vec!["detail-track-1".to_string(), "detail-track-2".to_string()],
+        next: None,
+    })];
+    pages.insert(library::RemoteList::Album(album_id), tracks);
+    let magenta = include_bytes!("../tests/fixtures/covers/magenta.png").to_vec();
+    a.service = std::sync::Arc::new(tidal::FakeService {
+        pages,
+        covers: [("artist-detail-artist-1".to_string(), Ok(magenta))].into(),
+        ..tidal::FakeService::default()
+    });
+    a.wait_for_decode = true;
 }
 
 fn view(app: &App, _cx: &mut Cx<App>) -> El {
@@ -566,9 +628,13 @@ mod tests {
     impl Paged {
         /// The `signed-in-paged` scene on `db`, drawn in a window of the app's size.
         fn open(db: &std::path::Path, held: bool) -> Paged {
+            Paged::open_scene(db, held, signed_in_paged_scene)
+        }
+
+        fn open_scene(db: &std::path::Path, held: bool, scene: fn(&mut App)) -> Paged {
             let mut app = App::default();
             app.db_override = Some(db.to_path_buf());
-            signed_in_paged_scene(&mut app);
+            scene(&mut app);
             let (verdicts, rx) = mpsc::channel();
             let gate = Arc::new(Gate {
                 inner: app.service.clone(),
@@ -658,6 +724,23 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).ok();
         }
+    }
+
+    /// Opening an artist reads its albums, and opening one of them reads its
+    /// tracks. Neither read changes a library list.
+    #[test]
+    fn opening_an_artist_and_an_album_reads_their_details() {
+        let scratch = Scratch::new("details");
+        let mut p = Paged::open_scene(&scratch.db(), false, signed_in_details_scene);
+        let artist = p.rt.state.catalogue.artist_id("detail-artist-1").expect("the scene artist");
+        let album = p.rt.state.catalogue.album_id("detail-album-2").expect("the scene album");
+        let before = p.rt.state.core.lib.clone();
+        p.rt.update(|a, _| state::open_detail(&mut a.core, &a.catalogue, Route::Artist(artist.clone())));
+        p.until("showed the artist's albums", |p| p.shows("album-2"));
+        assert!(!p.shows("detail-track-1"), "a track showed before its album was opened");
+        p.rt.update(|a, _| state::open_detail(&mut a.core, &a.catalogue, Route::Album(album.clone())));
+        p.until("showed the album's tracks", |p| p.shows("detail-track-1") && p.shows("track-1"));
+        assert_eq!(p.rt.state.core.lib, before, "a detail read changed the library");
     }
 
     /// The first page holds five albums, so the rows in view want more, and

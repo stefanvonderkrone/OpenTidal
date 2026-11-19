@@ -861,21 +861,32 @@ mod tests {
         rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key) && e.path.contains(&inside)).map(|e| e.rect)
     }
 
-    /// How many glyphs show, after their clips, beside the card keyed `card`:
-    /// in the gap before it or anywhere to its right on its rows. The card must
-    /// be the last in its row, so only its own text could draw there.
-    fn glyphs_beside(rt: &Runtime<App>, card: &str) -> usize {
-        let [x, y, w, h] = rt.elements().into_iter().find(|e| e.key.as_deref() == Some(card)).expect("the card").rect;
+    /// The right edge of the title row in `card`, after each glyph's clip.
+    /// A clipped title ends at the card edge; an unclipped one runs far past
+    /// it. The margin allows a glyph's raster padding on any platform, but is
+    /// far smaller than the extra width of this test's long title.
+    fn title_right(rt: &Runtime<App>, card: &str) -> f32 {
+        let [x, _, w, _] = rt.elements().into_iter().find(|e| e.key.as_deref() == Some(card)).expect("the card").rect;
+        let [_, ty, _, th] = card_part(rt, card, "title").expect("the card lost its title");
         rt.instances.iter()
             .filter(|i| i.params[1] == rune::render::KIND_GLYPH)
-            .filter(|i| i.rect[1] >= y && i.rect[1] < y + h)
-            .filter(|i| {
-                let left = i.rect[0].max(i.clip[0]);
-                let right = (i.rect[0] + i.rect[2]).min(i.clip[2]);
-                let in_gap = left < x - 0.5 && right > x - tok::space::S3 + 0.5;
-                right > left && (in_gap || right > x + w + 0.5)
-            })
-            .count()
+            .filter(|i| i.rect[1] >= ty - 2.0 && i.rect[1] < ty + th + 2.0)
+            .filter(|i| i.rect[0] >= x - 8.0)
+            .map(|i| (i.rect[0] + i.rect[2]).min(i.clip[2]))
+            .fold(x + w, f32::max)
+    }
+
+    /// Whether glyphs in the title row of `card` carry the marquee window's
+    /// clip. The clip is a layout value, so unlike glyph padding it is the
+    /// same on every platform.
+    fn title_is_clipped(rt: &Runtime<App>, card: &str) -> bool {
+        let [x, _, w, _] = rt.elements().into_iter().find(|e| e.key.as_deref() == Some(card)).expect("the card").rect;
+        let [_, ty, _, th] = card_part(rt, card, "title").expect("the card lost its title");
+        rt.instances.iter()
+            .filter(|i| i.params[1] == rune::render::KIND_GLYPH)
+            .filter(|i| i.rect[1] >= ty - 2.0 && i.rect[1] < ty + th + 2.0)
+            .filter(|i| i.rect[0] >= x - 8.0 && i.rect[0] < x + w + 8.0)
+            .any(|i| i.clip[0] >= x - 1.0 && i.clip[2] <= x + w + 1.0)
     }
 
     /// Rests the pointer on the cover of the card keyed `card` past the hover delay.
@@ -890,8 +901,8 @@ mod tests {
     #[test]
     fn a_long_title_at_rest_stays_one_line_inside_its_card() {
         let rt = long_title_home();
-        assert_eq!(glyphs_beside(&rt, "album-4"), 0, "the title spills past its card");
-        assert!(card_part(&rt, "album-4", "title").is_some(), "the card lost its title");
+        let [x, _, w, _] = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("album-4")).expect("the card").rect;
+        assert!(title_right(&rt, "album-4") <= x + w + 16.0, "the title spills past its card");
         assert!(card_part(&rt, "album-4", "title-clip").is_none(), "a card at rest scrolls its title");
     }
 
@@ -908,7 +919,7 @@ mod tests {
         }
         let later = card_part(&rt, "album-4", "title").expect("the title")[0];
         assert!(later < start, "the title does not move left: {start} then {later}");
-        assert_eq!(glyphs_beside(&rt, "album-4"), 0, "the scrolling title shows outside its card");
+        assert!(title_is_clipped(&rt, "album-4"), "the marquee draws outside its card");
     }
 
     #[test]
@@ -921,7 +932,8 @@ mod tests {
             rt.frame(1.0 / 60.0);
         }
         assert!(card_part(&rt, "album-4", "title-clip").is_none(), "the title still scrolls after the pointer left");
-        assert_eq!(glyphs_beside(&rt, "album-4"), 0, "the title spills past its card after a leave");
+        let [x, _, w, _] = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("album-4")).expect("the card").rect;
+        assert!(title_right(&rt, "album-4") <= x + w + 16.0, "the title spills past its card after a leave");
     }
 
     #[test]

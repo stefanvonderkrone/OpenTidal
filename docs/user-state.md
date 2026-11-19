@@ -291,7 +291,7 @@ Returning to a list read to its end reads its first page again behind the rows
 already shown. Returning to a list whose pass stopped part way resumes that pass
 and does not read the first page again.
 
-A pass obeys five rules.
+A pass obeys six rules.
 
 1. Apply each page as it lands. An earlier page adds and reorders members, but
    it never removes one, because a member it omits may sit on a later page. A
@@ -311,6 +311,10 @@ A pass obeys five rules.
    token. A fresh token Tidal rejects too ends the session. A renewal that
    fails without ending the grant stalls every pass that waited on it, and a
    later scroll retries the pass.
+6. Start no page while a cover batch runs. Pages and covers share one request
+   pacer, so a long sync would otherwise hold back the covers on screen. A page
+   already in flight finishes. Once the batch lands, the next page starts
+   before the next batch does.
 
 Opening a Tidal album or a Tidal artist starts a pass of its own. An album's
 pass reads its tracks, and an artist's pass reads its albums. Neither list owns
@@ -485,6 +489,7 @@ names the test that covers the code path, and no hand check has happened.
 | A sync for an earlier session is dropped | Start a sync, sign out and back in, drain, assert nothing landed | test: `a_sync_for_an_earlier_session_is_dropped` |
 | A sync for a closed library is dropped | Start a sync, end the session on a dead token, drain, assert the library stays empty | test: `a_sync_for_a_closed_library_is_dropped` |
 | An edit during a sync survives it | Edit while a page is in flight, assert the edit and the page both remain | test: `an_edit_during_a_sync_survives_it` |
+| A cover batch holds back the next page | Hold a cover batch, ask for more rows, assert no page starts, then release the batch and assert the page lands | test: `a_cover_batch_holds_back_the_next_page` |
 | A dead token found by a sync ends the session | A page returns a dead grant, assert no library, no token, and the last edit on disk | test: `a_dead_refresh_token_during_sync_closes_the_library` |
 | A failed page keeps the earlier pages | Serve an error as page 3, assert pages 1 and 2 stay in memory and on disk | test: `a_failed_page_keeps_the_earlier_pages` |
 | A paged list is read to its last page | Two liked-track pages, assert all three members in order | test: `liked_tracks_follow_the_cursor_to_the_last_page` |

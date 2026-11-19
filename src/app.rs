@@ -709,6 +709,11 @@ impl App {
     /// profile fetch may refresh the token. An expired token is renewed first,
     /// unless the last profile fetch could not reach Tidal, so an offline
     /// session does not retry on every frame. The page worker never refreshes.
+    ///
+    /// No page starts while a cover batch runs. Both share one request pacer,
+    /// so a full sync would hold back the covers the user is looking at. A
+    /// landed batch is no longer pending, so one page starts before the next
+    /// batch does.
     fn pump(&mut self) {
         if self.token_in_use() {
             return;
@@ -720,6 +725,9 @@ impl App {
             if self.profile_error.is_none() {
                 self.renew_token();
             }
+            return;
+        }
+        if self.cover_fetch.is_pending() {
             return;
         }
         let Some(request) = open.passes.next_request(&token.access_token) else {
@@ -2932,6 +2940,38 @@ mod tests {
         release.send(()).unwrap();
         drain_until(&mut app, |a| shown(a) == 2);
         assert_eq!(shown(&app), 2, "the cover wanted during a batch never arrived");
+    }
+
+    /// A running cover batch holds back the next page, because both share one
+    /// request pacer and the covers are what the user is looking at. The page
+    /// starts once the batch lands.
+    #[test]
+    fn a_cover_batch_holds_back_the_next_page() {
+        let dir = TempDir::new("covers-before-pages");
+        let (mut app, _) = covered_app("173210380", &dir.path(), &dir.0.join("covers"), 1);
+        let inner = Arc::new(tidal::FakeService {
+            covers: BTreeMap::from([("art-0".to_string(), Ok(crate::covers::tests::magenta()))]),
+            pages: BTreeMap::from([(RemoteList::Liked, vec![page(&["seed-track-1"]), page(&["seed-track-2"])])]),
+            ..tidal::FakeService::default()
+        });
+        let release = gate(&mut app, inner);
+        app.revalidate_on_entry = true;
+        crate::state::open_section(&mut app.core, crate::state::Route::LikedSongs);
+        drain_until(&mut app, |a| settled(a) && a.core.lib.is_liked(&track(1)));
+        want_covers(&app);
+        app.drain();
+        assert!(app.cover_fetch.is_pending(), "the fixture started no batch");
+
+        app.want(RemoteList::Liked, 2);
+        for _ in 0..20 {
+            app.drain();
+        }
+        assert!(!app.pages.is_pending(), "a page started while a cover batch ran");
+
+        release.send(()).unwrap();
+        drain_until(&mut app, |a| settled(a) && a.pass_status(RemoteList::Liked) == PassStatus::Complete);
+        assert_eq!(app.core.lib.liked.to_vec(), tracks(&[1, 2]), "the page never started after the batch landed");
+        assert_eq!(shown(&app), 1, "the batch did not land");
     }
 
     /// A batch started for one account and landing after another opened is

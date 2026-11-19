@@ -233,8 +233,10 @@ impl Catalogue {
         cat
     }
 
-    /// Merge rows and return how many it dropped. Artists go first, then albums
-    /// whose artist is known, then tracks whose album and artist are known, then
+    /// Merge rows and return how many it dropped. Artists go first, then albums.
+    /// An album that names an artist the catalogue lacks adds that artist as
+    /// "Unknown artist", and a later artist row with the id renames it. Then
+    /// tracks whose album and artist are known, then
     /// catalogue playlists with their known tracks. A row with a malformed id or
     /// duration is dropped. A malformed or empty cover never drops a row: it
     /// keeps the cover the entry already has, or none. A known id updates its
@@ -252,11 +254,16 @@ impl Catalogue {
             changed |= upsert(&mut self.artists, &mut self.artist_at, Artist { id, name: row.name }, |a| &a.id);
         }
         for row in rows.albums {
-            let (Some(id), Some(artist)) = (mint(&row.id).map(AlbumId), self.artist_id(&row.artist))
+            let (Some(id), Some(artist)) =
+                (mint(&row.id).map(AlbumId), self.artist_id(&row.artist).or_else(|| mint(&row.artist).map(ArtistId)))
             else {
                 dropped += 1;
                 continue;
             };
+            if self.artist(&artist).is_none() {
+                let stub = Artist { id: artist.clone(), name: UNKNOWN_ARTIST.into() };
+                changed |= upsert(&mut self.artists, &mut self.artist_at, stub, |a| &a.id);
+            }
             let known = self.album(&id).and_then(|a| a.cover.clone());
             let cover = mint(&row.cover).map(ArtworkId).or(known);
             let album = Album { id, title: row.title, artist, cover };
@@ -487,6 +494,10 @@ fn upsert<I: Ord + Clone, T: PartialEq>(
 /// this only stops a damaged row from becoming a key.
 const MAX_ID_LEN: usize = 64;
 
+/// The name of an artist that an album names but no page includes. Tidal
+/// names such artists in a relationship and answers no read for them.
+const UNKNOWN_ARTIST: &str = "Unknown artist";
+
 /// Whether text has the shape of an id: ASCII letters, digits and hyphens, from
 /// one to 64 bytes. Such text is also a safe single path component, which the
 /// cover cache relies on for user ids and artwork ids.
@@ -699,7 +710,7 @@ mod tests {
         let mut cat = Catalogue::default();
         let dropped = cat.absorb(CatalogueRows {
             artists: vec![artist("1")],
-            albums: vec![album("10", "1"), album("11", "2")],
+            albums: vec![album("10", "1")],
             tracks: vec![track("100", "10", "1"), track("101", "11", "1"), track("102", "10", "2")],
             playlists: vec![PlaylistRow {
                 id: "e".into(),
@@ -709,13 +720,35 @@ mod tests {
                 cover: String::new(),
             }],
         });
-        assert_eq!(dropped, 4);
-        assert!(cat.album_id("11").is_none(), "an album with an unknown artist got in");
+        assert_eq!(dropped, 3);
         assert!(cat.track_id("101").is_none(), "a track with an unknown album got in");
         assert!(cat.track_id("102").is_none(), "a track with an unknown artist got in");
         assert!(cat.track_id("100").is_some());
         let e = cat.playlists().find(|p| p.id.as_str() == "e").unwrap();
         assert_eq!(e.tracks.to_vec(), vec![cat.track_id("100").unwrap()]);
+    }
+
+    /// Tidal names album artists that no page includes and no read returns. The
+    /// album and its tracks stay, under an unknown artist that a later artist
+    /// row renames in place.
+    #[test]
+    fn an_album_whose_artist_is_missing_keeps_its_tracks() {
+        let mut cat = Catalogue::default();
+        let dropped = cat.absorb(CatalogueRows {
+            albums: vec![album("428755424", "51278646")],
+            tracks: vec![track("100", "428755424", "51278646")],
+            ..CatalogueRows::default()
+        });
+        assert_eq!(dropped, 0, "a row was dropped for an artist Tidal did not include");
+        let held = cat.track(&cat.track_id("100").expect("the track was dropped")).unwrap();
+        let album = cat.album(&held.album).expect("the track names no album");
+        assert_eq!(album.title, "428755424 title");
+        let named = album.artist.clone();
+        assert_eq!(cat.artist(&named).unwrap().name, "Unknown artist");
+
+        assert_eq!(cat.absorb(CatalogueRows { artists: vec![artist("51278646")], ..CatalogueRows::default() }), 0);
+        assert_eq!(cat.artists().count(), 1, "the real artist did not replace the stub");
+        assert_eq!(cat.artist(&named).unwrap().name, "51278646 name");
     }
 
     /// Absorbing new rows never removes an earlier id, so an id held by a route or

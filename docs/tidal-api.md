@@ -111,6 +111,11 @@ it never removes one, because a member it omits may sit on a later page. Only a
 complete pass, whose last page landed, can remove a member that Tidal no longer
 lists. A member the catalogue cannot hold is dropped and counted.
 
+A page can name an album artist that it does not include. The catalogue keeps
+that album and its tracks, and it holds the artist under the name
+"Unknown artist". A later page that includes the artist renames it in place. A
+row with a malformed id is still dropped.
+
 Nested folders are dropped. The public API cannot derive them. The folder
 endpoints need `r_usr`, which this app cannot request. The deprecated folder
 view does not carry a parent field in its schema. Local collections stay flat.

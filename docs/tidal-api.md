@@ -90,17 +90,32 @@ An album's tracks and an artist's albums own no list in the library. Their
 pages fill the catalogue, and the album and artist screens draw what the
 catalogue holds for that album or artist.
 
-Artist pictures come from one batched read per 20 artists:
-`GET /artists?filter%5Bid%5D=<id>%2C<id>...&include=profileArt`. Each artist
-in `data` names its artwork in `relationships.profileArt.data[0].id`, and the
-artwork in `included` carries `files[].href` and `meta.width`, the shape an
-album cover has. The read takes at most 20 ids, because 50 ids answered `400`.
-The answers come back in request order, one per artist. An artist with an
-empty `profileArt`, an id Tidal does not know, or an artwork missing from
-`included` has no picture. That is not an error, so it is not logged. The cover
+Covers come from one batched `filter[id]` read per 20 owners of one kind. The
+cover worker sends every miss under its cap in one batch. The batch groups the
+requests by kind, and each group takes its own reads:
+
+- Albums: `GET /albums?filter%5Bid%5D=<id>%2C<id>...&include=coverArt`
+- Playlists: `GET /playlists?filter%5Bid%5D=<id>%2C<id>...&include=coverArt`
+- Artists: `GET /artists?filter%5Bid%5D=<id>%2C<id>...&include=profileArt`
+
+Each owner names its artwork in `relationships.coverArt.data[0].id`, or in
+`relationships.profileArt.data[0].id` for an artist. The artwork in `included`
+carries `files[].href` and `meta.width`. The owner is looked up in `data` and
+in `included`, because an artist read can answer `data` with bare
+identifiers. A read takes at most 20 ids for every kind. 22 playlist ids, 25
+and 50 album ids, and 50 artist ids answered `400` in read-only probes on
+2026-11-19, made before this change.
+
+The results come back in request order, one per request. An owner with an
+empty relationship, an id Tidal does not know, or an artwork missing from
+`included` has no cover. That is not an error, so it is not logged. The cover
 is `Unavailable`, so the app asks again only after the next page lands, not in
-the next batch. A read that fails fails every artist of its chunk
-with the same error, so a rate limit defers them all.
+the next batch. A read that fails fails every request of its chunk with the
+same error, so a rate limit defers them all. A read that answers
+`Unauthorized` stops the batch, and no later chunk is read.
+
+The single read `GET /albums/<id>/relationships/coverArt?include=coverArt`
+remains in `HttpService::cover`, but the cover worker does not use it.
 
 An artist picture is cached under the key `artist-<id>`, not under its artwork
 id, because only the batched read names the artwork. A cached picture is

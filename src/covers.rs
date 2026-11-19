@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::catalogue::{ArtworkId, CoverOwner, CoverRequest, is_id_shaped};
+use crate::catalogue::{ArtworkId, CoverRequest, is_id_shaped};
 use crate::tidal::{MusicService, ServiceError};
 
 /// The most cover files one account keeps. Only files whose name parses as
@@ -152,13 +152,12 @@ pub enum CoverOutcome {
 /// The cover worker body. It first sweeps leftover temporary files. Then, for
 /// each request, a hit is `Ready` with no network. A miss with a token fetches
 /// through the service and puts the bytes, while fewer than [`MAX_FETCHES`]
-/// misses are fetching. Artist misses go to the service in one
-/// `artist_pictures` call, and each still counts toward the cap. Album and
-/// playlist misses fetch one by one. A miss with no token is `Unavailable`.
-/// One failure never stops the other requests, except `Unauthorized`, which
-/// marks the remaining misses `Unavailable` rather than spending more requests
-/// on a rejected token. The worker never refreshes a token, so it never races
-/// the sync or the profile fetch over one refresh token.
+/// misses are fetching. Every miss under the cap, of any kind, goes to the
+/// service in one `cover_batch` call. A miss with no token is `Unavailable`.
+/// One failure never stops the other requests. A rejected token makes the
+/// service send no further read, so its misses come back `Unavailable`. The
+/// worker never refreshes a token, so it never races the sync or the profile
+/// fetch over one refresh token.
 ///
 /// Every request gets one outcome in request order, except a miss past the
 /// cap, which gets none and stays wanted for the next batch.
@@ -170,39 +169,24 @@ pub fn resolve(
 ) -> Vec<(ArtworkId, CoverOutcome)> {
     cache.sweep();
     let mut outcomes: Vec<Option<CoverOutcome>> = vec![None; requests.len()];
-    let mut artists = Vec::new();
-    let mut singles = Vec::new();
+    let mut misses = Vec::new();
     for (slot, request) in requests.iter().enumerate() {
         if let Some(path) = cache.get(&request.artwork) {
             outcomes[slot] = Some(CoverOutcome::Ready(path));
         } else if token.is_none() {
             outcomes[slot] = Some(CoverOutcome::Unavailable);
-        } else if artists.len() + singles.len() < MAX_FETCHES {
-            match request.owner {
-                CoverOwner::Artist(_) => artists.push(slot),
-                CoverOwner::Album(_) | CoverOwner::Playlist(_) => singles.push(slot),
-            }
+        } else if misses.len() < MAX_FETCHES {
+            misses.push(slot);
         }
     }
-    let fetches = artists.len() + singles.len();
     if let Some(token) = token {
-        let mut rejected = false;
-        if !artists.is_empty() {
-            let batch: Vec<CoverRequest> = artists.iter().map(|&slot| requests[slot].clone()).collect();
-            let results = service.artist_pictures(token, &batch);
-            for (&slot, (_, result)) in artists.iter().zip(results) {
-                outcomes[slot] = Some(outcome(cache, &requests[slot].artwork, result, &mut rejected));
-            }
-            for &slot in &artists {
-                outcomes[slot].get_or_insert(CoverOutcome::Unavailable);
-            }
+        let batch: Vec<CoverRequest> = misses.iter().map(|&slot| requests[slot].clone()).collect();
+        let results = service.cover_batch(token, &batch);
+        for (&slot, (_, result)) in misses.iter().zip(results) {
+            outcomes[slot] = Some(outcome(cache, &requests[slot].artwork, result));
         }
-        for slot in singles {
-            outcomes[slot] = Some(if rejected {
-                CoverOutcome::Unavailable
-            } else {
-                outcome(cache, &requests[slot].artwork, service.cover(token, &requests[slot]), &mut rejected)
-            });
+        for &slot in &misses {
+            outcomes[slot].get_or_insert(CoverOutcome::Unavailable);
         }
     }
     let outcomes: Vec<(ArtworkId, CoverOutcome)> = requests
@@ -210,19 +194,14 @@ pub fn resolve(
         .zip(outcomes)
         .filter_map(|(request, outcome)| Some((request.artwork, outcome?)))
         .collect();
-    eprintln!("opentidal: a cover batch fetched {fetches} of {} covers", outcomes.len());
+    eprintln!("opentidal: a cover batch fetched {} of {} covers", misses.len(), outcomes.len());
     outcomes
 }
 
 /// What one fetch came to. The bytes are put, and an error maps to the outcome
-/// the app acts on. `Unauthorized` sets `rejected`. A missing artist picture is
-/// the normal case for many artists, so it is not logged.
-fn outcome(
-    cache: &CoverCache,
-    artwork: &ArtworkId,
-    fetched: Result<Vec<u8>, ServiceError>,
-    rejected: &mut bool,
-) -> CoverOutcome {
+/// the app acts on. A missing cover is the normal case for many artists, so it
+/// is not logged.
+fn outcome(cache: &CoverCache, artwork: &ArtworkId, fetched: Result<Vec<u8>, ServiceError>) -> CoverOutcome {
     match fetched {
         Ok(bytes) => match cache.put(artwork, &bytes) {
             Ok(path) => CoverOutcome::Ready(path),
@@ -231,15 +210,11 @@ fn outcome(
                 CoverOutcome::Unavailable
             }
         },
-        Err(ServiceError::NoPicture) => CoverOutcome::Unavailable,
+        Err(ServiceError::NoCover) => CoverOutcome::Unavailable,
         Err(error) => {
             eprintln!("opentidal: cannot fetch cover {}: {error:?}", artwork.as_str());
             match error {
                 ServiceError::RateLimited(_) => CoverOutcome::Deferred,
-                ServiceError::Unauthorized => {
-                    *rejected = true;
-                    CoverOutcome::Unavailable
-                }
                 _ => CoverOutcome::Unavailable,
             }
         }
@@ -594,12 +569,29 @@ pub(crate) mod tests {
         cat.artist(&cat.artist_id(id).unwrap()).unwrap().cover_request().unwrap()
     }
 
-    fn artist_reads(service: &crate::tidal::FakeService) -> usize {
-        service.artist_picture_calls.load(std::sync::atomic::Ordering::SeqCst)
+    /// A request for the cover of a Tidal playlist with this artwork id.
+    fn playlist(artwork_id: &str) -> CoverRequest {
+        let mut cat = Catalogue::seed();
+        let id = format!("playlist-{artwork_id}");
+        cat.absorb(CatalogueRows {
+            playlists: vec![crate::catalogue::PlaylistRow {
+                id: id.clone(),
+                name: "Cover test".into(),
+                description: String::new(),
+                tracks: Vec::new(),
+                cover: artwork_id.into(),
+            }],
+            ..CatalogueRows::default()
+        });
+        cat.playlist(&cat.playlist_id(&id).unwrap()).unwrap().cover_request().unwrap()
     }
 
-    /// Twenty artist misses cost one batched read and no single cover read,
-    /// and every picture lands under its own artist.
+    fn batch_reads(service: &crate::tidal::FakeService) -> usize {
+        service.cover_batch_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Twenty artist misses cost one batched read, and every picture lands
+    /// under its own artist.
     #[test]
     fn twenty_artist_misses_make_one_batched_read() {
         let root = tempfile::tempdir().unwrap();
@@ -610,8 +602,7 @@ pub(crate) mod tests {
         let svc = service(&answers.iter().map(|(id, a)| (id.as_str(), a.clone())).collect::<Vec<_>>());
 
         let outcomes = resolve(&cache, &svc, Some("tok"), ids.iter().map(|id| artist(id)).collect());
-        assert_eq!(artist_reads(&svc), 1, "twenty artists did not share one read");
-        assert_eq!(calls(&svc), 0, "an artist took a single cover read");
+        assert_eq!(batch_reads(&svc), 1, "twenty artists did not share one read");
         let expected: Vec<(ArtworkId, CoverOutcome)> = ids
             .iter()
             .map(|id| {
@@ -623,27 +614,32 @@ pub(crate) mod tests {
         assert_eq!(outcomes, expected);
     }
 
-    /// An artist Tidal does not know and an artist with no profile art both
-    /// come back `Unavailable`, so the app does not ask for them in the next
-    /// batch the way it does for a missing or `Deferred` outcome.
+    /// An owner of any kind with no cover comes back `Unavailable`, so the app
+    /// does not ask for it in the next batch the way it does for a missing or
+    /// `Deferred` outcome.
     #[test]
-    fn an_artist_with_no_picture_is_unavailable() {
+    fn an_owner_with_no_cover_is_unavailable() {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(root.path());
-        let svc = service(&[("artist-9001", Err(ServiceError::NoPicture))]);
+        let svc = service(&[("artist-9001", Err(ServiceError::NoCover))]);
 
-        let outcomes = resolve(&cache, &svc, Some("tok"), vec![artist("9001"), artist("9002")]);
+        let outcomes =
+            resolve(&cache, &svc, Some("tok"), vec![artist("9001"), artist("9002"), request("dead-album"), playlist("dead-list")]);
         assert_eq!(
             outcomes,
-            [(artwork("artist-9001"), CoverOutcome::Unavailable), (artwork("artist-9002"), CoverOutcome::Unavailable)]
+            [
+                (artwork("artist-9001"), CoverOutcome::Unavailable),
+                (artwork("artist-9002"), CoverOutcome::Unavailable),
+                (artwork("dead-album"), CoverOutcome::Unavailable),
+                (artwork("dead-list"), CoverOutcome::Unavailable),
+            ]
         );
-        assert_eq!(artist_reads(&svc), 1);
-        assert!(names(&cache.dir).is_empty(), "a missing picture left a file");
+        assert_eq!(batch_reads(&svc), 3, "each kind did not take one read");
+        assert!(names(&cache.dir).is_empty(), "a missing cover left a file");
     }
 
-    /// Albums and artists in one batch: each album takes its own read with its
-    /// own outcome, the artists share one read, and the order is the request
-    /// order.
+    /// Albums, playlists and artists in one batch: one `cover_batch` call,
+    /// one read per kind, every outcome in request order.
     #[test]
     fn a_mixed_batch_keeps_every_outcome_in_place() {
         let root = tempfile::tempdir().unwrap();
@@ -653,8 +649,16 @@ pub(crate) mod tests {
             ("artist-7", Ok(magenta())),
             ("album-bad", Err(ServiceError::Http("500".to_string()))),
             ("album-limited", Err(ServiceError::RateLimited("429".to_string()))),
+            ("list-ok", Ok(magenta())),
         ]);
-        let requests = vec![request("album-ok"), artist("7"), request("album-bad"), artist("8"), request("album-limited")];
+        let requests = vec![
+            request("album-ok"),
+            artist("7"),
+            playlist("list-ok"),
+            request("album-bad"),
+            artist("8"),
+            request("album-limited"),
+        ];
 
         let outcomes = resolve(&cache, &svc, Some("tok"), requests);
         assert_eq!(
@@ -662,29 +666,36 @@ pub(crate) mod tests {
             [
                 (artwork("album-ok"), CoverOutcome::Ready(cache.path(&artwork("album-ok")))),
                 (artwork("artist-7"), CoverOutcome::Ready(cache.path(&artwork("artist-7")))),
+                (artwork("list-ok"), CoverOutcome::Ready(cache.path(&artwork("list-ok")))),
                 (artwork("album-bad"), CoverOutcome::Unavailable),
                 (artwork("artist-8"), CoverOutcome::Unavailable),
                 (artwork("album-limited"), CoverOutcome::Deferred),
             ]
         );
-        assert_eq!((calls(&svc), artist_reads(&svc)), (3, 1));
+        assert_eq!((calls(&svc), batch_reads(&svc)), (6, 3));
     }
 
-    /// Each artist picture is one fetch toward the cap, though the artists
-    /// share one read. With the cap full of artists, an album waits for the
-    /// next batch and gets no outcome.
+    /// Each cover is one fetch toward the cap, though a kind shares one read.
+    /// With the cap full of artists, albums and playlists, one more album waits
+    /// for the next batch and gets no outcome.
     #[test]
-    fn the_cap_counts_artist_pictures() {
+    fn the_cap_counts_every_kind() {
         let root = tempfile::tempdir().unwrap();
         let cache = cache(root.path());
-        let mut requests: Vec<CoverRequest> = (0..MAX_FETCHES).map(|n| artist(&(500 + n).to_string())).collect();
-        requests.push(request("album-late"));
+        let requests: Vec<CoverRequest> = (0..MAX_FETCHES)
+            .map(|n| match n % 3 {
+                0 => artist(&(500 + n).to_string()),
+                1 => request(&format!("album-{n}")),
+                _ => playlist(&format!("list-{n}")),
+            })
+            .chain([request("album-late")])
+            .collect();
         let svc = service(&[("album-late", Ok(magenta()))]);
 
         let outcomes = resolve(&cache, &svc, Some("tok"), requests);
         assert_eq!(outcomes.len(), MAX_FETCHES);
         assert!(outcomes.iter().all(|(id, _)| id != &artwork("album-late")), "a request past the cap got an outcome");
-        assert_eq!(calls(&svc), 0, "the album was fetched past the cap");
+        assert_eq!(calls(&svc), MAX_FETCHES, "the album was fetched past the cap");
     }
 
     /// A cover whose decode failed is evicted, so the next request fetches it.

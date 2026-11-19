@@ -710,6 +710,20 @@ fn playlist_items(id: &str) -> String {
     )
 }
 
+/// The tracks of one album. The included albums name their artists, so each
+/// track's album resolves.
+fn album_items(id: &str) -> String {
+    format!(
+        "/albums/{id}/relationships/items?include=items,items.artists,items.albums,items.albums.coverArt,items.albums.artists"
+    )
+}
+
+/// The albums of one artist. `/artists/{id}/relationships/tracks` answered
+/// `400` live with every include tried, so an artist reads its albums only.
+fn artist_albums(id: &str) -> String {
+    format!("/artists/{id}/relationships/albums?include=albums,albums.artists,albums.coverArt")
+}
+
 /// One page of `of`, over any page source. `after: None` starts at the first
 /// favorited page for `RemoteList::Playlists`, so its owned read follows.
 fn fetch_page(
@@ -725,6 +739,8 @@ fn fetch_page(
         RemoteList::Artists => (FOLLOWED.to_owned(), "artists", Leg::Last),
         RemoteList::Playlists => (FAVORITED.to_owned(), "playlists", Leg::Favorited),
         RemoteList::Playlist(id) => (playlist_items(id.as_str()), "tracks", Leg::Last),
+        RemoteList::Album(id) => (album_items(id.as_str()), "tracks", Leg::Last),
+        RemoteList::Artist(id) => (artist_albums(id.as_str()), "albums", Leg::Last),
     };
     let at = after.cloned().unwrap_or(Cursor { leg, path: first });
     let doc = get(&at.path)?;
@@ -845,6 +861,8 @@ mod tests {
 
     const EVENING: &str = "f6b9f0a1-6c8e-4d24-9c71-1d0e2f3a4b5c";
     const MORNING: &str = "0c1d2e3f-4a5b-6c7d-8e9f-a0b1c2d3e4f5";
+    const CURRENTS: &str = "251380836";
+    const TAME_IMPALA: &str = "1566";
 
     /// The fixture for each path the read asks for. A path with no fixture
     /// panics, so a read that asks for something unexpected names it.
@@ -859,6 +877,8 @@ mod tests {
             p if p == owned("173210380") => "owned-playlists.json",
             p if p == playlist_items(EVENING) => "playlist-items.json",
             p if p == playlist_items(MORNING) => "owned-playlist-items.json",
+            p if p == album_items(CURRENTS) => "album-items.json",
+            p if p == artist_albums(TAME_IMPALA) => "artist-albums.json",
             other => panic!("the read asked for a path with no fixture: {other}"),
         }
     }
@@ -929,6 +949,62 @@ mod tests {
         assert_eq!(cover("Currents").as_deref(), Some("251380836-large"));
         assert_eq!(cover("In Rainbows").as_deref(), Some("108043637-large"));
         assert_eq!(evening.cover.as_ref().map(|c| c.as_str()), Some("playlist-cover-1"));
+    }
+
+    /// A catalogue that holds the fixtures' artist and album and none of their
+    /// tracks, as when the user opens the album or the artist from Albums.
+    fn holding_currents() -> Catalogue {
+        let mut cat = Catalogue::seed();
+        cat.absorb(CatalogueRows {
+            artists: vec![ArtistRow { id: TAME_IMPALA.into(), name: "Tame Impala".into() }],
+            albums: vec![AlbumRow {
+                id: CURRENTS.into(),
+                title: "Currents".into(),
+                artist: TAME_IMPALA.into(),
+                cover: String::new(),
+            }],
+            ..CatalogueRows::default()
+        });
+        cat
+    }
+
+    /// Read page one of `of` from the fixtures and merge it as the app does.
+    fn merge_first_page(lib: &mut Library, cat: &mut Catalogue, of: RemoteList) -> crate::library::MergeReport {
+        let mut get = |path: &str| Ok(fixture(fixture_path(path)));
+        let page = fetch_page(&mut get, "/v2", "173210380", &of, None).unwrap();
+        assert_eq!(page.next, None, "the fixture has one page");
+        lib.merge(cat, Merge { list: of, rows: page.rows, confirmed: page.members, reach: Reach::Complete })
+    }
+
+    /// Opening an album reads its tracks into the catalogue, so the album
+    /// screen lists them. No library list changes.
+    #[test]
+    fn an_album_page_brings_its_tracks() {
+        let mut cat = holding_currents();
+        let mut lib = Library::default();
+        let album = cat.album_id(CURRENTS).unwrap();
+        assert_eq!(cat.tracks_of_album(&album).count(), 0);
+
+        let report = merge_first_page(&mut lib, &mut cat, RemoteList::Album(album.clone()));
+        let titles: Vec<&str> = cat.tracks_of_album(&album).map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["Let It Happen", "The Less I Know the Better"]);
+        assert_eq!(report, crate::library::MergeReport { members: 2, dropped: 0 });
+        assert_eq!(lib, Library::default(), "an album page changed the library");
+    }
+
+    /// Opening an artist reads its albums into the catalogue, so the artist
+    /// screen shows its discography. No library list changes.
+    #[test]
+    fn an_artist_page_brings_its_albums() {
+        let mut cat = holding_currents();
+        let mut lib = Library::default();
+        let artist = cat.artist_id(TAME_IMPALA).unwrap();
+
+        let report = merge_first_page(&mut lib, &mut cat, RemoteList::Artist(artist.clone()));
+        let titles: Vec<&str> = cat.albums().filter(|a| a.artist == artist).map(|a| a.title.as_str()).collect();
+        assert_eq!(titles, ["Currents", "Let It Happen EP", "The Less I Know the Better"]);
+        assert_eq!(report, crate::library::MergeReport { members: 3, dropped: 0 });
+        assert_eq!(lib, Library::default(), "an artist page changed the library");
     }
 
     /// A page whose `next` is the given link, and nothing else.
@@ -1064,7 +1140,7 @@ mod tests {
     /// for them.
     #[test]
     fn http_pages_read_one_response_per_call() {
-        let (base, log, server) = serve_logged(6, |path| {
+        let (base, log, server) = serve_logged(8, |path| {
             let relative = path.strip_prefix("/v2").unwrap();
             let body = if relative.starts_with("/userCollectionArtists/") {
                 r#"{"data":[],"links":{"next":"https://evil.example/v2/x"}}"#.to_owned()
@@ -1087,16 +1163,24 @@ mod tests {
         assert_eq!(second.members, ["98765432"]);
         assert_eq!(second.next, None, "the last page did not end the chain");
 
-        for of in [RemoteList::Albums, RemoteList::Playlists, RemoteList::Playlist(tidal_playlist(EVENING))] {
+        let cat = holding_currents();
+        let (album, artist) = (cat.album_id(CURRENTS).unwrap(), cat.artist_id(TAME_IMPALA).unwrap());
+        for of in [
+            RemoteList::Albums,
+            RemoteList::Playlists,
+            RemoteList::Playlist(tidal_playlist(EVENING)),
+            RemoteList::Album(album),
+            RemoteList::Artist(artist),
+        ] {
             svc.page("tok", "173210380", &of, None).unwrap();
         }
-        assert_eq!(requests(), 5, "one call made more than one request");
+        assert_eq!(requests(), 7, "one call made more than one request");
         let refused = svc.page("tok", "173210380", &RemoteList::Artists, None);
         assert!(matches!(refused, Err(ServiceError::Decode(_))), "a foreign next was accepted: {refused:?}");
         server.join().unwrap();
 
         let log = log.lock().unwrap();
-        assert_eq!(log.len(), 6, "a foreign next was fetched");
+        assert_eq!(log.len(), 8, "a foreign next was fetched");
         assert!(log.iter().all(|(_, bearer)| *bearer), "a request went without the token: {log:?}");
         assert!(log[1].0.ends_with("page%5Bcursor%5D=page-2"), "the second page was not the first page's next: {log:?}");
         let includes = |start: &str| -> Vec<String> {
@@ -1110,6 +1194,8 @@ mod tests {
         assert!(includes(&format!("/v2/playlists/{EVENING}/")).contains(&"items.albums.coverArt".into()), "{log:?}");
         assert!(includes("/v2/userCollectionTracks/").contains(&"items.albums.artists".into()), "{log:?}");
         assert!(includes(&format!("/v2/playlists/{EVENING}/")).contains(&"items.albums.artists".into()), "{log:?}");
+        assert!(includes(&format!("/v2/albums/{CURRENTS}/relationships/items")).contains(&"items.albums.artists".into()), "{log:?}");
+        assert!(includes(&format!("/v2/artists/{TAME_IMPALA}/relationships/albums")).contains(&"albums.artists".into()), "{log:?}");
     }
 
     /// The playlists list reads the favorited playlists, then the owned ones,

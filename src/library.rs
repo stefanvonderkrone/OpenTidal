@@ -160,11 +160,15 @@ pub enum RemoteList {
     Playlists,
     /// The tracks of one Tidal playlist. Never a seed playlist.
     Playlist(CataloguePlaylistId),
+    /// The tracks of one Tidal album. Never a seed album.
+    Album(AlbumId),
+    /// The albums of one Tidal artist. Never a seed artist.
+    Artist(ArtistId),
 }
 
 impl RemoteList {
-    /// The remote list the route shows, if it shows one. A seed playlist is
-    /// not on Tidal, so it has none.
+    /// The remote list the route shows, if it shows one. A seed item is not
+    /// on Tidal, so it has none.
     pub fn of(route: Option<&Route>) -> Option<RemoteList> {
         match route? {
             Route::LikedSongs => Some(RemoteList::Liked),
@@ -172,6 +176,8 @@ impl RemoteList {
             Route::Artists => Some(RemoteList::Artists),
             Route::Playlists => Some(RemoteList::Playlists),
             Route::CataloguePlaylist(id) if !id.is_seed() => Some(RemoteList::Playlist(id.clone())),
+            Route::Album(id) if !id.is_seed() => Some(RemoteList::Album(id.clone())),
+            Route::Artist(id) if !id.is_seed() => Some(RemoteList::Artist(id.clone())),
             _ => None,
         }
     }
@@ -190,6 +196,8 @@ pub struct Merge {
 /// What one merge left in the list it named.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct MergeReport {
+    /// The members the list holds after the merge. For an album or an artist,
+    /// which own no membership list, the confirmed ids the catalogue resolves.
     pub members: usize,
     /// Catalogue rows that absorb dropped, plus confirmed ids that name nothing
     /// the catalogue holds after the absorb.
@@ -457,6 +465,8 @@ impl Library {
     /// Absorb the page's rows into `cat`, then merge the confirmed ids that
     /// resolve into the one list `m.list` names. The tracks of a Tidal
     /// playlist live in the catalogue, so `RemoteList::Playlist` merges there.
+    /// An album's tracks and an artist's albums are derived from the
+    /// catalogue, so those two pages only absorb, and `reach` changes nothing.
     /// Downloads, history, user playlists, collections and the name are
     /// untouched. A confirmed id that does not resolve is counted, not kept.
     pub fn merge(&mut self, cat: &mut Catalogue, m: Merge) -> MergeReport {
@@ -492,6 +502,8 @@ impl Library {
                     0
                 }
             },
+            RemoteList::Album(_) => resolve(m.confirmed, |raw| cat.track_id(raw), &mut dropped).len(),
+            RemoteList::Artist(_) => resolve(m.confirmed, |raw| cat.album_id(raw), &mut dropped).len(),
         };
         MergeReport { members, dropped }
     }
@@ -942,6 +954,21 @@ mod tests {
         assert_eq!(playlist.cover, cover, "a track page changed the cover");
         assert_eq!(report, MergeReport { members: 2, dropped: 0 });
         assert_eq!(lib, before, "a playlist track page changed the library");
+    }
+
+    /// A Tidal album or artist screen names its own read. A seed one is not on
+    /// Tidal, so it names none.
+    #[test]
+    fn a_detail_route_names_its_remote_list_unless_it_is_seed() {
+        let mut cat = Catalogue::seed();
+        cat.absorb(fetched_rows());
+        let (album, artist) = (cat.album_id("x-album").unwrap(), cat.artist_id("x-artist").unwrap());
+        assert_eq!(RemoteList::of(Some(&Route::Album(album.clone()))), Some(RemoteList::Album(album)));
+        assert_eq!(RemoteList::of(Some(&Route::Artist(artist.clone()))), Some(RemoteList::Artist(artist)));
+        let seed_album = cat.album_id("seed-album-0").unwrap();
+        let seed_artist = cat.artist_id("seed-artist-0").unwrap();
+        assert_eq!(RemoteList::of(Some(&Route::Album(seed_album))), None);
+        assert_eq!(RemoteList::of(Some(&Route::Artist(seed_artist))), None);
     }
 
     /// Renaming actually changes the name. The invariant does not constrain

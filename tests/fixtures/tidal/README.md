@@ -30,3 +30,12 @@ from the pinned albums spec, and nothing real backs it. The resource type
 unproven. The decoder matches the included artwork by id only, so it works
 with either type name. It holds a second artwork with another id, so a test
 can prove that the read picks the artwork the relationship names.
+
+`album-items.json` answers
+`/albums/<id>/relationships/items?include=items,items.artists,items.albums,items.albums.coverArt,items.albums.artists`,
+and `artist-albums.json` answers
+`/artists/<id>/relationships/albums?include=albums,albums.artists,albums.coverArt`.
+A live read on 2026-11-19 returned the same resource types for both: tracks in
+`data` for the album, albums in `data` for the artist, and each included album
+with `relationships.artists.data`. The attribute values here are still
+synthetic.

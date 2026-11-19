@@ -60,13 +60,18 @@ id!(
     ArtworkId
 );
 
-impl CataloguePlaylistId {
-    /// Whether the seed holds this playlist. Every other catalogue playlist came
-    /// from a Tidal account, so its name is that account's to see.
-    pub fn is_seed(&self) -> bool {
-        self.0.starts_with(SEED_PREFIX)
-    }
+macro_rules! seeded {
+    ($($name:ident),*) => {$(
+        impl $name {
+            /// Whether the seed holds this item. Every other item came from a
+            /// Tidal account, so only those have a Tidal read.
+            pub fn is_seed(&self) -> bool {
+                self.0.starts_with(SEED_PREFIX)
+            }
+        }
+    )*};
 }
+seeded!(ArtistId, AlbumId, CataloguePlaylistId);
 
 /// The prefix of every seed id. A Tidal id is a number or a UUID, so it never
 /// starts with this.

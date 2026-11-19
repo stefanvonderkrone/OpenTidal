@@ -149,22 +149,34 @@ pub enum CoverOutcome {
     Deferred,
 }
 
+/// What a cover batch does with a miss. A hit is `Ready` either way.
+#[derive(Clone, Debug)]
+pub enum Lookup {
+    /// Read the disk only. A miss gets no outcome and costs no network call,
+    /// so the app can show cached covers while the profile fetch may still
+    /// refresh the token.
+    HitsOnly,
+    /// Fetch misses with this token. With no usable token, every miss is
+    /// `Unavailable`.
+    Fetch(Option<String>),
+}
+
 /// The cover worker body. It first sweeps leftover temporary files. Then, for
-/// each request, a hit is `Ready` with no network. A miss with a token fetches
-/// through the service and puts the bytes, while fewer than [`MAX_FETCHES`]
-/// misses are fetching. Every miss under the cap, of any kind, goes to the
-/// service in one `cover_batch` call. A miss with no token is `Unavailable`.
-/// One failure never stops the other requests. A rejected token makes the
-/// service send no further read, so its misses come back `Unavailable`. The
-/// worker never refreshes a token, so it never races the sync or the profile
-/// fetch over one refresh token.
+/// each request, a hit is `Ready` with no network. Under [`Lookup::Fetch`], a
+/// miss with a token fetches through the service and puts the bytes, while
+/// fewer than [`MAX_FETCHES`] misses are fetching. Every miss under the cap, of
+/// any kind, goes to the service in one `cover_batch` call. A miss with no
+/// token is `Unavailable`. One failure never stops the other requests. A
+/// rejected token makes the service send no further read, so its misses come
+/// back `Unavailable`. The worker never refreshes a token, so it never races
+/// the sync or the profile fetch over one refresh token.
 ///
 /// Every request gets one outcome in request order, except a miss past the
-/// cap, which gets none and stays wanted for the next batch.
+/// cap and a miss under [`Lookup::HitsOnly`], which get none.
 pub fn resolve(
     cache: &CoverCache,
     service: &dyn MusicService,
-    token: Option<&str>,
+    lookup: Lookup,
     requests: Vec<CoverRequest>,
 ) -> Vec<(ArtworkId, CoverOutcome)> {
     cache.sweep();
@@ -173,13 +185,16 @@ pub fn resolve(
     for (slot, request) in requests.iter().enumerate() {
         if let Some(path) = cache.get(&request.artwork) {
             outcomes[slot] = Some(CoverOutcome::Ready(path));
-        } else if token.is_none() {
-            outcomes[slot] = Some(CoverOutcome::Unavailable);
-        } else if misses.len() < MAX_FETCHES {
-            misses.push(slot);
+            continue;
+        }
+        match lookup {
+            Lookup::HitsOnly => {}
+            Lookup::Fetch(None) => outcomes[slot] = Some(CoverOutcome::Unavailable),
+            Lookup::Fetch(Some(_)) if misses.len() < MAX_FETCHES => misses.push(slot),
+            Lookup::Fetch(Some(_)) => {}
         }
     }
-    if let Some(token) = token {
+    if let Lookup::Fetch(Some(token)) = &lookup {
         let batch: Vec<CoverRequest> = misses.iter().map(|&slot| requests[slot].clone()).collect();
         let results = service.cover_batch(token, &batch);
         for (&slot, (_, result)) in misses.iter().zip(results) {
@@ -404,6 +419,10 @@ pub(crate) mod tests {
         }
     }
 
+    fn fetch() -> Lookup {
+        Lookup::Fetch(Some("tok".to_string()))
+    }
+
     fn calls(service: &crate::tidal::FakeService) -> usize {
         service.cover_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -433,7 +452,7 @@ pub(crate) mod tests {
         std::fs::write(cache.dir.join("old.cover.99.tmp"), b"half").unwrap();
         let svc = service(&[("art-1", Ok(magenta()))]);
 
-        let outcomes = resolve(&cache, &svc, Some("tok"), vec![request("art-1")]);
+        let outcomes = resolve(&cache, &svc, fetch(), vec![request("art-1")]);
         let path = cache.path(&artwork("art-1"));
         assert_eq!(outcomes, [(artwork("art-1"), CoverOutcome::Ready(path.clone()))]);
         assert_eq!(std::fs::read(&path).unwrap(), magenta());
@@ -446,8 +465,8 @@ pub(crate) mod tests {
     fn a_hit_makes_no_fetch() {
         let root = tempfile::tempdir().unwrap();
         let svc = service(&[("art-1", Ok(magenta()))]);
-        let first = resolve(&cache(root.path()), &svc, Some("tok"), vec![request("art-1")]);
-        let second = resolve(&cache(root.path()), &svc, Some("tok"), vec![request("art-1")]);
+        let first = resolve(&cache(root.path()), &svc, fetch(), vec![request("art-1")]);
+        let second = resolve(&cache(root.path()), &svc, fetch(), vec![request("art-1")]);
         assert_eq!(first, second);
         assert_eq!(calls(&svc), 1, "a hit fetched the cover again");
     }
@@ -462,7 +481,7 @@ pub(crate) mod tests {
             ("html", Ok(b"<html>".to_vec())),
             ("good", Ok(magenta())),
         ]);
-        let outcomes = resolve(&cache, &svc, Some("tok"), vec![request("bad"), request("html"), request("good")]);
+        let outcomes = resolve(&cache, &svc, fetch(), vec![request("bad"), request("html"), request("good")]);
         assert_eq!(
             outcomes,
             [
@@ -484,7 +503,7 @@ pub(crate) mod tests {
             ("first", Err(ServiceError::Unauthorized)),
             ("second", Ok(magenta())),
         ]);
-        let outcomes = resolve(&cache, &svc, Some("tok"), vec![request("first"), request("hit"), request("second")]);
+        let outcomes = resolve(&cache, &svc, fetch(), vec![request("first"), request("hit"), request("second")]);
         assert_eq!(calls(&svc), 1, "the batch kept fetching on a rejected token");
         assert_eq!(outcomes[0], (artwork("first"), CoverOutcome::Unavailable));
         assert_eq!(outcomes[1], (artwork("hit"), CoverOutcome::Ready(cache.path(&artwork("hit")))));
@@ -501,7 +520,7 @@ pub(crate) mod tests {
             ("limited", Err(ServiceError::RateLimited("429".to_string()))),
             ("next", Ok(magenta())),
         ]);
-        let outcomes = resolve(&cache, &svc, Some("tok"), vec![request("limited"), request("next")]);
+        let outcomes = resolve(&cache, &svc, fetch(), vec![request("limited"), request("next")]);
         assert_eq!(
             outcomes,
             [
@@ -518,7 +537,7 @@ pub(crate) mod tests {
         let cache = cache(root.path());
         cache.put(&artwork("hit"), &magenta()).unwrap();
         let svc = service(&[("miss", Ok(magenta()))]);
-        let outcomes = resolve(&cache, &svc, None, vec![request("hit"), request("miss")]);
+        let outcomes = resolve(&cache, &svc, Lookup::Fetch(None), vec![request("hit"), request("miss")]);
         assert_eq!(
             outcomes,
             [
@@ -527,6 +546,19 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(calls(&svc), 0);
+    }
+
+    /// A hits-only batch serves hits and gives a miss no outcome, so the app
+    /// can tell a miss from a cover that has none. It makes no network call.
+    #[test]
+    fn a_hits_only_batch_leaves_a_miss_without_an_outcome() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = cache(root.path());
+        cache.put(&artwork("hit"), &magenta()).unwrap();
+        let svc = service(&[("miss", Ok(magenta()))]);
+        let outcomes = resolve(&cache, &svc, Lookup::HitsOnly, vec![request("hit"), request("miss")]);
+        assert_eq!(outcomes, [(artwork("hit"), CoverOutcome::Ready(cache.path(&artwork("hit"))))]);
+        assert_eq!(calls(&svc), 0, "a hits-only batch used the network");
     }
 
     /// Hits and damaged files never use up the cap. Past the cap a miss is left
@@ -551,7 +583,7 @@ pub(crate) mod tests {
             answers.iter().map(|(id, a)| (id.as_str(), a.clone())).collect();
         let svc = service(&answers);
 
-        let outcomes = resolve(&cache, &svc, Some("tok"), requests);
+        let outcomes = resolve(&cache, &svc, fetch(), requests);
         assert_eq!(calls(&svc), MAX_FETCHES, "the cap did not stop the fetches");
         assert_eq!(outcomes.len(), 2 * MAX_FETCHES, "hits or damaged files used up the cap");
         assert!(outcomes.iter().all(|(_, o)| matches!(o, CoverOutcome::Ready(_))));
@@ -601,7 +633,7 @@ pub(crate) mod tests {
             ids.iter().map(|id| (format!("artist-{id}"), Ok(magenta()))).collect();
         let svc = service(&answers.iter().map(|(id, a)| (id.as_str(), a.clone())).collect::<Vec<_>>());
 
-        let outcomes = resolve(&cache, &svc, Some("tok"), ids.iter().map(|id| artist(id)).collect());
+        let outcomes = resolve(&cache, &svc, fetch(), ids.iter().map(|id| artist(id)).collect());
         assert_eq!(batch_reads(&svc), 1, "twenty artists did not share one read");
         let expected: Vec<(ArtworkId, CoverOutcome)> = ids
             .iter()
@@ -624,7 +656,7 @@ pub(crate) mod tests {
         let svc = service(&[("artist-9001", Err(ServiceError::NoCover))]);
 
         let outcomes =
-            resolve(&cache, &svc, Some("tok"), vec![artist("9001"), artist("9002"), request("dead-album"), playlist("dead-list")]);
+            resolve(&cache, &svc, fetch(), vec![artist("9001"), artist("9002"), request("dead-album"), playlist("dead-list")]);
         assert_eq!(
             outcomes,
             [
@@ -660,7 +692,7 @@ pub(crate) mod tests {
             request("album-limited"),
         ];
 
-        let outcomes = resolve(&cache, &svc, Some("tok"), requests);
+        let outcomes = resolve(&cache, &svc, fetch(), requests);
         assert_eq!(
             outcomes,
             [
@@ -692,7 +724,7 @@ pub(crate) mod tests {
             .collect();
         let svc = service(&[("album-late", Ok(magenta()))]);
 
-        let outcomes = resolve(&cache, &svc, Some("tok"), requests);
+        let outcomes = resolve(&cache, &svc, fetch(), requests);
         assert_eq!(outcomes.len(), MAX_FETCHES);
         assert!(outcomes.iter().all(|(id, _)| id != &artwork("album-late")), "a request past the cap got an outcome");
         assert_eq!(calls(&svc), MAX_FETCHES, "the album was fetched past the cap");

@@ -16,7 +16,7 @@ use rune::{Image, ImageCache, Latest, TextEdit, Waker};
 use serde::Deserialize;
 use crate::auth::{self, Auth, OAuthConfig, Token, TokenStore};
 use crate::catalogue::{Album, Artist, ArtworkId, Catalogue, CataloguePlaylist, CoverOwner, CoverRequest};
-use crate::covers::{self, CoverCache, CoverOutcome};
+use crate::covers::{self, CoverCache, CoverOutcome, Lookup};
 use crate::library::{Library, RemoteList};
 use crate::pager::{Landed, PageResult, PassStatus, Passes};
 use crate::state::State;
@@ -152,9 +152,16 @@ struct AccountCovers {
 enum CoverState {
     /// The view drew it and no batch took it yet.
     Wanted(CoverOwner),
-    /// A batch holds it. The owner returns it to `Wanted` when the batch gives
-    /// it no outcome, because the batch reached its fetch cap first.
+    /// A batch that may fetch holds it. The owner returns it to `Wanted` when
+    /// the batch gives it no outcome, because the batch reached its fetch cap
+    /// first.
     Fetching(CoverOwner),
+    /// A hits-only batch holds it, because the profile fetch was pending.
+    Checking(CoverOwner),
+    /// A hits-only batch found no file this session. Only a batch that may
+    /// fetch takes it, so a pending profile fetch cannot make every frame read
+    /// the disk again.
+    Checked(CoverOwner),
     /// `ImageCache::file` returned this handle. The handle keeps the decoded
     /// pixels alive, because the image cache holds only weak references.
     Shown(Image),
@@ -387,12 +394,16 @@ impl App {
                     states.insert(id, state);
                 }
             }
-            // A cover the batch gave no outcome waits for the next one. A stale
-            // batch gives none, so its covers go back to wanted as well.
+            // A cover the batch gave no outcome waits for the next one. A
+            // hits-only miss waits for a batch that may fetch. A stale batch
+            // gives none, so its covers go back to wanted.
             for state in states.values_mut() {
-                if let CoverState::Fetching(owner) = state {
-                    *state = CoverState::Wanted(owner.clone());
-                }
+                let next = match state {
+                    CoverState::Checking(owner) if holds => CoverState::Checked(owner.clone()),
+                    CoverState::Fetching(owner) | CoverState::Checking(owner) => CoverState::Wanted(owner.clone()),
+                    _ => continue,
+                };
+                *state = next;
             }
         }
         let mut ready = 0;
@@ -411,19 +422,31 @@ impl App {
         if open.ready.replace(ready) != ready {
             changed = true;
         }
-        let idle = !self.cover_fetch.is_pending() && !self.token_in_use() && self.images.is_some();
+        let idle = !self.cover_fetch.is_pending() && self.images.is_some();
         let (Some(library), Auth::SignedIn { token }) = (&self.library, &self.auth) else {
             return changed;
         };
         if !idle {
             return changed;
         }
+        // The profile fetch may refresh the token, so a batch started now reads
+        // the disk only. A cache hit needs no token.
+        let lookup = if self.token_in_use() {
+            Lookup::HitsOnly
+        } else {
+            Lookup::Fetch((!auth::token_expired(token)).then(|| token.access_token.clone()))
+        };
         let requests: Vec<CoverRequest> = states
             .iter_mut()
             .filter_map(|(id, state)| {
-                let CoverState::Wanted(owner) = state else { return None };
-                let owner = owner.clone();
-                *state = CoverState::Fetching(owner.clone());
+                let owner = match (&lookup, &*state) {
+                    (_, CoverState::Wanted(owner)) | (Lookup::Fetch(_), CoverState::Checked(owner)) => owner.clone(),
+                    _ => return None,
+                };
+                *state = match lookup {
+                    Lookup::HitsOnly => CoverState::Checking(owner.clone()),
+                    Lookup::Fetch(_) => CoverState::Fetching(owner.clone()),
+                };
                 Some(CoverRequest { artwork: id.clone(), owner })
             })
             .collect();
@@ -433,11 +456,8 @@ impl App {
         }
         let ticket = Ticket { session: self.session, user_id: library.user_id.clone() };
         let cache = open.cache.clone();
-        let token = (!auth::token_expired(token)).then(|| token.access_token.clone());
         let service = self.service.clone();
-        self.cover_fetch.request(requests, move |requests| {
-            (ticket, covers::resolve(&cache, &*service, token.as_deref(), requests))
-        });
+        self.cover_fetch.request(requests, move |requests| (ticket, covers::resolve(&cache, &*service, lookup, requests)));
         changed
     }
 
@@ -768,9 +788,9 @@ impl App {
         true
     }
 
-    /// Whether a worker that may refresh the token is running. A page or a
-    /// cover batch waits for it, because two refreshes of one refresh token
-    /// race each other. Only the profile fetch refreshes.
+    /// Whether a worker that may refresh the token is running. A page waits
+    /// for it, and a cover batch reads the disk only, because two refreshes of
+    /// one refresh token race each other. Only the profile fetch refreshes.
     fn token_in_use(&self) -> bool {
         self.profile.is_pending()
     }
@@ -3032,25 +3052,90 @@ mod tests {
         assert_eq!(cover_calls(&service), 0, "a restart fetched a cover it had on disk");
     }
 
-    /// A cover batch does not start while the profile fetch is pending, the
-    /// same guard a page has.
-    #[test]
-    fn a_cover_batch_waits_for_the_profile_fetch() {
-        let dir = TempDir::new("covers-wait-profile");
-        let (mut app, _) = covered_app("173210380", &dir.path(), &dir.0.join("covers"), 1);
+    /// Hold the profile fetch until the returned sender sends, as a slow
+    /// network does after a restart.
+    fn hold_profile(app: &mut App) -> std::sync::mpsc::Sender<()> {
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let session = app.session;
         app.profile.request((), move |_| {
             let _ = wait.recv();
             (session, Err(ServiceError::Http("offline".to_string())))
         });
+        release
+    }
+
+    fn cover_state(app: &App, artwork: &str) -> Option<&'static str> {
+        let open = app.library.as_ref()?.covers.as_ref()?;
+        let states = open.states.borrow();
+        Some(match states.get(&crate::covers::tests::artwork(artwork))? {
+            CoverState::Wanted(_) => "wanted",
+            CoverState::Fetching(_) => "fetching",
+            CoverState::Checking(_) => "checking",
+            CoverState::Checked(_) => "checked",
+            CoverState::Shown(_) => "shown",
+            CoverState::Unavailable => "unavailable",
+        })
+    }
+
+    /// A cover miss makes no network call while the profile fetch is pending,
+    /// the same guard a page has, and it is not marked unavailable. It is
+    /// fetched once the profile lands.
+    #[test]
+    fn a_cover_batch_waits_for_the_profile_fetch() {
+        let dir = TempDir::new("covers-wait-profile");
+        let (mut app, service) = covered_app("173210380", &dir.path(), &dir.0.join("covers"), 1);
+        let release = hold_profile(&mut app);
         want_covers(&app);
-        app.drain();
-        assert!(!app.cover_fetch.is_pending(), "a cover batch started while the profile fetch was pending");
+        drain_until(&mut app, |a| cover_state(a, "art-0") == Some("checked"));
+        assert!(app.profile.is_pending(), "the fixture let the profile land");
+        assert_eq!(cover_calls(&service), 0, "a cover miss used the network while the profile fetch was pending");
+        assert_eq!(cover_state(&app, "art-0"), Some("checked"), "a miss behind the profile fetch was not kept for a fetch");
 
         release.send(()).unwrap();
         drain_until(&mut app, |a| shown(a) == 1);
         assert_eq!(shown(&app), 1, "the cover batch did not start once the profile landed");
+    }
+
+    /// A cover on disk shows while the profile fetch is still pending, with no
+    /// network call. A cache hit needs no token.
+    #[test]
+    fn a_cached_cover_shows_before_the_profile_lands() {
+        let dir = TempDir::new("covers-hit-before-profile");
+        let root = dir.0.join("covers");
+        CoverCache::for_account(&root, "173210380")
+            .unwrap()
+            .put(&crate::covers::tests::artwork("art-0"), &crate::covers::tests::magenta())
+            .unwrap();
+        let (mut app, service) = covered_app("173210380", &dir.path(), &root, 1);
+        let _release = hold_profile(&mut app);
+        want_covers(&app);
+        drain_until(&mut app, |a| shown(a) == 1);
+
+        assert!(app.profile.is_pending(), "the fixture let the profile land");
+        assert_eq!(shown(&app), 1, "a cached cover waited for the profile fetch");
+        assert_eq!(cover_calls(&service), 0);
+    }
+
+    /// A miss behind a pending profile fetch reads the disk once. Later frames
+    /// start no batch for it, so a slow profile fetch cannot spin the loop.
+    #[test]
+    fn a_cover_miss_is_checked_once_while_the_profile_is_pending() {
+        let dir = TempDir::new("covers-miss-before-profile");
+        let (mut app, service) = covered_app("173210380", &dir.path(), &dir.0.join("covers"), 1);
+        let _release = hold_profile(&mut app);
+        want_covers(&app);
+        drain_until(&mut app, |a| cover_state(a, "art-0") == Some("checked"));
+        assert_eq!(cover_state(&app, "art-0"), Some("checked"), "the miss never rested as checked: no batch landed, or each frame took it again");
+
+        for _ in 0..50 {
+            want_covers(&app);
+            app.drain();
+            assert!(!app.cover_fetch.is_pending(), "a checked miss started another batch");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(app.profile.is_pending(), "the fixture let the profile land");
+        assert_eq!(cover_state(&app, "art-0"), Some("checked"));
+        assert_eq!(cover_calls(&service), 0);
     }
 
     /// Restoring a session in `setup` does no cover work: no fetch, no batch,

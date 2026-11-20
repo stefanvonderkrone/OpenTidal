@@ -44,7 +44,7 @@ struct Pass {
     /// Every member id read so far, page one first, without duplicates.
     confirmed: Vec<String>,
     state: State,
-    /// Set by a rejection, cleared by a page that lands. A second rejection
+    /// Set by a rejection, cleared by any other answer. A second rejection
     /// while it is set means the renewed token is dead too.
     renewed: bool,
 }
@@ -197,6 +197,7 @@ impl Pass {
                 return Landed::DeadGrant(error);
             }
             Err(error) => {
+                self.renewed = false;
                 *phase = Phase::Stalled(error);
                 return Landed::Kept;
             }
@@ -556,6 +557,33 @@ mod tests {
         passes.land(answer(&retry, page(&["x"], Some("1")), "b"));
         let later = passes.next_request("b").unwrap();
         assert_eq!(passes.land(answer(&later, Err(ServiceError::Unauthorized), "b")), Landed::Renew);
+    }
+
+    /// A server error between two rejections answers the renewed token, so the
+    /// second rejection renews again. Two rejections in a row still end the grant.
+    #[test]
+    fn a_server_error_after_a_renewal_lets_a_later_rejection_renew_again() {
+        let mut passes = Passes::default();
+        let mut ids = 0;
+        passes.enter(Some(RemoteList::Liked), &mut ids);
+        passes.want(&RemoteList::Liked, 10);
+        let request = passes.next_request("a").unwrap();
+        assert_eq!(passes.land(answer(&request, Err(ServiceError::Unauthorized), "a")), Landed::Renew);
+        let renewed = passes.next_request("b").unwrap();
+        assert_eq!(passes.land(answer(&renewed, Err(ServiceError::Http("500".into())), "b")), Landed::Kept);
+        passes.want(&RemoteList::Liked, 11);
+        let retry = passes.next_request("b").expect("more demand did not retry the stalled pass");
+        assert_eq!(
+            passes.land(answer(&retry, Err(ServiceError::Unauthorized), "b")),
+            Landed::Renew,
+            "a rejection after a server error ended the grant"
+        );
+        let again = passes.next_request("c").unwrap();
+        assert_eq!(
+            passes.land(answer(&again, Err(ServiceError::Unauthorized), "c")),
+            Landed::DeadGrant(ServiceError::Unauthorized),
+            "two rejections in a row did not end the grant"
+        );
     }
 
     #[test]

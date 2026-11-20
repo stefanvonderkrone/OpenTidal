@@ -1,0 +1,32 @@
+{
+  "data": [
+    {"type": "artworks", "id": "251380836-large"}
+  ],
+  "included": [
+    {
+      "type": "artworks",
+      "id": "251380836-other",
+      "attributes": {
+        "mediaType": "IMAGE",
+        "files": [
+          {"href": "https://resources.tidal.com/images/other/640x640.jpg", "meta": {"width": 640, "height": 640}}
+        ]
+      }
+    },
+    {
+      "type": "artworks",
+      "id": "251380836-large",
+      "attributes": {
+        "mediaType": "IMAGE",
+        "files": [
+          {"href": "https://resources.tidal.com/images/251380836/160x160.jpg", "meta": {"width": 160, "height": 160}},
+          {"href": "https://resources.tidal.com/images/251380836/1280x1280.jpg", "meta": {"width": 1280, "height": 1280}},
+          {"href": "https://resources.tidal.com/images/251380836/750x750.jpg", "meta": {"width": 750, "height": 750}}
+        ]
+      }
+    }
+  ],
+  "links": {
+    "self": "/albums/251380836/relationships/coverArt?include=coverArt"
+  }
+}

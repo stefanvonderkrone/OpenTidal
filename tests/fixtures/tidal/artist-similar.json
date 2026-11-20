@@ -1,0 +1,21 @@
+{
+  "data": [
+    {"type": "artists", "id": "4471"},
+    {"type": "artists", "id": "8923"}
+  ],
+  "included": [
+    {
+      "type": "artists",
+      "id": "4471",
+      "attributes": {"name": "Frank Ocean", "popularity": 0.86}
+    },
+    {
+      "type": "artists",
+      "id": "8923",
+      "attributes": {"name": "Radiohead", "popularity": 0.9}
+    }
+  ],
+  "links": {
+    "self": "/v2/artists/1566/relationships/similarArtists?include=similarArtists"
+  }
+}

@@ -74,10 +74,10 @@ file instead. The file is the operator's and stays out of the repo.
 
 ## 5. Verify before shipping
 
-- `cargo test` — the invariant proofs and the auth and service tests.
-- `scripts/control-opentidal doctor` — one readiness check.
+- `cargo test` runs the invariant proofs and the auth and service tests.
+- `scripts/control-opentidal doctor` runs one readiness check.
 - `scripts/control-opentidal drive features/sign-in/script.json artifacts/sign-in`
-  — the sign-in journey against the fake.
+  drives the sign-in journey against the fake.
 - Live check with a real account: set `OPENTIDAL_LIVE=1` and the `TIDAL_*` env
   vars, sign in, and confirm the name shows in the sidebar.
 

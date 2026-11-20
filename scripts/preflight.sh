@@ -29,11 +29,27 @@ cargo clippy -q -p opentidal --all-targets --no-deps ${fix[@]+"${fix[@]}"} -- -D
 echo "== evidence table"
 python3 scripts/evidence-status.py
 
+echo "== pixel check self-test"
+# The cover journey proves a decoded cover with this script. The self-test proves
+# it passes on a matching rect and fails on a wrong rect and on a missing key, so a
+# broken check cannot pass a placeholder.
+python3 scripts/pixel-assert.py --self-test
+
 echo "== no copied scope list"
 # The list lives in `DEFAULT_SCOPE` and nowhere else. `scripts/scope-check.py` reads
 # the working tree, the index and the untracked files, and fails when it cannot read
 # something. Every earlier shell version failed open in a different way.
 python3 scripts/scope-check.py
+
+echo "== tidal api access tiers"
+# A summary doc named internal endpoints as usable three times. This check reads
+# the pinned snapshot, so an endpoint that needs internal access fails the gate.
+python3 scripts/tidal-api-check.py
+
+echo "== no retired sync claims"
+# The design docs described the deleted whole-library sync as current after the
+# code moved to one page at a time. This check fails on the retired phrases.
+python3 scripts/sync-rule-check.py
 
 echo "== ci runs the scripts"
 # CI runs this script and nothing else. A workflow that copied the commands would

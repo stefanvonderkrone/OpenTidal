@@ -1,0 +1,20 @@
+{
+  "data": [
+    {"type": "tracks", "id": "75413016"}
+  ],
+  "included": [
+    {
+      "type": "tracks",
+      "id": "75413016",
+      "attributes": {
+        "title": "Let It Happen",
+        "duration": "PT7M46S",
+        "popularity": 0.82
+      },
+      "relationships": {}
+    }
+  ],
+  "links": {
+    "self": "/v2/tracks/75413016?include=credits"
+  }
+}

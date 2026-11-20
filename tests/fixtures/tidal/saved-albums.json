@@ -1,0 +1,112 @@
+{
+  "data": [
+    {
+      "type": "albums",
+      "id": "251380836",
+      "meta": {
+        "addedAt": "2026-10-30T10:00:00Z"
+      }
+    },
+    {
+      "type": "albums",
+      "id": "108043637",
+      "meta": {
+        "addedAt": "2026-09-14T17:45:00Z"
+      }
+    }
+  ],
+  "included": [
+    {
+      "type": "albums",
+      "id": "251380836",
+      "attributes": {
+        "title": "Currents",
+        "type": "ALBUM",
+        "releaseDate": "2015-07-17",
+        "numberOfItems": 13,
+        "duration": "PT1H1M57S",
+        "explicit": false,
+        "copyright": "2015 Capitol Records",
+        "mediaTags": [
+          "LOSSLESS"
+        ]
+      },
+      "relationships": {
+        "coverArt": {
+          "data": [
+            {
+              "type": "coverArts",
+              "id": "251380836-large",
+              "meta": {
+                "width": 1280,
+                "height": 1280
+              }
+            }
+          ]
+        },
+        "artists": {
+          "data": [
+            {
+              "type": "artists",
+              "id": "1566"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "albums",
+      "id": "108043637",
+      "attributes": {
+        "title": "In Rainbows",
+        "type": "ALBUM",
+        "releaseDate": "2007-12-31",
+        "numberOfItems": 10,
+        "duration": "PT42M34S",
+        "explicit": false,
+        "mediaTags": [
+          "LOSSLESS"
+        ]
+      },
+      "relationships": {
+        "coverArt": {
+          "data": [
+            {
+              "type": "coverArts",
+              "id": "108043637-large",
+              "meta": {
+                "width": 1280,
+                "height": 1280
+              }
+            }
+          ]
+        },
+        "artists": {
+          "data": [
+            {
+              "type": "artists",
+              "id": "3346"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "artists",
+      "id": "1566",
+      "attributes": {
+        "name": "Tame Impala"
+      }
+    },
+    {
+      "type": "artists",
+      "id": "3346",
+      "attributes": {
+        "name": "Radiohead"
+      }
+    }
+  ],
+  "links": {
+    "self": "/v2/userCollectionAlbums/me/relationships/items?include=items,items.artists"
+  }
+}

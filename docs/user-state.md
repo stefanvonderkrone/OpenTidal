@@ -51,22 +51,37 @@ directory.
 
 ## Schema
 
+`PRAGMA user_version` is 4.
+
 ```
 user(id TEXT PRIMARY KEY, name TEXT NOT NULL, updated_at INTEGER NOT NULL)
 
-like(user_id TEXT NOT NULL REFERENCES user, track_id INTEGER NOT NULL,
+artist(id TEXT PRIMARY KEY, name TEXT NOT NULL)
+album(id TEXT PRIMARY KEY, title TEXT NOT NULL,
+      artist_id TEXT NOT NULL REFERENCES artist,
+      cover TEXT NOT NULL DEFAULT '')
+track(id TEXT PRIMARY KEY, title TEXT NOT NULL,
+      artist_id TEXT NOT NULL REFERENCES artist,
+      album_id TEXT NOT NULL REFERENCES album, duration TEXT NOT NULL)
+
+like(user_id TEXT NOT NULL REFERENCES user,
+     track_id TEXT NOT NULL REFERENCES track,
      PRIMARY KEY (user_id, track_id))
-save(user_id TEXT NOT NULL REFERENCES user, album_id INTEGER NOT NULL,
+save(user_id TEXT NOT NULL REFERENCES user,
+     album_id TEXT NOT NULL REFERENCES album,
      PRIMARY KEY (user_id, album_id))
-follow(user_id TEXT NOT NULL REFERENCES user, artist_id INTEGER NOT NULL,
-     PRIMARY KEY (user_id, artist_id))
-download(user_id TEXT NOT NULL REFERENCES user, album_id INTEGER NOT NULL,
-     PRIMARY KEY (user_id, album_id))
+follow(user_id TEXT NOT NULL REFERENCES user,
+       artist_id TEXT NOT NULL REFERENCES artist,
+       PRIMARY KEY (user_id, artist_id))
+download(user_id TEXT NOT NULL REFERENCES user,
+         album_id TEXT NOT NULL REFERENCES album,
+         PRIMARY KEY (user_id, album_id))
 
 playlist(slot INTEGER NOT NULL, user_id TEXT NOT NULL REFERENCES user,
          name TEXT NOT NULL, PRIMARY KEY (user_id, slot))
 playlist_track(user_id TEXT NOT NULL REFERENCES user, slot INTEGER NOT NULL,
-               position INTEGER NOT NULL, track_id INTEGER NOT NULL,
+               position INTEGER NOT NULL,
+               track_id TEXT NOT NULL REFERENCES track,
                PRIMARY KEY (user_id, slot, position),
                FOREIGN KEY (user_id, slot) REFERENCES playlist(user_id, slot))
 
@@ -78,13 +93,23 @@ collection_playlist(user_id TEXT NOT NULL REFERENCES user, idx INTEGER NOT NULL,
                     FOREIGN KEY (user_id, idx) REFERENCES collection(user_id, idx))
 
 history(user_id TEXT NOT NULL REFERENCES user, position INTEGER NOT NULL,
-        track_id INTEGER NOT NULL,
+        track_id TEXT NOT NULL REFERENCES track,
         PRIMARY KEY (user_id, position))
+
+catalogue_playlist(id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                   description TEXT NOT NULL, cover TEXT NOT NULL DEFAULT '')
+catalogue_playlist_track(playlist_id TEXT NOT NULL REFERENCES catalogue_playlist,
+                         position INTEGER NOT NULL,
+                         track_id TEXT NOT NULL REFERENCES track,
+                         PRIMARY KEY (playlist_id, position))
+tidal_playlist(user_id TEXT NOT NULL REFERENCES user,
+               playlist_id TEXT NOT NULL REFERENCES catalogue_playlist,
+               PRIMARY KEY (user_id, playlist_id))
 ```
 
 Notes:
 
-- Every table hangs off `user.id`. No table assumes one user.
+- Every library table hangs off `user.id`. No table assumes one user.
 - Playlist slots and collection indices are local to a user. A global slot
   key would prevent two users from each storing slot zero. Child keys include
   `user_id` for the same reason.
@@ -92,11 +117,49 @@ Notes:
   Slots persist as stored. Timestamp columns arrive with the Tidal sync.
 - `history` orders by `position`, never by rowid. A rowid can be reused after
   a delete, and history order is user-visible.
-- `track_id`, `album_id`, `artist_id` hold integer catalogue indices. The
-  catalogue ships with the app and never changes, so the schema cannot carry
-  a foreign key to it. `Library::check` validates these ids on load.
+- `track_id`, `album_id` and `artist_id` hold opaque Tidal ids as text. The
+  `artist`, `album` and `track` tables hold the catalogue rows that the stored
+  libraries name, and they are shared by every account. A foreign key means a
+  library row cannot reach the disk before its catalogue row.
+- A TEXT column turns an inserted number into text, but a blob stays a blob.
+  Load drops a row whose id is not text and counts it, like any other unknown id.
+- `catalogue_playlist` and `catalogue_playlist_track` hold the catalogue
+  playlists the stored libraries name, shared by every account like the other
+  catalogue tables. `tidal_playlist` is the per-account membership. The local
+  slots keep the `playlist` table.
+- `duration` is ISO 8601 text such as `PT3M26S`, the shape Tidal sends.
+- `cover` is the artwork id from the `coverArt` relationship, or empty for none.
+  A non-text or malformed cover reads as none and never costs its album or
+  playlist. The cover image itself is not in the store. It lives in the cover
+  cache, one directory per account under `$XDG_CACHE_HOME/opentidal/covers`.
 - No `is_active` column. The token store decides who is active. A stored
   flag would be a second source of truth and could disagree after a crash.
+
+### Migration from version 1
+
+Version 1 stored integer positions into a catalogue that shipped with the app.
+Those positions name placeholder content, not Tidal items, so no mapping exists.
+The migration runs in one transaction. It drops `like`, `save`, `follow`,
+`download`, `playlist_track` and `history`, and then creates the catalogue tables
+and the six library tables from the same text a fresh file uses. `user`,
+`playlist`, `collection` and `collection_playlist` hold no catalogue id, so the
+name, the playlists in their slots, and the collections survive. A playlist
+keeps its name and loses its placeholder tracks.
+
+A failure at any statement rolls back to an intact version 1, which the next open
+migrates again.
+
+### Migration from version 2
+
+Version 2 holds every row version 3 keeps. The migration adds the three catalogue
+playlist tables in one transaction and changes nothing else.
+
+### Migration from version 3
+
+Version 3 lacks only the two `cover` columns. The migration adds them with
+`ALTER TABLE` in one transaction, and every row keeps an empty cover until the
+next sync names one. Every path to version 4 runs the same `ALTER TABLE` text,
+a fresh file included, so a fresh and a migrated file hold the same definitions.
 
 ## Start
 
@@ -147,6 +210,10 @@ next start, which is the next thing that tries.
   always signs out, because it has nowhere to write and nothing to lose.
 - Refresh: token store only. No library write. This is the gain over a rotating key.
 - Profile fetch: update `user.name`.
+- Page: merge one page into one mirrored list in memory. The next frame writes
+  the library through `Store::write`, so each page costs one write, like any edit.
+  A page that changes only the catalogue, such as a Tidal playlist's tracks, is
+  written too, because the catalogue revision moved.
 - Library change: one comparison per frame, not a write per operation. The app
   keeps the library as last written, and `drain` writes when the two differ. This
   replaces the earlier "write through in the same operation", which would have
@@ -170,11 +237,9 @@ says the library could not be opened, and the Account screen shows that.
 While the app is read-only, the library is a mirror of Tidal, not a truth.
 Every row came from Tidal. Tidal still holds it.
 
-**That recovery is planned, not built.** The sync is not in this branch: the
-catalogue it needs does not exist yet, and the evidence table marks every sync
-check `pending: sync PR`. So today a row dropped by `Store::load` stays gone
-until a sync exists. The rule below says what the drop does now and what the
-sync will make true later; do not read it as a working recovery path.
+**The sync is the recovery.** A row dropped by `Store::load` comes back on the
+next sync that lists it. Local data is the exception: a dropped download or
+history entry has no server copy, which the paragraph below covers.
 
 Both paths treat a bad leaf the same way. `Store::load`, the sync, and any
 future reader drop the leaf that fails `Library::check` and log a count. The
@@ -185,8 +250,9 @@ stays closed for writing, so a save cannot overwrite what the app could not
 read.
 
 Two tables hold data no server has: `download` and `history`. A drop there is
-permanent, so the rule needs one more sentence. A drop happens only when the
-catalogue stops shipping an id, which means the app no longer has the album or
+permanent, so the rule needs one more sentence. A write stores the catalogue
+rows a library names, and the catalogue never forgets an id, so a drop happens
+only when the file is damaged, which means the app no longer has the album or
 the track. A downloaded album the app cannot name is not something the user can
 play, and a history entry it cannot name is not something a screen can show. So
 the row went with the content, and nothing the user can reach is lost.
@@ -197,44 +263,102 @@ answer.
 
 ## Sync
 
-A sync runs on demand, when a library screen opens. Start reads disk only, so
-a launch stays free of network work. The cost of that choice: a user who never
-opens a library screen never syncs, and a broken leaf waits until one does.
+A pass reads one remote list from its first page. Each page lands in the
+library as it arrives, so cached rows show at once and fill in page by page.
+The mirrored lists are likes, saves, follows, and Tidal playlists. A pass never
+touches downloads, history, user playlists, collections, or the name.
 
-How it lands: paint the rows from disk first, then update in place as pages
-arrive. The app must never show a spinner over a list it already has, or the
-sync makes the app slower than the file alone.
+A sync is a complete pass of each of the four mirrored lists. It starts from
+the Sync with Tidal button on the Account screen. In live mode it also starts
+once the profile fetch lands. In the live build, opening a list's route starts a
+pass that reads the first page only. Reopening the route that shows does not
+start another. A view that needs more rows than a pass read asks for the next
+page.
 
-A sync is the only thing that creates rows in bulk, and the only thing that
-deletes them. It obeys three rules.
+The Liked Songs, Albums, Artists and Playlists screens, and a Tidal playlist's
+tracks, draw the library's ordered lists in Tidal's order. They build only the
+rows near the viewport. The rows in view ask for the members up to the last
+visible row plus 20 more, so a scroll toward the end reads the next page before
+the reader gets there. A line keyed `pass-status` under the list says whether a
+page is loading, whether the pass stalled, or whether the list is read to its
+end. A pass stalled by a failed page reads that page again when a scroll asks
+for more rows than before. A pass stalled by a repeated cursor or the page cap
+does not, because the same page would stall it again. Opening the screen again
+starts a new pass from the first page. A pass that stalls with the last row
+already in view therefore waits for the screen to open again.
 
-1. Merge, never replace. The collection read is paged. Page 4 of 7 can fail,
-   and a replace has already deleted everything. A merge makes an unread page
-   a no-op.
-2. Delete only after a complete read. The sync carries a `complete` flag, set
-   when the last page arrives. No delete pass runs on a partial read.
-3. Delete only from the tables Tidal owns. Those are `like`, `save`, `follow`,
-   `playlist`, `playlist_track`, `collection`, and `collection_playlist`. The
-   `download` and `history` tables are local, so the sync never deletes a row
-   there.
+Returning to a list read to its end reads its first page again behind the rows
+already shown. Returning to a list whose pass stopped part way resumes that pass
+and does not read the first page again.
 
-Rule 3 removes the need for a size guard. A wrong delete from a mirrored table
-costs one sync, because the server returns the row again. The two tables where
-a wrong delete would lose real work are the two the sync cannot touch.
+A pass obeys six rules.
 
-The offline window is the one cost. A broken leaf stays missing until the
+1. Apply each page as it lands. An earlier page adds and reorders members, but
+   it never removes one, because a member it omits may sit on a later page. A
+   page that fails, a repeated cursor, or the cap of 400 pages halts the pass,
+   and every row read before the halt stays in memory and on disk.
+2. Only the last page removes. A complete pass is the truth for its list, so a
+   member Tidal no longer lists is removed when the last page lands, and not
+   before. A halted pass removes nothing.
+3. A page applied twice changes nothing. Reading the same pages again leaves
+   the library, the catalogue, and the file as they were.
+4. Apply only to the account that asked. A page carries the session and the
+   user id it started under, and the passes belong to the open library. A page
+   for an earlier session, a closed library, or another account is dropped.
+5. Read one page at a time, and never while the profile fetch is pending. The
+   page worker never refreshes the token. A page Tidal rejects starts one
+   renewal through the profile fetch, and the pass resumes with the fresh
+   token. A fresh token Tidal rejects too ends the session. A renewal that
+   fails without ending the grant stalls every pass that waited on it, and a
+   later scroll retries the pass.
+6. Start no page while a cover batch runs. Pages and the JSON reads of covers
+   share one request pacer, so a long sync would otherwise hold back the covers
+   on screen. Image downloads are not paced. A page
+   already in flight finishes. Once the batch lands, the next page starts
+   before the next batch does.
+
+Opening a Tidal album or a Tidal artist starts a pass of its own. An album's
+pass reads its tracks, and an artist's pass reads its albums. Neither list owns
+a membership in the library, so these pages only fill the catalogue, and the
+complete or partial rule has nothing to remove. The album screen draws the
+catalogue's tracks on that album, and the artist screen draws the catalogue's
+albums by that artist. Both build only the rows near the viewport and show the
+`pass-status` line, like the other remote lists. A seed album or artist is not
+on Tidal and starts no pass. The catalogue rows these pages bring are not
+written unless the library names them, so a restart reads them again.
+
+A Tidal playlist is a catalogue playlist, not a user playlist. Its name and
+tracks live in the catalogue, and the library holds only its id in
+`tidal_playlists`. No edit operation takes a catalogue playlist id, so a local
+edit cannot reach a Tidal playlist. User playlists keep their slots and stay
+editable. Collections stay flat and local, and they hold user playlists only.
+
+The `download` and `history` tables are local. A pass never writes them, so a
+wrong pass cannot lose real work. A wrong removal from a mirrored membership
+costs one sync, because the server returns the member again.
+
+The cost of the page cap: a list longer than 400 pages is never read to its
+end, so it keeps every row it read and removes none.
+
+The offline window is the other cost. A broken leaf stays missing until the
 first sync after the network returns. The local copy is as good as the last
 successful read.
 
-The delete pass runs through the state operations, never through the store
-directly. `Route::UserPlaylist` holds a slot, so a playlist that a route names
-can be the target of a delete. `state.rs:272` `delete_playlist` already repairs
-the route. Raw SQL would break the invariant on the bulk path.
+A catalogue playlist that leaves `tidal_playlists` stays in the catalogue for
+the session, because the catalogue never forgets. A route to it still resolves,
+so a sync needs no route repair. The next load does not bring it back, because
+a write stores only the catalogue rows the library names.
+
+The catalogue is shared by every account in one run, and so are the catalogue
+tables on disk. The library names which Tidal playlists an account sees. The
+Home shelf shows seed playlists only, and `forget_session` clears every route
+to a Tidal playlist, so one account never sees another account's playlist names.
 
 ## Load and the invariant
 
-`src/library.rs` ids are slot indices into fixed arrays, and `src/state.rs`
-proves that no route, playlist, or saved item dangles after each operation.
+`src/library.rs` playlist ids are slot indices into a fixed array, catalogue ids
+are opaque Tidal strings, and `src/state.rs` proves that no route, playlist, or
+saved item dangles after each operation.
 Load is a new way into that state, so it must not bypass the proof.
 
 The rules:
@@ -244,7 +368,7 @@ The rules:
 2. On load, restore each playlist to its exact slot. Restore collections in
    `idx` order and their playlist references in `position` order.
 3. Do not derive `Serialize` on `Library`. Map rows into a fresh `Library`
-   field by field. Validate catalogue indices before a bit shift or cast.
+   field by field. Validate every catalogue id before it enters the library.
 4. Run `Library::check` on the loaded value, and assert it in a debug build. A
    row that would fail the check is dropped at the boundary, before it enters
    the library, so the loaded value always satisfies the invariant.
@@ -272,6 +396,28 @@ deliberate: the `user_id` column costs nothing now and the door stays open.
 - Settings > Account needs a `remove account data` action. A second person's
   listening history on this machine must be deletable.
 
+### Account isolation of playlist tracks
+
+The catalogue is shared, and `catalogue_playlist_track` keeps one track list per
+Tidal playlist, with no `user_id`. If two accounts follow one playlist id, the
+list holds the tracks of the account that wrote it last. Without a guard,
+account B opens that playlist and sees account A's tracks until B's own page
+lands.
+
+The rule: when an account opens and the file holds a row for another account,
+`Catalogue::forget_playlist_tracks` empties the tracks of every Tidal playlist.
+The ids, names and covers stay. Seed playlists keep their tracks. The switch
+raises the catalogue revision, so the next drain writes the emptied lists of
+this account's playlists to disk. A file with only this account keeps its
+cached tracks, so a restart still shows them first. Reopening the account that
+is already open empties nothing.
+
+The cost: with two accounts in one file, a Tidal playlist shows no cached tracks
+after a restart until its page lands. A `user_id` column on
+`catalogue_playlist_track` would remove that cost, and is not in this branch.
+
+Test: `account_b_never_sees_account_a_playlist_tracks`.
+
 ## Evidence
 
 Each row names its status. `test:` names a real test and `scripts/evidence-status.py`
@@ -279,7 +425,8 @@ fails when the name does not exist. `live:` names a check done by hand, and name
 test that also covers it as `name`(), with the parentheses. The parentheses matter:
 without them a renamed test there would pass unchecked, and another pragma or column
 name would be read as a test. `pending:` names work this branch does not build, so
-nothing there is a test.
+nothing there is a test. A `live:` cell that starts with `not run` is open: it
+names the test that covers the code path, and no hand check has happened.
 
 | Claim | Check | Status |
 | --- | --- | --- |
@@ -295,6 +442,7 @@ nothing there is a test.
 | A network error keeps the session | Land an `Http` profile error, assert `SignedIn`, the disk name, and the stored token | test: `a_network_error_keeps_the_session_signed_in` |
 | A rejected fresh token ends the session | Classify a post-refresh `Unauthorized` as a dead grant | test: `a_fresh_token_that_is_rejected_ends_the_session` |
 | A scope is assigned nowhere but `src/auth.rs` | Write an assignment into a doc, a script and an untracked file | `python3 scripts/scope-check.py`, by hand: each fails, and a clean tree passes |
+| No design doc calls the retired whole-library sync current | Restore an old sync phrase in `docs/tidal-api.md`, then run the check on the docs as they stood before the paged read | `python3 scripts/sync-rule-check.py` in `scripts/preflight.sh`, and by hand on 2026-11-18: each run fails and names the file, line and phrase, and the current docs pass |
 | A driven scene owns its stores | Run the stored scene over a non-memory store, assert it installs its own and a scratch database path | test: `the_stored_scene_owns_its_store_and_its_database` |
 | A quit whose write fails reports the lost edits | Make every write fail, then quit and assert the report | test: `a_quit_that_cannot_write_reports_the_edits_as_lost` |
 | An invalid index cannot hide a valid collection | Seed a negative index first with one allowed, assert the valid one loads | test: `an_invalid_collection_index_does_not_hide_a_valid_one` |
@@ -322,6 +470,11 @@ nothing there is a test.
 | A repeated write makes no duplicates | Write twice, assert one row per bit | test: `write_is_idempotent` |
 | An email is not a display name | A profile whose `username` is an address asserts `You` | test: `an_email_is_not_used_as_a_name` |
 | The key holds offline | `uid` read from the token store alone, no network, before any fetch | test: `the_user_id_comes_from_the_token`, `the_fake_token_names_no_user` |
+| A landed profile fetch starts a sync in live mode only | Land a profile in live and in fake mode, assert only live syncs | test: `a_landed_profile_syncs_only_in_live_mode` |
+| A live sign-in syncs the library | Sign in with a real account, assert Liked Songs and the From Tidal grid fill and the file holds the rows | live: 2026-11-19. A scratch drive with a signed-in account landed albums, tracks, likes, saves and Tidal playlists. The trigger is covered by `a_landed_profile_syncs_only_in_live_mode`() |
+| Tidal honours the nested include | A live read of liked tracks reports no dropped item | live: 2026-11-19. The old include dropped 18 albums and 20 tracks per page. After `items.albums.artists` was added, later album and artist drives logged no drop. One long mixed drive logged two residual drops of 3 and 1 item |
+| A live next link starts with the host-root path | A live read of a library longer than one page reaches its last page | live: 2026-11-18. A saved-albums chain passed 25 paced pages and the pager accepts the host-root shape. The pure rule is covered by `a_next_link_without_the_base_path_is_followed`() |
+| The owned playlist list pages like the others | A live read of an account with many owned playlists | pending: no token |
 | The file is private | `stat -f '%Lp'` returns `600` | live: 2026-11-15, plus `a_restart_reads_the_written_library`() |
 | Schema is sound | `PRAGMA integrity_check` is `ok` and no row has an orphan `user_id` | live: 2026-11-15, plus `replacement_removes_stale_rows`() |
 | A like reaches the disk from a live session | Like a track, wait for idle, read the row | live: 2026-11-15 |
@@ -332,10 +485,129 @@ nothing there is a test.
 | Start needs no network | Launch with the network off, name and playlist visible | pending: no test. Start reads the disk first, then fetches the profile |
 | A library screen needs no network | Open Liked Songs offline, assert the disk rows paint | pending: no test |
 | A refresh writes no rows | Count rows before and after a refresh, `user_version` unchanged | pending: no test. A refresh writes the token store only |
-| A partial sync loses nothing | Fail the read after page 2, assert every row is still present | pending: sync PR |
-| A partial sync deletes nothing | Same test, assert the delete pass did not run | pending: sync PR |
+| A halted pass removes nothing | Fail one list on its first page and another on its second, assert every cached row stays in memory and on disk | test: `a_halted_pass_removes_nothing` |
+| A sync lands on disk | Sync, then open the file in a new run, assert the like and the playlist name | test: `a_sync_lands_on_disk` |
+| A sync for an earlier session is dropped | Start a sync, sign out and back in, drain, assert nothing landed | test: `a_sync_for_an_earlier_session_is_dropped` |
+| A sync for a closed library is dropped | Start a sync, end the session on a dead token, drain, assert the library stays empty | test: `a_sync_for_a_closed_library_is_dropped` |
+| An edit during a sync survives it | Edit while a page is in flight, assert the edit and the page both remain | test: `an_edit_during_a_sync_survives_it` |
+| A cover batch holds back the next page | Hold a cover batch, ask for more rows, assert no page starts, then release the batch and assert the page lands | test: `a_cover_batch_holds_back_the_next_page` |
+| A dead token found by a sync ends the session | A page returns a dead grant, assert no library, no token, and the last edit on disk | test: `a_dead_refresh_token_during_sync_closes_the_library` |
+| A failed page keeps the earlier pages | Serve an error as page 3, assert pages 1 and 2 stay in memory and on disk | test: `a_failed_page_keeps_the_earlier_pages` |
+| A paged list is read to its last page | Two liked-track pages, assert all three members in order | test: `liked_tracks_follow_the_cursor_to_the_last_page` |
+| The fixtures decode into a whole library | Read every fixture page, merge each, assert the counts, no drop, and the playlist tracks | test: `the_fixtures_decode_into_a_whole_library` |
+| A repeated cursor halts the pass | Two pages that name each other, assert the stall and that more demand does not retry | test: `a_repeated_cursor_stalls_the_pass_for_good` |
+| The page cap halts the pass | A list with no last page, assert the stall at the cap | test: `the_page_cap_stalls_the_pass` |
+| The real client reads one page per call with the token | A loopback server serves the fixtures, assert one request per call and the bearer header | test: `http_pages_read_one_response_per_call` |
+| The token never leaves the host | A `next` link to another host or outside the base, assert it is refused before a fetch | test: `a_next_link_to_another_host_is_refused` |
+| A version 1 file keeps what the user wrote | Migrate a version 1 file, assert the name, playlists and collections stay and every id row is gone | test: `a_version_one_file_keeps_its_playlists_and_drops_its_catalogue_rows` |
+| A migrated file has the fresh schema | Compare `sqlite_master` of a fresh and a migrated file | test: `a_fresh_and_a_migrated_schema_match` |
+| A version 2 file keeps every row | Migrate a version 2 file with a row in every table, assert the whole library loads | test: `a_version_2_file_keeps_every_row` |
+| A Tidal playlist survives a restart | Write a library that names a fetched playlist, load into the seed alone, assert the name and tracks | test: `a_tidal_playlist_survives_a_restart` |
+| An unknown Tidal playlist cannot hide a valid one | Plant an unknown membership before a valid one, assert the valid one loads and the drop is counted | test: `an_unknown_tidal_playlist_does_not_hide_a_valid_one` |
+| A failed migration leaves version 1 | A view named `history` fails the last drop, assert version 1 and the `like` rows | test: `a_failed_migration_leaves_version_one` |
+| A non-text id costs only its row | Plant a blob id, assert the drop and the rest of the library | test: `a_non_text_id_is_dropped_not_fatal` |
+| A write keeps the catalogue rows it names | Write a library that names a fetched track, load into the seed alone, assert the track comes back | test: `a_write_stores_the_catalogue_rows_it_names` |
+| A library row needs its catalogue row | Insert a like with no track row, assert the foreign key refuses it | test: `a_library_row_needs_its_catalogue_row` |
+| A route outside the catalogue cannot open | Open an album id from a larger catalogue, assert the stack is unchanged | test: `opening_an_unknown_album_is_refused` |
+| A track outside the catalogue cannot play | Select a track id from a larger catalogue, assert the state is unchanged | test: `selecting_an_unknown_track_is_refused` |
 | An invalid history row cannot hide a valid entry | Seed an unknown track then two distinct valid ones, assert both load | test: `an_unknown_history_row_does_not_hide_a_valid_one` |
-| The sync never touches local tables | Seed a `download` and a `history` row, sync, assert both remain | pending: sync PR |
+| A merge never touches local data | Seed a download, a history entry, a user playlist and a collection, merge a partial and a complete page, assert all remain | test: `a_local_like_survives_a_partial_merge_and_only_a_complete_merge_removes_it` |
+| One account never sees another's playlist names | Sync account A, open its playlist, sign out, open account B in this run and the next, assert Home and the stack hold no name of A's | test: `account_b_never_sees_account_a_playlist_names` |
+| One account never sees another's playlist tracks | Two accounts follow one playlist id, A merges tracks, open B with its page held, assert no track of A's in memory or on disk and the seed tracks intact, release, assert only B's tracks | test: `account_b_never_sees_account_a_playlist_tracks` |
+| A page for another account is dropped | Hold a page, open another account in the same session, release, assert nothing landed in memory or on disk | test: `a_page_for_another_account_is_dropped` |
+| A page waits for the profile fetch | Hold the profile fetch, ask for a sync, assert no page, then release and assert one page per mirrored list | test: `a_page_waits_for_the_profile_fetch` |
+| Only a complete pass removes a row | Read page one of two, assert the cached row stays, then read to the end, assert it is gone | test: `only_a_complete_pass_removes_a_row` |
+| A page applied twice changes nothing | Sync twice over the same pages, assert the library, the catalogue revision and the file are unchanged | test: `a_page_applied_twice_changes_nothing` |
+| A rejected page forces one renewal | Reject the first token, assert one profile fetch and the pass resuming with the fresh token | test: `an_unauthorized_page_forces_one_refresh` |
+| A renewed token rejected again ends the session | Reject every page token, assert one renewal, then no library and no token | test: `a_renewed_token_rejected_again_ends_the_session` |
+| A failed renewal stalls its passes and a scroll retries them | Reject the first token and fail the refresh, assert the pass stalls and the session stays, then scroll and assert the fresh token reads the page | test: `a_failed_renewal_stalls_the_pass_until_a_scroll_retries` |
+| A catalogue-only change reaches disk | Read a Tidal playlist's tracks, assert the library is unchanged and a new run loads the tracks | test: `a_catalogue_only_change_reaches_disk` |
+| Entering a route starts one pass | Open Liked Songs twice, assert one page, then Albums, assert one more | test: `entering_a_route_starts_one_pass_and_reentering_does_not` |
+| A larger view reads the next page | Enter a two-page list, assert one page, ask for two rows, assert both pages | test: `a_larger_want_reads_the_next_page` |
+| A scroll reads the page its rows need | Open Albums in the paged scene, assert album 50 is absent, scroll, assert its row | test: `a_scroll_reads_the_page_its_rows_need`. The paged journey asserts the same row headless |
+| Cached rows show before page one lands | Write a read library, restart with page one held, assert the rows and the loading line | test: `cached_rows_show_before_the_first_page_lands` |
+| Reentry refreshes behind the rows | Read Albums to its end, leave, hold page one, return, assert the rows and the loading line | test: `reentering_a_cached_screen_shows_rows_before_the_refresh_lands` |
+| A stalled pass says so and a larger scroll retries it | Fail the page a scroll asked for, assert the stall line, scroll further, assert the page lands | test: `a_stalled_pass_says_so_and_a_larger_scroll_retries_it` |
+| A live library pages on scroll | Sign in with a large real account, open Albums, scroll, watch later rows arrive | pending: no live run in this unit |
+| A merge keeps no unresolvable member | Merge a member the catalogue lacks, assert it is counted and left out | test: `an_unresolvable_member_is_counted_not_kept` |
+| A merge cannot break the invariant | Three merge successors in the exhaustive library proof | test: `every_reachable_library_satisfies_check` |
+| A bad cover never hides its album or playlist | Absorb rows with malformed covers, assert each row is kept with no cover and nothing is counted | test: `a_bad_cover_does_not_hide_its_album`, `a_bad_cover_does_not_hide_its_playlist` |
+| A row without a cover keeps the known cover | Absorb a cover, then the same album and playlist with an empty and a malformed one | test: `a_row_without_a_cover_keeps_the_known_cover` |
+| The decoder reads the cover id | Decode the synthetic fixtures, assert each album and playlist cover id | test: `the_fixtures_decode_into_a_whole_library` |
+| A cover id survives a restart | Write an album and a playlist with covers, load into the seed alone, compare the entries whole | test: `a_cover_survives_a_restart`, `rows_for_carries_the_cover` |
+| A damaged cover column costs only the cover | Plant a blob and a malformed cover, assert the library loads whole with no cover | test: `a_non_text_cover_keeps_its_album` |
+| A version 3 file gains empty covers | Migrate a version 3 file, assert every row loads with no cover | test: `a_version_3_file_gains_empty_covers`, `a_fresh_and_a_migrated_schema_match` |
+| The cover cache lives under the XDG cache root | Ask for the root with and without `XDG_CACHE_HOME`, relative and empty included | test: `the_cover_cache_lives_under_xdg_cache_home`, `without_xdg_cache_home_the_cover_cache_falls_back_to_dot_cache` |
+| A put cover survives a restart | Put the fixture, rebuild the cache from the same root, assert the bytes | test: `a_put_cover_survives_a_restart` |
+| A failed put leaves no partial cover | Block the rename with a directory, assert no cover and no temporary file | test: `a_failed_put_leaves_no_partial_cover` |
+| Putting a cover twice changes nothing | Put the same bytes twice, compare the directory and the bytes | test: `putting_a_cover_twice_changes_nothing` |
+| Bytes that are not an image are never put | Put HTML, empty and truncated bodies, assert no file | test: `bytes_that_are_not_an_image_are_never_put` |
+| A damaged cover reads as a miss | Overwrite a cover with junk, assert a miss and the file removed | test: `a_damaged_cover_reads_as_a_miss`, `an_evicted_cover_is_a_miss` |
+| A stray file cannot push out a valid cover | Plant stray names, prune to one, assert the valid cover stays and the strays are untouched | test: `an_invalid_cache_entry_does_not_count_against_the_limit` |
+| A crashed replace leaves nothing behind | Plant a temporary file, sweep, assert only the cover remains | test: `a_leftover_temporary_file_is_swept` |
+| One account cannot read another's covers | Put a cover for account A, assert a miss for B | test: `one_account_cannot_read_another_accounts_covers`, `a_user_id_cannot_leave_the_cover_root` |
+| The cover cache is private | Assert mode 0600 on a cover and 0700 on its directory | test: `the_cover_cache_is_private` |
+| A cover fetch reads the pinned relationship | Read the synthetic artwork fixture, assert the path, the artwork by id and the file | test: `a_cover_link_is_read_from_the_artwork_files`, `the_smallest_file_at_or_above_the_width_wins` |
+| A cover link must be https | Serve http, relative, protocol-relative, file and ftp links, assert no image request | test: `a_cover_link_that_is_not_https_is_refused` |
+| A cover with no file is an error | Serve artworks with no usable file and a missing artwork | test: `a_cover_with_no_files_is_a_decode_error` |
+| The image request carries no token and a cap | A loopback server checks the header and serves an over-cap body | test: `an_image_body_over_the_cap_is_refused` |
+| A miss fetches and a hit does not | Resolve twice over one root, count the fetches | test: `a_miss_fetches_and_puts_the_cover`, `a_hit_makes_no_fetch` |
+| One failed cover costs only itself | Resolve a batch with an error, an HTML body and a good cover | test: `a_failed_cover_does_not_block_the_batch` |
+| A rejected token stops the fetches | Reject the first cover, assert one fetch and the hits still served | test: `a_rejected_token_stops_further_fetches`, `no_token_still_serves_hits` |
+| Only fetches count toward the batch cap | Plant a cap of hits and more damaged files, assert the cap counts fetches only | test: `only_fetches_count_toward_the_cap` |
+| Every wanted cover arrives | Want more covers than one batch fetches, drain until idle, assert all shown | test: `every_wanted_cover_is_fetched_across_batches`, `a_cover_wanted_during_a_batch_is_fetched_next` |
+| A cover batch for another account is dropped | Start a batch, open another account in the same session, assert nothing shown and no file in its directory | test: `a_cover_batch_from_another_account_is_dropped` |
+| A cached cover shows before the profile lands | Put a cover file in the cache, hold the profile fetch, draw, assert the cover shows with no service call while the profile is still pending | test: `a_cached_cover_shows_before_the_profile_lands` |
+| A cover miss is checked once while the profile is pending | Hold the profile, draw a miss, drain many frames, assert one disk check, no service call and a `Checked` state | test: `a_cover_miss_is_checked_once_while_the_profile_is_pending` |
+| A cover fetch waits for the profile fetch | Hold the profile, want a cover the cache does not hold, assert no service call, then release | test: `a_cover_batch_waits_for_the_profile_fetch` |
+| Sign-out forgets the shown covers | Show a cover, sign out, assert no cover and an empty map on reopen | test: `sign_out_forgets_the_shown_covers` |
+| A restart fetches no cover it has | Two apps on one root, assert the second fetches nothing | test: `a_cover_restart_fetches_nothing` |
+| Setup does no cover work | Restore a session in setup, drain, assert no batch, no fetch and no cover root | test: `no_cover_work_runs_at_setup` |
+| Shown covers stay under the cap | Draw more covers than the cap across frames, assert the shown count never exceeds it and an evicted cover comes back from disk with no fetch | test: `shown_covers_stay_under_the_cap` |
+| A cover on screen is never evicted | Keep one shelf in view while more covers than the cap load, assert every shelf cover stays shown and no batch restarts | test: `covers_on_screen_are_never_evicted` |
+| A missing list payload stalls the pass | Read `{}`, `{"data":null}` and a single object, assert each is a decode error, the pass stalls and stored rows stay | test: `a_list_page_without_a_data_array_stalls_the_pass_and_keeps_the_rows` |
+| A server error after a renewal lets a later rejection renew | Renew once, stall on a 500, retry, reject, assert a new renewal; two rejections in a row still end the grant | test: `a_server_error_after_a_renewal_lets_a_later_rejection_renew_again` |
+| A rotated token survives a failed profile call | Refresh, rotate the refresh token, fail the profile call on transport, assert the fresh token is stored | test: `a_rotated_token_is_kept_when_the_profile_call_fails` |
+| A put cover decodes through Rune | Put the fixture, decode it with `ImageCache::file`, assert its size | test: `a_ready_cover_decodes_to_its_pixels` |
+| A decoded cover appears on screen | Drive `features/covers` twice with one database, assert `cover-image`, the magenta share inside its rect, and a second run with no fetch | `scripts/pixel-assert.py` on the `features/covers` drive, by hand on 2026-11-18 against the fake service: both runs pass. This is not a live check |
+| A real account shows a real cover | Sign in with a real account, sync, open Albums, compare a cover with the Tidal app | live: 2026-11-19. An artist detail drive showed a decoded `hero-cover-image`. A scratch live drive of the batched read showed 78 cover-image nodes after 45 seconds from a cold cache, with no fetch error. A 90-second continuation showed 138 images. An album drive showed 80 cover-image nodes and no gradient. The read is covered by `a_cover_link_is_read_from_the_artwork_files`() |
+| A warm restart shows cached covers at once | Restart a signed-in app with a full cover cache, open Albums, count images at 1, 2, 5 and 15 seconds | live: 2026-11-19. Before the fix, a debug drive showed 4, 16, 38 and 80 images and a release drive showed 0, 0, 80 and 80. A debug decode took about 120 ms per file, a release decode about 5 ms, and a pending profile fetch gated the batch for seconds. After the hits-only pass and optimized debug dependencies, the same debug drive showed 80 images at 1, 2, 5 and 15 seconds, with 0 cover fetches. No resolution was changed |
+| A live next link is followed | Read a live collection page, follow its `links.next`, read the second page | live: 2026-11-18, plus `a_next_link_without_the_base_path_is_followed`() |
+| A live cover reads an artwork file | Read a live album coverArt response, pick a file, fetch the image with no token | live: 2026-11-18, plus `a_cover_link_is_read_from_the_artwork_files`() and `the_smallest_file_at_or_above_the_width_wins`() |
+| The live library needs cover includes | Read live collections with and without the coverArt include, compare the relationships | live: 2026-11-18. The include assertions are covered by `http_pages_read_one_response_per_call`() |
+| The track reads ask for each album's artists | A loopback server logs the liked-tracks and playlist-items paths, assert `items.albums.artists` in each include | test: `http_pages_read_one_response_per_call` |
+| An album page brings its tracks | Read the album items fixture into a catalogue that holds the album, assert its tracks, the report and an unchanged library | test: `an_album_page_brings_its_tracks` |
+| An artist page brings its albums | Read the artist albums fixture, assert the three albums, the report and an unchanged library | test: `an_artist_page_brings_its_albums` |
+| A detail route names its own read, a seed one none | Map Tidal and seed album and artist routes to their remote lists | test: `a_detail_route_names_its_remote_list_unless_it_is_seed` |
+| Opening an artist and then an album shows their details | Drive the details scene, open the artist, assert the albums only its read brings, open an album, assert its tracks and an unchanged library | test: `opening_an_artist_and_an_album_reads_their_details`. The two detail journeys assert the same headless |
+| An artist picture reads its profile art | Serve a synthetic batched artist read for one artist, assert the `filter[id]` path and the file of the named artwork | test: `a_single_artist_cover_uses_the_batched_read`, `only_a_tidal_artist_asks_for_a_cover` |
+| Artist pictures come in one read per 20 artists | Serve a synthetic `fetch_cover_batch` read for 21 artists, one dead and one with an empty `profileArt`, assert two `filter[id]` paths, each picture under its own artist, and no image read for the two with none | test: `a_batched_artist_read_maps_each_picture_to_its_artist` |
+| Album covers come in one read per 20 albums | Serve a synthetic `fetch_cover_batch` read for 20 albums, one dead, assert one `/albums` `filter[id]` path with `include=coverArt`, each cover under its own album, `NoCover` and no image read for the dead one | test: `twenty_albums_take_one_filter_read` |
+| Playlist covers come in one read per 20 playlists | Serve a synthetic `fetch_cover_batch` read for 20 playlists, one dead, assert one `/playlists` `filter[id]` path with `include=coverArt`, each cover under its own playlist, `NoCover` and no image read for the dead one | test: `twenty_playlists_take_one_filter_read`. A scratch live drive with 22 Tidal playlists made one batch and showed 44 cover-image nodes with no gradient on the warm run |
+| A cold album cover batch fills the grid | Sign in with a real account, open Albums from a cold cache, assert images and no fetch error | live: 2026-11-19. A scratch drive made two batches for 40 album covers and showed 80 cover-image nodes with no gradient and no fetch error |
+| Each kind takes its own read in a mixed batch | Interleave albums, a playlist and artists, assert one read per kind and every result in request order, an artist and an album with one id included | test: `a_mixed_batch_reads_each_kind_once_in_request_order` |
+| An artist named only in `included` keeps its picture | Answer `data` with a bare identifier and the artist in `included`, assert the picture | test: `an_artist_named_only_in_included_keeps_its_picture` |
+| A rejected read stops the batch | Answer `Unauthorized`, assert one read, no image read, and `Unauthorized` for every request | test: `a_rejected_read_stops_the_batch` |
+| A failed batched read fails its whole chunk | Fail the read with a rate limit, assert every artist gets it and no image is read | test: `a_failed_batched_read_fails_its_whole_chunk` |
+| Twenty artist misses make one read | Resolve 20 artist misses, assert one `cover_batch` read and each picture on disk | test: `twenty_artist_misses_make_one_batched_read` |
+| An owner with no cover is unavailable | Resolve two artists with no picture, a dead album and a dead playlist, assert all `Unavailable`, one read per kind, and no file | test: `an_owner_with_no_cover_is_unavailable` |
+| A mixed batch keeps every outcome in place | Resolve albums, a playlist and artists interleaved, assert each outcome in request order and one `cover_batch` read per kind | test: `a_mixed_batch_keeps_every_outcome_in_place` |
+| Every cover counts toward the cap | Fill the cap with artist, album and playlist misses, add an album, assert the album gets no outcome and no fetch | test: `the_cap_counts_every_kind` |
+| Image downloads are not paced | A loopback server answers one JSON read and three image reads, assert the fake clock never slept | test: `an_image_read_is_not_paced`, `the_pacer_keeps_its_minimum_gap` |
+| A decoded artist picture appears on screen | Drive `features/artist-detail`, assert `hero-cover-image` and the magenta share inside its rect | `scripts/pixel-assert.py` on the `features/artist-detail` drive, by hand on 2026-11-19 against the fake service. This is not a live check |
+| An artist card in the Artists grid shows the artist picture | Drive the details scene, open Artists, assert `cover-image` on `artist-0` and no gradient | test: `an_artist_card_shows_the_artist_picture`. The artist-grid journey asserts the same headless. A scratch live drive on 2026-11-19 showed 78 cover-image nodes after 45 seconds from a cold cache |
+| An album whose artist no page includes keeps its tracks | Absorb an album and a track that name an absent artist, assert both resolve under "Unknown artist" with no drop, then absorb the artist and assert the name changes in place | test: `an_album_whose_artist_is_missing_keeps_its_tracks` |
+| A live liked page keeps its albums | Sign in with a real account, read Liked Songs, assert no drop in the log | live: 2026-11-19. The old build dropped 18 albums and 20 tracks per liked page. After the artist stub fix, a scratch drive that opened the album, artist and playlist details logged zero drop lines. The include is covered by `http_pages_read_one_response_per_call`() and the stub by `an_album_whose_artist_is_missing_keeps_its_tracks`() |
+| A real artist shows its albums and picture | Sign in with a real account, open an artist, compare with the Tidal app | live: 2026-11-19. A scratch drive showed 11 album cards and a decoded `hero-cover-image` on the artist screen. The read is covered by `an_artist_page_brings_its_albums`() and `a_single_artist_cover_uses_the_batched_read`(). That detail drive used the old per-artist read; the later grid drives used the batched read |
+| An artist with no profile art keeps its gradient | Sign in, open Artists, assert no cover image and no fetch error for that artist | live: 2026-11-19. Three of the 72 artist cards stayed gradients after 90 seconds. The ids 57135158, 5171767 and 4274415 came back with an empty `profileArt` and no artwork from the live batched read. The rule is covered by `an_owner_with_no_cover_is_unavailable`() |
+| The image host needs no pacer | Read 30 image URLs from the CDN without waits, assert every answer succeeds | live: 2026-11-19. 30 rapid GETs to `resources.tidal.com` all answered `200` in 1.39 s. The test `an_image_read_is_not_paced`() proves the code keeps the image read outside the pacer |
+| A long card title stays inside its cell | Draw a long album title at rest, assert its drawn right edge is within the card plus raster padding | test: `a_long_title_at_rest_stays_one_line_inside_its_card` |
+| A long card title scrolls on hover | Rest the pointer on the card, assert a clipped window and a copy, assert the title moves left, and assert the title glyphs carry the card's clip | test: `a_long_title_scrolls_while_its_card_is_hovered`. A scratch live drive on 2026-11-19 hovered "Everybody Scream Tour Live" and saw the title move 88 pt left between 5 s and 12 s, with no glyph past the card |
+| Leaving a card stops its title | Rest on a long-title card, move the pointer away, assert no clipped window and no glyphs past the edge | test: `leaving_a_card_stops_its_title_scrolling` |
+| A short card title never scrolls | Rest on a short-title card, assert no clipped window | test: `a_short_title_never_scrolls` |
+| A real album shows its tracks | Sign in with a real account, open an album, assert its track rows | live: 2026-11-19. A scratch drive showed 23 track rows on the album screen and the status `Up to date with Tidal.` |
+| A real Tidal playlist shows its tracks | Sign in with a real account, open a Tidal playlist, assert its track rows | live: 2026-11-19. A scratch drive showed track rows on the playlist detail screen |
+| Tidal limits rapid requests | Send ten rapid paced-free page requests, observe `429 Too Many Requests` | live: 2026-11-18, plus `a_rate_limited_page_call_is_retried_and_lands`() |
 
 ## Confirmed live
 

@@ -1,0 +1,102 @@
+{
+  "data": [
+    {
+      "type": "tracks",
+      "id": "75413016",
+      "meta": {
+        "itemIndex": 0
+      }
+    },
+    {
+      "type": "tracks",
+      "id": "12345678",
+      "meta": {
+        "itemIndex": 1
+      }
+    }
+  ],
+  "included": [
+    {
+      "type": "tracks",
+      "id": "75413016",
+      "attributes": {
+        "title": "Let It Happen",
+        "duration": "PT7M46S",
+        "popularity": 0.82
+      },
+      "relationships": {
+        "albums": {
+          "data": [
+            {
+              "type": "albums",
+              "id": "251380836"
+            }
+          ]
+        },
+        "artists": {
+          "data": [
+            {
+              "type": "artists",
+              "id": "1566"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "tracks",
+      "id": "12345678",
+      "attributes": {
+        "title": "The Less I Know the Better",
+        "duration": "PT3M38S",
+        "popularity": 0.91
+      },
+      "relationships": {
+        "albums": {
+          "data": [
+            {
+              "type": "albums",
+              "id": "251380836"
+            }
+          ]
+        },
+        "artists": {
+          "data": [
+            {
+              "type": "artists",
+              "id": "1566"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "albums",
+      "id": "251380836",
+      "attributes": {
+        "title": "Currents",
+        "type": "ALBUM"
+      },
+      "relationships": {
+        "artists": {
+          "data": [
+            {
+              "type": "artists",
+              "id": "1566"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "artists",
+      "id": "1566",
+      "attributes": {
+        "name": "Tame Impala"
+      }
+    }
+  ],
+  "links": {
+    "self": "/v2/playlists/f6b9f0a1-6c8e-4d24-9c71-1d0e2f3a4b5c/relationships/items?include=items,items.albums,items.artists"
+  }
+}

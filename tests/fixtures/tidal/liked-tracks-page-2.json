@@ -1,0 +1,74 @@
+{
+  "data": [
+    {
+      "type": "tracks",
+      "id": "98765432",
+      "meta": {
+        "addedAt": "2026-10-02T08:15:00Z"
+      }
+    }
+  ],
+  "included": [
+    {
+      "type": "tracks",
+      "id": "98765432",
+      "attributes": {
+        "title": "Eventually",
+        "duration": "PT5M19S",
+        "popularity": 0.61,
+        "explicit": false,
+        "trackNumber": 3,
+        "mediaTags": [
+          "LOSSLESS"
+        ],
+        "tidalUrl": "https://tidal.com/browse/track/98765432"
+      },
+      "relationships": {
+        "albums": {
+          "data": [
+            {
+              "type": "albums",
+              "id": "251380836"
+            }
+          ]
+        },
+        "artists": {
+          "data": [
+            {
+              "type": "artists",
+              "id": "1566"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "albums",
+      "id": "251380836",
+      "attributes": {
+        "title": "Currents",
+        "type": "ALBUM"
+      },
+      "relationships": {
+        "artists": {
+          "data": [
+            {
+              "type": "artists",
+              "id": "1566"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "artists",
+      "id": "1566",
+      "attributes": {
+        "name": "Tame Impala"
+      }
+    }
+  ],
+  "links": {
+    "self": "/v2/userCollectionTracks/me/relationships/items?include=items,items.albums,items.artists&page%5Bcursor%5D=page-2"
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "data": [
+    {"type": "albums", "id": "251380836"},
+    {"type": "albums", "id": "445567890"},
+    {"type": "albums", "id": "556677889"}
+  ],
+  "included": [
+    {
+      "type": "albums",
+      "id": "251380836",
+      "attributes": {"title": "Currents", "type": "ALBUM", "releaseDate": "2015-07-17"},
+      "relationships": {
+        "artists": {"data": [{"type": "artists", "id": "1566"}]},
+        "coverArt": {"data": [{"type": "artworks", "id": "251380836-large"}]}
+      }
+    },
+    {
+      "type": "albums",
+      "id": "445567890",
+      "attributes": {"title": "Let It Happen EP", "type": "EP", "releaseDate": "2015-04-01"},
+      "relationships": {
+        "artists": {"data": [{"type": "artists", "id": "1566"}]}
+      }
+    },
+    {
+      "type": "albums",
+      "id": "556677889",
+      "attributes": {"title": "The Less I Know the Better", "type": "SINGLE", "releaseDate": "2015-11-10"},
+      "relationships": {
+        "artists": {"data": [{"type": "artists", "id": "1566"}]}
+      }
+    },
+    {
+      "type": "artists",
+      "id": "1566",
+      "attributes": {"name": "Tame Impala"}
+    }
+  ],
+  "links": {
+    "self": "/artists/1566/relationships/albums?include=albums,albums.artists,albums.coverArt"
+  }
+}

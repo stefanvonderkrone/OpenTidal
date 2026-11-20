@@ -5,7 +5,6 @@
 
 use std::{
     ffi::OsStr,
-    io::Write,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -267,72 +266,10 @@ impl FileStore {
 
     fn write(&self, token: &Token) -> std::io::Result<()> {
         let text = toml::to_string(token).map_err(std::io::Error::other)?;
-        let parent = self.path.parent().ok_or_else(|| std::io::Error::other("token file has no parent"))?;
-        let mut directory = std::fs::DirBuilder::new();
-        directory.recursive(true);
-        private_directory(&mut directory);
-        directory.create(parent)?;
-        let temporary = self.path.with_extension(format!("toml.{}.tmp", std::process::id()));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        private_file(&mut options);
-        let mut file = match options.open(&temporary) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                // A stale temporary file from a crash is safe to remove. Creating
-                // with create_new refuses an existing symlink.
-                std::fs::remove_file(&temporary)?;
-                options.open(&temporary)?
-            }
-            Err(error) => return Err(error),
-        };
-        let mut temporary = TemporaryFile::new(temporary);
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&temporary.path, &self.path)?;
-        temporary.disarm();
-        sync_directory(parent)?;
+        crate::atomic::replace(&self.path, text.as_bytes())?;
         exclude_from_backup(&self.path);
         Ok(())
     }
-}
-
-/// A temporary token file. It removes itself unless the rename succeeds, so a
-/// failed write leaves no half-written file for the next launch to find.
-struct TemporaryFile {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl TemporaryFile {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for TemporaryFile {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-/// Make the renamed directory entry durable. `sync_all` on the file does not
-/// make its name in the directory survive a crash.
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> std::io::Result<()> {
-    std::fs::File::open(path)?.sync_all()
-}
-
-/// No equivalent on other platforms. The rename still completes.
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 /// Keep the token out of a Time Machine backup, using the same extended
@@ -352,24 +289,6 @@ fn exclude_from_backup(path: &Path) {
 /// No Time Machine off macOS. The call site in `write` is unconditional.
 #[cfg(not(target_os = "macos"))]
 fn exclude_from_backup(_path: &Path) {}
-
-#[cfg(unix)]
-fn private_directory(directory: &mut std::fs::DirBuilder) {
-    use std::os::unix::fs::DirBuilderExt;
-    directory.mode(0o700);
-}
-
-#[cfg(not(unix))]
-fn private_directory(_directory: &mut std::fs::DirBuilder) {}
-
-#[cfg(unix)]
-fn private_file(options: &mut std::fs::OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    options.mode(0o600);
-}
-
-#[cfg(not(unix))]
-fn private_file(_options: &mut std::fs::OpenOptions) {}
 
 impl TokenStore for FileStore {
     fn is_memory(&self) -> bool {

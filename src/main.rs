@@ -3,9 +3,12 @@
 //! `cargo run -- --snap out.png --scene default` renders headless.
 
 mod app;
+mod atomic;
 mod auth;
-mod catalog;
+mod catalogue;
+mod covers;
 mod library;
+mod pager;
 mod screens;
 mod state;
 mod store;
@@ -14,7 +17,6 @@ mod tidal;
 use rune::tok::{self, radius, space, type_};
 use rune::{AppSpec, Color, Cx, El, Icon, Key, ScrollSpec, col, el, icon, row, text};
 use app::App;
-use catalog::TrackId;
 use state::{Group, Route, State};
 
 // The accent count must match the rune palette the app draws from.
@@ -28,7 +30,7 @@ const HEART: Icon = Icon { name: "heart", view: 24.0, body: "<path d=\"M12 21s-6
 
 type Scene = (&'static str, fn(&mut App));
 
-const SCENES: [Scene; 6] = [
+const SCENES: [Scene; 10] = [
     ("default", |_| {}),
     ("accent-blue", |a| a.core.accent = 0),
     ("accent-pink", |a| a.core.accent = 2),
@@ -40,6 +42,10 @@ const SCENES: [Scene; 6] = [
         };
     }),
     ("signed-in-stored", signed_in_stored_scene),
+    ("signed-in-synced", signed_in_synced_scene),
+    ("signed-in-covers", signed_in_covers_scene),
+    ("signed-in-paged", signed_in_paged_scene),
+    ("signed-in-details", signed_in_details_scene),
 ];
 
 /// Signs in as a user the database can key on, so a driven scene proves the write
@@ -59,6 +65,7 @@ fn signed_in_stored_scene(a: &mut App) {
         expires_in: 0,
     };
     a.live = false;
+    a.revalidate_on_entry = false;
     a.service = std::sync::Arc::new(tidal::FakeService::default());
     a.tokens = std::sync::Arc::new(auth::MemoryStore::default());
     // A scratch database, so the library this scene writes cannot land in the real
@@ -81,6 +88,11 @@ fn signed_in_stored_scene(a: &mut App) {
     if let Some(dir) = db.parent() {
         std::fs::create_dir_all(dir).ok();
     }
+    // The covers this scene fetches go beside its database, never into the
+    // user's cache, unless a test already named a root.
+    if a.cover_root_override.is_none() {
+        a.cover_root_override = db.parent().map(|dir| dir.join("covers"));
+    }
     a.db_override = Some(db);
     // A driven scene must never write a fabricated token into the real keychain. The
     // assignment above is the fix; this refuses the drive if it ever stops working,
@@ -94,6 +106,147 @@ fn signed_in_stored_scene(a: &mut App) {
     a.core.lib.set_name("Stored User".to_string());
 }
 
+/// The stored scene, with a fake service whose library holds one liked track and
+/// one Tidal playlist. Nothing syncs by itself: the Sync with Tidal button on the
+/// Account screen starts it, the way the deterministic build always does.
+fn signed_in_synced_scene(a: &mut App) {
+    use catalogue::{CatalogueRows, PlaylistRow};
+    signed_in_stored_scene(a);
+    const EVENING: &str = "f6b9f0a1-6c8e-4d24-9c71-1d0e2f3a4b5c";
+    let evening = PlaylistRow {
+        id: EVENING.to_string(),
+        name: "Evening Drive".to_string(),
+        description: "A playlist from Tidal".to_string(),
+        tracks: vec!["seed-track-0".to_string(), "seed-track-1".to_string()],
+        cover: String::new(),
+    };
+    let pages = [
+        (library::RemoteList::Liked, one_page(CatalogueRows::default(), "seed-track-3")),
+        (
+            library::RemoteList::Playlists,
+            one_page(CatalogueRows { playlists: vec![evening], ..CatalogueRows::default() }, EVENING),
+        ),
+    ];
+    a.service = std::sync::Arc::new(tidal::FakeService { pages: pages.into(), ..tidal::FakeService::default() });
+}
+
+/// A list that is one last page holding one member.
+fn one_page(rows: catalogue::CatalogueRows, member: &str) -> Vec<Result<tidal::Page, tidal::ServiceError>> {
+    vec![Ok(tidal::Page { rows, members: vec![member.to_string()], next: None })]
+}
+
+/// The stored scene, with a fake service whose library saves one album with a
+/// cover, and whose cover is a solid magenta PNG. The covers land beside the
+/// scene's database, so a second run with the same `OPENTIDAL_DB` reads them
+/// back with no fetch. Each decode is waited on, so it lands before the snap.
+fn signed_in_covers_scene(a: &mut App) {
+    use catalogue::{AlbumRow, CatalogueRows};
+    signed_in_stored_scene(a);
+    let rows = CatalogueRows {
+        albums: vec![AlbumRow {
+            id: "fixture-album-1".to_string(),
+            title: "Fixture Cover".to_string(),
+            artist: "seed-artist-0".to_string(),
+            cover: "fixture-cover-1".to_string(),
+        }],
+        ..CatalogueRows::default()
+    };
+    let magenta = include_bytes!("../tests/fixtures/covers/magenta.png").to_vec();
+    a.service = std::sync::Arc::new(tidal::FakeService {
+        pages: [(library::RemoteList::Albums, one_page(rows, "fixture-album-1"))].into(),
+        covers: [("fixture-cover-1".to_string(), Ok(magenta))].into(),
+        ..tidal::FakeService::default()
+    });
+    a.wait_for_decode = true;
+}
+
+/// The stored scene, with a fake service whose saved albums run to 145 over
+/// eight pages: five on the first, so they leave room below, then 20 a page.
+/// Entering a list reads its first page, and only scrolling reads past what is
+/// in view, as a live session does.
+fn signed_in_paged_scene(a: &mut App) {
+    use catalogue::{AlbumRow, CatalogueRows};
+    signed_in_stored_scene(a);
+    a.revalidate_on_entry = true;
+    let ids: Vec<String> = (0..145).map(|n| format!("paged-album-{n}")).collect();
+    let mut pages = Vec::new();
+    let mut start = 0;
+    for size in std::iter::once(5).chain(std::iter::repeat_n(20, 7)) {
+        let members = ids[start..start + size].to_vec();
+        let albums = members
+            .iter()
+            .map(|id| AlbumRow { id: id.clone(), title: format!("Album {}", &id[12..]), artist: "seed-artist-0".to_string(), cover: String::new() })
+            .collect();
+        pages.push(Ok(tidal::Page { rows: CatalogueRows { albums, ..CatalogueRows::default() }, members, next: None }));
+        start += size;
+    }
+    a.service = std::sync::Arc::new(tidal::FakeService {
+        pages: [(library::RemoteList::Albums, pages)].into(),
+        ..tidal::FakeService::default()
+    });
+}
+
+/// The stored scene, with a fake service whose account follows one artist.
+/// Opening the artist reads its three albums, and opening the second album
+/// reads its two tracks. Only the artist read brings the first and third
+/// albums, and only the album read brings the tracks. The artist's profile art
+/// is the solid magenta PNG, and each decode is waited on, so it lands before
+/// the snap.
+fn signed_in_details_scene(a: &mut App) {
+    use catalogue::{AlbumRow, ArtistRow, CatalogueRows, TrackRow};
+    signed_in_stored_scene(a);
+    a.revalidate_on_entry = true;
+    let artist = || ArtistRow { id: "detail-artist-1".to_string(), name: "Detail Artist".to_string() };
+    let album = |n: usize, title: &str| AlbumRow {
+        id: format!("detail-album-{n}"),
+        title: title.to_string(),
+        artist: "detail-artist-1".to_string(),
+        cover: String::new(),
+    };
+    let track = |n: usize, title: &str| TrackRow {
+        id: format!("detail-track-{n}"),
+        title: title.to_string(),
+        artist: "detail-artist-1".to_string(),
+        album: "detail-album-2".to_string(),
+        duration: "PT3M".to_string(),
+    };
+    a.catalogue.absorb(CatalogueRows { artists: vec![artist()], ..CatalogueRows::default() });
+    let artist_id = a.catalogue.artist_id("detail-artist-1").expect("the scene artist");
+    let followed = one_page(CatalogueRows { artists: vec![artist()], ..CatalogueRows::default() }, "detail-artist-1");
+    let discography = vec![Ok(tidal::Page {
+        rows: CatalogueRows {
+            artists: vec![artist()],
+            albums: vec![album(1, "First Album"), album(2, "Second Album"), album(3, "Third Album")],
+            ..CatalogueRows::default()
+        },
+        members: (1..=3).map(|n| format!("detail-album-{n}")).collect(),
+        next: None,
+    })];
+    let mut pages: std::collections::BTreeMap<_, _> =
+        [(library::RemoteList::Artists, followed), (library::RemoteList::Artist(artist_id), discography)].into();
+    // The album read is keyed by an id only the catalogue mints, so the second
+    // album is absorbed here to name it. It is the first card of the artist's
+    // grid, because the grid keeps catalogue order.
+    a.catalogue.absorb(CatalogueRows { albums: vec![album(2, "Second Album")], ..CatalogueRows::default() });
+    let album_id = a.catalogue.album_id("detail-album-2").expect("the scene album");
+    let tracks = vec![Ok(tidal::Page {
+        rows: CatalogueRows {
+            tracks: vec![track(1, "Detail Track One"), track(2, "Detail Track Two")],
+            ..CatalogueRows::default()
+        },
+        members: vec!["detail-track-1".to_string(), "detail-track-2".to_string()],
+        next: None,
+    })];
+    pages.insert(library::RemoteList::Album(album_id), tracks);
+    let magenta = include_bytes!("../tests/fixtures/covers/magenta.png").to_vec();
+    a.service = std::sync::Arc::new(tidal::FakeService {
+        pages,
+        covers: [("artist-detail-artist-1".to_string(), Ok(magenta))].into(),
+        ..tidal::FakeService::default()
+    });
+    a.wait_for_decode = true;
+}
+
 fn view(app: &App, _cx: &mut Cx<App>) -> El {
     // The library may have changed during this frame's events. Ask for one more
     // frame so `drain` writes it; a window at rest draws none.
@@ -101,6 +254,7 @@ fn view(app: &App, _cx: &mut Cx<App>) -> El {
     let s = &app.core;
     let t = tok::theme(true);
     let accent = tok::accent(s.accent, true);
+    let cat = &app.catalogue;
 
     col()
         .key("app")
@@ -112,7 +266,7 @@ fn view(app: &App, _cx: &mut Cx<App>) -> El {
                 .child(sidebar(app, t, accent))
                 .child(main_col(app, t, accent)),
         )
-        .child(now_playing(s, t, accent))
+        .child(now_playing(s, cat, t, accent))
 }
 
 fn nav_item(route: Route, selected: bool, t: tok::Theme, accent: Color) -> El {
@@ -129,7 +283,7 @@ fn nav_item(route: Route, selected: bool, t: tok::Theme, accent: Color) -> El {
         .focusable(true)
         .on_press(move |a: &mut App| {
             a.rename.clear();
-            state::open_section(&mut a.core, route)
+            state::open_section(&mut a.core, route.clone())
         })
         .child(
             text(name)
@@ -171,8 +325,10 @@ fn sidebar(app: &App, t: tok::Theme, accent: Color) -> El {
     );
 
     for route in state::SECTIONS {
-        let item = nav_item(route, state::current(s) == route, t, accent);
-        match route.group() {
+        let selected = state::current(s) == &route;
+        let group = route.group();
+        let item = nav_item(route, selected, t, accent);
+        match group {
             Group::Primary => primary = primary.child(item),
             Group::Library => library = library.child(item),
             Group::Bottom => bottom = bottom.child(item),
@@ -274,31 +430,36 @@ fn main_col(app: &App, t: tok::Theme, accent: Color) -> El {
 }
 
 fn screen_body(app: &App, t: tok::Theme, accent: Color) -> El {
-    match state::current(&app.core) {
-        Route::Home => screens::home(t),
+    let s = &app.core;
+    let cat = &app.catalogue;
+    let covers = app.covers();
+    let hovered = app.hovered_card.as_deref();
+    match state::current(s) {
+        Route::Home => screens::home(cat, covers, hovered, t),
         Route::Feed => screens::feed(t),
-        Route::Popular => screens::popular(&app.core, t),
-        Route::ForYou => screens::for_you(t),
-        Route::LikedSongs => screens::liked_songs(&app.core, t),
-        Route::Albums => screens::albums(&app.core, t),
-        Route::Artists => screens::artists(&app.core, t),
-        Route::Playlists => screens::playlists(&app.core, t),
+        Route::Popular => screens::popular(s, cat, covers, hovered, t),
+        Route::ForYou => screens::for_you(cat, covers, hovered, t),
+        Route::LikedSongs => screens::liked_songs(app, t),
+        Route::Albums => screens::albums(app, t),
+        Route::Artists => screens::artists(app, t),
+        Route::Playlists => screens::playlists(app, t),
         Route::Collections => screens::collections(app, t),
-        Route::Local => screens::local(&app.core, t),
-        Route::History => screens::history(&app.core, t),
-        Route::Stats => screens::stats(&app.core, t),
-        Route::Downloads => screens::downloads(&app.core, t),
-        Route::Search => screens::search(t, &app.search),
+        Route::Local => screens::local(s, cat, t),
+        Route::History => screens::history(s, cat, t),
+        Route::Stats => screens::stats(s, cat, t),
+        Route::Downloads => screens::downloads(s, cat, t),
+        Route::Search => screens::search(cat, covers, hovered, t, &app.search),
         Route::Settings => screens::settings(t),
-        Route::SettingsPage(p) => screens::settings_page(p, app, t),
+        Route::SettingsPage(p) => screens::settings_page(*p, app, t),
         route => screens::detail(route, app, accent, t),
     }
 }
 
-fn now_playing(s: &State, t: tok::Theme, accent: Color) -> El {
-    let id = s.now_playing.unwrap_or(TrackId(0));
-    let tr = catalog::track(id);
-    let liked = s.lib.is_liked(id);
+fn now_playing(s: &State, cat: &catalogue::Catalogue, t: tok::Theme, accent: Color) -> El {
+    let tr = s.now_playing.as_ref().and_then(|id| cat.track(id));
+    let liked = s.now_playing.as_ref().is_some_and(|id| s.lib.is_liked(id));
+    let title = tr.map_or("Nothing playing", |tr| tr.title.as_str());
+    let artist = tr.and_then(|tr| cat.artist(&tr.artist)).map_or("", |a| a.name.as_str());
 
     let like_btn = el().key("like")
         .label(if liked { "Unlike" } else { "Like" })
@@ -308,7 +469,7 @@ fn now_playing(s: &State, t: tok::Theme, accent: Color) -> El {
         .hover(t.hover)
         .focusable(true)
         .on_press(move |a: &mut App| {
-            if let Some(tr) = a.core.now_playing {
+            if let Some(tr) = a.core.now_playing.clone() {
                 a.core.lib.toggle_like(tr);
             }
         })
@@ -356,8 +517,8 @@ fn now_playing(s: &State, t: tok::Theme, accent: Color) -> El {
                 .child(like_btn)
                 .child(
                     col().gap(2.0)
-                        .child(text(tr.title).key("track").font(type_::BODY).color(t.text))
-                        .child(text(catalog::artist(tr.artist).name).key("artist").font(type_::LABEL).color(t.text_secondary)),
+                        .child(text(title).key("track").font(type_::BODY).color(t.text))
+                        .child(text(artist).key("artist").font(type_::LABEL).color(t.text_secondary)),
                 ),
         )
         .child(
@@ -419,4 +580,368 @@ fn main() {
             app.quit();
         })
         .run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+
+    use catalogue::CoverRequest;
+    use library::RemoteList;
+    use rune::{Env, Runtime};
+    use tidal::{Cursor, MusicService, Page, ServiceError, User};
+
+    /// The paged scene's fake service behind a gate. An open gate answers at
+    /// once. A held gate makes each page wait for a verdict: `Ok` reads the
+    /// fake page, `Err` answers that error instead.
+    struct Gate {
+        inner: Arc<dyn MusicService>,
+        held: AtomicBool,
+        verdicts: Mutex<mpsc::Receiver<Result<(), ServiceError>>>,
+        pages: AtomicUsize,
+    }
+
+    impl MusicService for Gate {
+        fn current_user(&self, token: &str) -> Result<User, ServiceError> {
+            self.inner.current_user(token)
+        }
+        fn page(&self, token: &str, user: &str, of: &RemoteList, after: Option<&Cursor>) -> Result<Page, ServiceError> {
+            self.pages.fetch_add(1, Ordering::SeqCst);
+            if self.held.load(Ordering::SeqCst) {
+                let verdict = self.verdicts.lock().expect("gate").recv().unwrap_or(Ok(()));
+                verdict?;
+            }
+            self.inner.page(token, user, of, after)
+        }
+        fn cover(&self, token: &str, cover: &CoverRequest) -> Result<Vec<u8>, ServiceError> {
+            self.inner.cover(token, cover)
+        }
+    }
+
+    struct Paged {
+        rt: Runtime<App>,
+        gate: Arc<Gate>,
+        verdicts: mpsc::Sender<Result<(), ServiceError>>,
+    }
+
+    impl Paged {
+        /// The `signed-in-paged` scene on `db`, drawn in a window of the app's size.
+        fn open(db: &std::path::Path, held: bool) -> Paged {
+            Paged::open_scene(db, held, signed_in_paged_scene)
+        }
+
+        fn open_scene(db: &std::path::Path, held: bool, scene: fn(&mut App)) -> Paged {
+            let mut app = App::default();
+            app.db_override = Some(db.to_path_buf());
+            scene(&mut app);
+            let (verdicts, rx) = mpsc::channel();
+            let gate = Arc::new(Gate {
+                inner: app.service.clone(),
+                held: AtomicBool::new(held),
+                verdicts: Mutex::new(rx),
+                pages: AtomicUsize::new(0),
+            });
+            app.service = gate.clone();
+            let mut rt = Runtime::new(app, view, (1280.0, 800.0), Env::new(true, 1.0));
+            rt.poll = Some(|app, _, _| app.drain());
+            rt.frame(0.0);
+            Paged { rt, gate, verdicts }
+        }
+
+        fn open_albums(&mut self) {
+            self.rt.update(|a, _| state::open_section(&mut a.core, Route::Albums));
+        }
+
+        fn status(&self) -> PassStatusLine {
+            let line = self.rt.elements().into_iter().find(|e| e.key.as_deref() == Some("pass-status")).and_then(|e| e.text);
+            PassStatusLine(line)
+        }
+
+        fn shows(&self, key: &str) -> bool {
+            self.rt.find(key).is_some()
+        }
+
+        /// Draws frames until `done`, giving the workers real time to answer.
+        fn until(&mut self, what: &str, done: impl Fn(&Paged) -> bool) {
+            for _ in 0..400 {
+                self.rt.frame(1.0 / 60.0);
+                if done(self) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            panic!("never {what}: status {:?}", self.status());
+        }
+
+        /// Frames until no page is in flight and nothing more is wanted.
+        fn settle(&mut self) {
+            self.until("settled", |p| p.rt.state.pass_status(RemoteList::Albums) != pager::PassStatus::Loading);
+            for _ in 0..30 {
+                self.rt.frame(1.0 / 60.0);
+            }
+        }
+
+        /// Opens the gate, answers the page that waits on it, and settles.
+        fn release(&mut self) {
+            self.gate.held.store(false, Ordering::SeqCst);
+            self.verdicts.send(Ok(())).expect("gate");
+            self.settle();
+        }
+
+        fn scroll(&mut self, dy: f32) {
+            self.rt.wheel(700.0, 400.0, dy);
+            for _ in 0..30 {
+                self.rt.frame(1.0 / 60.0);
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct PassStatusLine(Option<String>);
+
+    impl PassStatusLine {
+        fn says(&self, start: &str) -> bool {
+            self.0.as_deref().is_some_and(|line| line.starts_with(start))
+        }
+    }
+
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!("opentidal-paged-{name}-{}", std::process::id()));
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir_all(&dir).expect("scratch directory");
+            Scratch(dir)
+        }
+        fn db(&self) -> std::path::PathBuf {
+            self.0.join("scene.db")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    /// Opening an artist reads its albums, and opening one of them reads its
+    /// tracks. Neither read changes a library list.
+    #[test]
+    fn opening_an_artist_and_an_album_reads_their_details() {
+        let scratch = Scratch::new("details");
+        let mut p = Paged::open_scene(&scratch.db(), false, signed_in_details_scene);
+        let artist = p.rt.state.catalogue.artist_id("detail-artist-1").expect("the scene artist");
+        let album = p.rt.state.catalogue.album_id("detail-album-2").expect("the scene album");
+        // The stored scene starts a profile fetch before this test holds the
+        // service. Let it land first, or a name change from that fetch is blamed
+        // on the detail read. This failed on Linux and passed on Mac.
+        p.until("settled the profile", |p| p.rt.state.core.lib.name == "Fake User");
+        let before = p.rt.state.core.lib.clone();
+        p.rt.update(|a, _| state::open_detail(&mut a.core, &a.catalogue, Route::Artist(artist.clone())));
+        p.until("showed the artist's albums", |p| p.shows("album-2"));
+        assert!(!p.shows("detail-track-1"), "a track showed before its album was opened");
+        p.rt.update(|a, _| state::open_detail(&mut a.core, &a.catalogue, Route::Album(album.clone())));
+        p.until("showed the album's tracks", |p| p.shows("detail-track-1") && p.shows("track-1"));
+        assert_eq!(p.rt.state.core.lib, before, "a detail read changed the library");
+    }
+
+    /// The Artists grid draws each artist's profile art, not only the gradient.
+    #[test]
+    fn an_artist_card_shows_the_artist_picture() {
+        let scratch = Scratch::new("artist-card");
+        let mut p = Paged::open_scene(&scratch.db(), false, signed_in_details_scene);
+        p.rt.update(|a, _| state::open_section(&mut a.core, Route::Artists));
+        p.until("showed the artist's picture on its card", |p| p.shows("artist-0/cover-image"));
+        assert!(!p.shows("artist-0/cover"), "the card kept its gradient beside the picture");
+    }
+
+    /// The first page holds five albums, so the rows in view want more, and
+    /// album 50 sits on a page only a scroll asks for.
+    #[test]
+    fn a_scroll_reads_the_page_its_rows_need() {
+        let scratch = Scratch::new("scroll");
+        let mut p = Paged::open(&scratch.db(), false);
+        p.open_albums();
+        p.settle();
+        assert!(p.shows("paged-album-0"), "the first page did not show");
+        assert!(!p.shows("paged-album-50"), "a page no row needs was read");
+        p.scroll(-900.0);
+        p.settle();
+        assert!(p.shows("paged-album-50"), "the scroll did not read the next page, status {:?}", p.status());
+    }
+
+    /// A restart shows the albums the file holds while page one is still out.
+    #[test]
+    fn cached_rows_show_before_the_first_page_lands() {
+        let scratch = Scratch::new("cached");
+        let mut first = Paged::open(&scratch.db(), false);
+        first.open_albums();
+        first.settle();
+        assert!(first.rt.state.quit(), "the first run did not write its library");
+        drop(first);
+
+        let mut p = Paged::open(&scratch.db(), true);
+        p.open_albums();
+        p.until("asked for page one", |p| p.gate.pages.load(Ordering::SeqCst) == 1);
+        for _ in 0..10 {
+            p.rt.frame(1.0 / 60.0);
+        }
+        assert!(p.shows("paged-album-0") && p.shows("paged-album-10"), "the cached rows waited for the page");
+        assert_eq!(p.status(), PassStatusLine(Some("Loading from Tidal…".to_string())));
+        p.release();
+        assert!(p.shows("paged-album-10"), "page one dropped the cached rows");
+    }
+
+    /// Coming back to a list read to its end reads page one again, behind the
+    /// rows already shown.
+    #[test]
+    fn reentering_a_cached_screen_shows_rows_before_the_refresh_lands() {
+        let scratch = Scratch::new("reenter");
+        let mut p = Paged::open(&scratch.db(), false);
+        p.open_albums();
+        p.rt.update(|a, _| a.sync());
+        p.until("read to the end", |p| p.rt.state.pass_status(RemoteList::Albums) == pager::PassStatus::Complete);
+        p.rt.update(|a, _| state::open_section(&mut a.core, Route::Home));
+        p.settle();
+        p.gate.held.store(true, Ordering::SeqCst);
+        let before = p.gate.pages.load(Ordering::SeqCst);
+        p.open_albums();
+        p.until("asked for the refresh", |p| p.gate.pages.load(Ordering::SeqCst) == before + 1);
+        for _ in 0..10 {
+            p.rt.frame(1.0 / 60.0);
+        }
+        assert!(p.shows("paged-album-0") && p.shows("paged-album-10"), "reentry hid the rows until the refresh");
+        assert!(p.status().says("Loading"), "the refresh is not shown: {:?}", p.status());
+        p.release();
+    }
+
+    /// A failed page says so, and a scroll that wants more rows reads it again.
+    #[test]
+    fn a_stalled_pass_says_so_and_a_larger_scroll_retries_it() {
+        let scratch = Scratch::new("stall");
+        let mut p = Paged::open(&scratch.db(), false);
+        p.open_albums();
+        p.settle();
+        p.gate.held.store(true, Ordering::SeqCst);
+        let before = p.gate.pages.load(Ordering::SeqCst);
+        p.scroll(-700.0);
+        p.until("asked for the next page", |p| p.gate.pages.load(Ordering::SeqCst) == before + 1);
+        p.verdicts.send(Err(ServiceError::Http("500".to_string()))).expect("gate");
+        p.until("stalled", |p| p.status().says("Tidal did not send the rest"));
+        assert!(!p.shows("paged-album-50"));
+
+        p.verdicts.send(Ok(())).expect("gate");
+        p.scroll(-900.0);
+        p.until("read the page again", |p| p.gate.pages.load(Ordering::SeqCst) >= before + 2);
+        p.release();
+        assert!(p.shows("paged-album-50"), "the retry did not land, status {:?}", p.status());
+    }
+
+    /// The Home screen with its last card, `album-4`, renamed to a title far
+    /// wider than the card. No card stands to its right, so a spilled title
+    /// would draw over empty space. The first album keeps its short title,
+    /// "Currents".
+    fn long_title_home() -> Runtime<App> {
+        use catalogue::{AlbumRow, CatalogueRows};
+        let mut app = App::default();
+        let title = "A Title Much Too Long To Fit Inside One Album Card".to_string();
+        let row = AlbumRow { id: "seed-album-4".into(), title, artist: "seed-artist-4".into(), cover: String::new() };
+        app.catalogue.absorb(CatalogueRows { albums: vec![row], ..CatalogueRows::default() });
+        let mut rt = Runtime::new(app, view, (1280.0, 800.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        rt
+    }
+
+    /// The drawn rect of the element keyed `key` inside the card keyed `card`.
+    fn card_part(rt: &Runtime<App>, card: &str, key: &str) -> Option<[f32; 4]> {
+        let inside = format!("/{card}/");
+        rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key) && e.path.contains(&inside)).map(|e| e.rect)
+    }
+
+    /// The right edge of the title row in `card`, after each glyph's clip.
+    /// A clipped title ends at the card edge; an unclipped one runs far past
+    /// it. The margin allows a glyph's raster padding on any platform, but is
+    /// far smaller than the extra width of this test's long title.
+    fn title_right(rt: &Runtime<App>, card: &str) -> f32 {
+        let [x, _, w, _] = rt.elements().into_iter().find(|e| e.key.as_deref() == Some(card)).expect("the card").rect;
+        let [_, ty, _, th] = card_part(rt, card, "title").expect("the card lost its title");
+        rt.instances.iter()
+            .filter(|i| i.params[1] == rune::render::KIND_GLYPH)
+            .filter(|i| i.rect[1] >= ty - 2.0 && i.rect[1] < ty + th + 2.0)
+            .filter(|i| i.rect[0] >= x - 8.0)
+            .map(|i| (i.rect[0] + i.rect[2]).min(i.clip[2]))
+            .fold(x + w, f32::max)
+    }
+
+    /// Whether glyphs in the title row of `card` carry the marquee window's
+    /// clip. The clip is a layout value, so unlike glyph padding it is the
+    /// same on every platform.
+    fn title_is_clipped(rt: &Runtime<App>, card: &str) -> bool {
+        let [x, _, w, _] = rt.elements().into_iter().find(|e| e.key.as_deref() == Some(card)).expect("the card").rect;
+        let [_, ty, _, th] = card_part(rt, card, "title").expect("the card lost its title");
+        rt.instances.iter()
+            .filter(|i| i.params[1] == rune::render::KIND_GLYPH)
+            .filter(|i| i.rect[1] >= ty - 2.0 && i.rect[1] < ty + th + 2.0)
+            .filter(|i| i.rect[0] >= x - 8.0 && i.rect[0] < x + w + 8.0)
+            .any(|i| i.clip[0] >= x - 1.0 && i.clip[2] <= x + w + 1.0)
+    }
+
+    /// Rests the pointer on the cover of the card keyed `card` past the hover delay.
+    fn rest_on(rt: &mut Runtime<App>, card: &str) {
+        let (x, y) = rt.find(&format!("{card}/cover")).expect("the card has a cover");
+        rt.pointer_move(x, y);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+    }
+
+    #[test]
+    fn a_long_title_at_rest_stays_one_line_inside_its_card() {
+        let rt = long_title_home();
+        let [x, _, w, _] = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("album-4")).expect("the card").rect;
+        assert!(title_right(&rt, "album-4") <= x + w + 16.0, "the title spills past its card");
+        assert!(card_part(&rt, "album-4", "title-clip").is_none(), "a card at rest scrolls its title");
+    }
+
+    #[test]
+    fn a_long_title_scrolls_while_its_card_is_hovered() {
+        let mut rt = long_title_home();
+        rest_on(&mut rt, "album-4");
+        assert!(card_part(&rt, "album-4", "title-clip").is_some(), "the hovered card does not scroll its title");
+        assert!(card_part(&rt, "album-4", "title-echo").is_some(), "the title has no copy to follow it");
+        assert!(card_part(&rt, "album-0", "title-clip").is_none(), "a card that is not hovered scrolls too");
+        let start = card_part(&rt, "album-4", "title").expect("the title")[0];
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        let later = card_part(&rt, "album-4", "title").expect("the title")[0];
+        assert!(later < start, "the title does not move left: {start} then {later}");
+        assert!(title_is_clipped(&rt, "album-4"), "the marquee draws outside its card");
+    }
+
+    #[test]
+    fn leaving_a_card_stops_its_title_scrolling() {
+        let mut rt = long_title_home();
+        rest_on(&mut rt, "album-4");
+        assert!(card_part(&rt, "album-4", "title-clip").is_some(), "the hovered card does not scroll its title");
+        rt.pointer_move(1270.0, 790.0);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(card_part(&rt, "album-4", "title-clip").is_none(), "the title still scrolls after the pointer left");
+        let [x, _, w, _] = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("album-4")).expect("the card").rect;
+        assert!(title_right(&rt, "album-4") <= x + w + 16.0, "the title spills past its card after a leave");
+    }
+
+    #[test]
+    fn a_short_title_never_scrolls() {
+        let mut rt = long_title_home();
+        rest_on(&mut rt, "album-0");
+        assert_eq!(rt.state.hovered_card.as_deref(), Some("album-0"), "the pointer never rested on the card");
+        assert!(card_part(&rt, "album-0", "title-clip").is_none(), "a title that fits its card scrolls");
+        assert!(card_part(&rt, "album-0", "title").is_some(), "the card lost its title");
+    }
 }

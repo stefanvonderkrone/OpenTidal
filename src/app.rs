@@ -183,9 +183,10 @@ const COVER_SCALE: f32 = 2.0;
 /// A finished sign-in exchange, tagged with the session it ran under.
 type AuthFlow = (u64, Result<Token, String>);
 
-/// A finished profile fetch, tagged with its session, carrying the token to
-/// persist.
-type ProfileFetch = (u64, Result<(Token, User), ServiceError>);
+/// A finished profile fetch, tagged with its session. The token is the one the
+/// session holds afterwards, even when the profile call failed, because a
+/// refresh before that call may have rotated the refresh token.
+type ProfileFetch = (u64, Token, Result<User, ServiceError>);
 
 /// A finished page, tagged with the account it was read for.
 type PageFetch = (Ticket, PageResult);
@@ -660,7 +661,8 @@ impl App {
         let (service, config, session, refresh) = (self.service.clone(), self.oauth.clone(), self.session, self.refresh);
         self.profile_renews = false;
         self.profile.request(token, move |t| {
-            (session, with_fresh_token(&|t| refresh(&config, t), t, &|access| service.current_user(access)))
+            let (token, user) = with_fresh_token(&|t| refresh(&config, t), t, &|access| service.current_user(access));
+            (session, token, user)
         });
     }
 
@@ -677,7 +679,8 @@ impl App {
         let (service, config, session, refresh) = (self.service.clone(), self.oauth.clone(), self.session, self.refresh);
         self.profile_renews = true;
         self.profile.request(token.clone(), move |t| {
-            (session, renew(&|t| refresh(&config, t), t, &|access| service.current_user(access)))
+            let (token, user) = renew(&|t| refresh(&config, t), t, &|access| service.current_user(access));
+            (session, token, user)
         });
     }
 
@@ -843,14 +846,16 @@ impl App {
                 Err(message) => self.auth = Auth::Failed { message },
             }
         }
-        if let Some((session, result)) = self.profile.take()
+        if let Some((session, token, result)) = self.profile.take()
             && session == self.session
         {
             changed = true;
             let renewal = std::mem::take(&mut self.profile_renews);
+            if !matches!(&result, Err(ServiceError::InvalidGrant(_))) {
+                self.keep_token(token);
+            }
             match result {
-                Ok((token, user)) => {
-                    self.keep_token(token);
+                Ok(user) => {
                     self.core.lib.set_name(user.name);
                     // The fetch landed, so the reason an earlier one did not is out
                     // of date. Leaving it would show "could not reach Tidal" over a
@@ -876,8 +881,8 @@ impl App {
                         eprintln!(
                             "opentidal: the profile fetch failed, staying signed in: {e:?}"
                         );
-                        // The token did not change, so a pass waiting for a new one
-                        // would say it syncs forever.
+                        // A pass waiting on a token the fetch could not replace would
+                        // say it syncs forever. A replaced token resumes it instead.
                         if let (Some(open), Auth::SignedIn { token }) = (self.library.as_mut(), &self.auth) {
                             open.passes.renewal_failed(&token.access_token, &e);
                         }
@@ -955,10 +960,11 @@ impl App {
 }
 
 /// Run `call` with a fresh token, refreshing it first when it is expired or when
-/// the service rejects it. Returns the token actually used, so the caller can
-/// persist a renewed one. A refresh the endpoint rejects outright (for example
-/// `invalid_grant`) surfaces as [`ServiceError::InvalidGrant`], which the caller
-/// maps to clearing the stored token. The profile fetch uses it.
+/// the service rejects it. Returns the newest token beside the answer, even a
+/// failed one, so the caller can persist a renewed token. A refresh the endpoint
+/// rejects outright (for example `invalid_grant`) surfaces as
+/// [`ServiceError::InvalidGrant`], which the caller maps to clearing the stored
+/// token. The profile fetch uses it.
 ///
 /// The refresh is a parameter. A test needs to count the refreshes and make them
 /// fail on demand, which the network call cannot do without a server. Production
@@ -967,7 +973,7 @@ fn with_fresh_token<T>(
     refresh: &dyn Fn(&Token) -> Result<Token, ServiceError>,
     token: Token,
     call: &dyn Fn(&str) -> Result<T, ServiceError>,
-) -> Result<(Token, T), ServiceError> {
+) -> (Token, Result<T, ServiceError>) {
     // Whether this call already refreshed for expiry decides how a rejection reads.
     // A token that was expired and refreshed, then rejected anyway, is rejected in its
     // freshest form: refreshing again cannot help, and a transport failure on that
@@ -975,39 +981,44 @@ fn with_fresh_token<T>(
     // on a token the API will not take.
     let expired = auth::token_expired(&token);
     let token = if expired {
-        refresh(&token)?
+        match refresh(&token) {
+            Ok(fresh) => fresh,
+            Err(e) => return (token, Err(e)),
+        }
     } else {
         token
     };
     match call(&token.access_token) {
-        Ok(answer) => Ok((token, answer)),
+        Ok(answer) => (token, Ok(answer)),
         // The one refresh-and-retry for a token that was still current. It is worth
         // trying once: the API rejects a token whose clock it disagrees with. A sync
         // rejected on page nine reads again from page one, which is safe because
         // nothing was applied.
-        Err(ServiceError::Unauthorized) if !expired => {
-            let fresh = refresh(&token)?;
-            let answer = after_refresh(call(&fresh.access_token))?;
-            Ok((fresh, answer))
-        }
+        Err(ServiceError::Unauthorized) if !expired => renew(refresh, token, call),
         Err(ServiceError::Unauthorized) => {
-            Err(ServiceError::InvalidGrant("a fresh token was rejected".to_string()))
+            (token, Err(ServiceError::InvalidGrant("a fresh token was rejected".to_string())))
         }
-        Err(e) => Err(e),
+        Err(e) => (token, Err(e)),
     }
 }
 
 /// Refresh first, then make the call with the fresh token. A rejected page
 /// forces this, because the token it carried was not expired by its clock. A
 /// fresh token the service rejects too is a dead grant, through `after_refresh`.
+/// A failed call still returns the fresh token, because the refresh may have
+/// rotated the refresh token the old one carried.
 fn renew<T>(
     refresh: &dyn Fn(&Token) -> Result<Token, ServiceError>,
     token: Token,
     call: &dyn Fn(&str) -> Result<T, ServiceError>,
-) -> Result<(Token, T), ServiceError> {
-    let fresh = refresh(&token)?;
-    let answer = after_refresh(call(&fresh.access_token))?;
-    Ok((fresh, answer))
+) -> (Token, Result<T, ServiceError>) {
+    match refresh(&token) {
+        Ok(fresh) => {
+            let answer = after_refresh(call(&fresh.access_token));
+            (fresh, answer)
+        }
+        Err(e) => (token, Err(e)),
+    }
 }
 
 /// Read the answer to a request made with a freshly minted token. A token minted a
@@ -1463,7 +1474,7 @@ mod tests {
         // discards it as stale.
         let session = app.session;
         let dead = ServiceError::InvalidGrant("refresh token revoked".to_string());
-        app.profile.request((), move |_| (session, Err(dead)));
+        app.profile.request((), move |_| (session, fake_token(), Err(dead)));
         for _ in 0..1_000 {
             if app.drain() {
                 break;
@@ -1612,7 +1623,7 @@ mod tests {
             refresh_token: "r".to_string(),
             expires_in: 0,
         };
-        let result = with_fresh_token(&refresh, expired, &|access| service.current_user(access));
+        let (_, result) = with_fresh_token(&refresh, expired, &|access| service.current_user(access));
 
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the token was refreshed more than once");
         assert!(
@@ -1628,7 +1639,7 @@ mod tests {
             refresh_token: "r".to_string(),
             expires_in: 3600,
         };
-        let result = with_fresh_token(&refresh, current, &|access| service.current_user(access));
+        let (_, result) = with_fresh_token(&refresh, current, &|access| service.current_user(access));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the retry refresh did not happen");
         assert!(matches!(result, Err(ServiceError::InvalidGrant(_))));
     }
@@ -1648,7 +1659,7 @@ mod tests {
 
         let session = app.session;
         let offline = ServiceError::Http("dns: no route to host".to_string());
-        app.profile.request((), move |_| (session, Err(offline)));
+        app.profile.request((), move |_| (session, fake_token(), Err(offline)));
         for _ in 0..1_000 {
             if app.drain() {
                 break;
@@ -1680,7 +1691,7 @@ mod tests {
             id: crate::tidal::UserId("173210380".to_string()),
             name: "Ada".to_string(),
         };
-        app.profile.request((), move |_| (session, Ok((fake_token(), user))));
+        app.profile.request((), move |_| (session, fake_token(), Ok(user)));
         for _ in 0..1_000 {
             if app.drain() {
                 break;
@@ -2225,6 +2236,8 @@ mod tests {
         tokens: std::sync::Mutex<Vec<String>>,
         users: std::sync::atomic::AtomicUsize,
         rejects: fn(&str) -> bool,
+        /// Every profile fetch fails on transport, as with the network gone.
+        offline_profile: bool,
         hold: Option<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
     }
 
@@ -2235,6 +2248,7 @@ mod tests {
                 tokens: std::sync::Mutex::new(Vec::new()),
                 users: std::sync::atomic::AtomicUsize::new(0),
                 rejects: |_| false,
+                offline_profile: false,
                 hold: None,
             }
         }
@@ -2257,6 +2271,9 @@ mod tests {
     impl MusicService for Recorded {
         fn current_user(&self, token: &str) -> Result<User, ServiceError> {
             self.users.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.offline_profile {
+                return Err(ServiceError::Http("offline".to_string()));
+            }
             self.inner.current_user(token)
         }
         fn page(
@@ -2435,7 +2452,7 @@ mod tests {
         let session = app.session;
         app.profile.request((), move |_| {
             let _ = wait.recv();
-            (session, Err(ServiceError::Http("offline".to_string())))
+            (session, fake_token(), Err(ServiceError::Http("offline".to_string())))
         });
         app.sync();
         for _ in 0..50 {
@@ -2585,6 +2602,33 @@ mod tests {
         assert!(matches!(app.auth, Auth::SignedIn { .. }), "the retry after a failed renewal ended the session");
         assert!(app.core.lib.is_liked(&track(1)), "a scroll did not retry the stalled pass");
         assert_eq!(service.tokens(), ["fake-access", "fake-access", "fresh"]);
+    }
+
+    /// A refresh that rotates the refresh token is kept even when the profile
+    /// call after it fails on transport. The old refresh token is spent, so
+    /// dropping the fresh one would end a valid session at the next refresh.
+    /// The pass that waited on the renewal resumes with the fresh token.
+    #[test]
+    fn a_rotated_token_is_kept_when_the_profile_call_fails() {
+        let dir = TempDir::new("page-rotates");
+        let path = dir.path();
+        let pages = vec![(RemoteList::Liked, vec![page(&["seed-track-1"])])];
+        let service =
+            Arc::new(Recorded { rejects: |token| token == "fake-access", offline_profile: true, ..Recorded::new(pages) });
+        let mut app = signed_in_with("account-a", &path, service.clone());
+        app.revalidate_on_entry = true;
+        app.tokens.save(&fake_token());
+        app.refresh = |_, _| Ok(Token { access_token: "fresh".into(), refresh_token: "rotated".into(), expires_in: 3600 });
+
+        crate::state::open_section(&mut app.core, crate::state::Route::LikedSongs);
+        drain_until(&mut app, |a| !a.profile.is_pending() && settled(a) && a.core.lib.is_liked(&track(1)));
+
+        assert_eq!(service.users(), 1, "the fixture did not renew exactly once");
+        let fresh = Token { access_token: "fresh".into(), refresh_token: "rotated".into(), expires_in: 3600 };
+        assert_eq!(app.tokens.load(), Some(fresh.clone()), "the rotated token was not stored");
+        assert!(matches!(&app.auth, Auth::SignedIn { token } if *token == fresh), "the session kept the spent token");
+        assert_eq!(service.tokens(), ["fake-access", "fresh"], "the waiting pass did not resume with the fresh token");
+        assert!(app.core.lib.is_liked(&track(1)), "the waiting pass did not land");
     }
 
     /// A renewed token that Tidal rejects too ends the session, the same rule
@@ -2822,7 +2866,7 @@ mod tests {
             app.live = live;
             let session = app.session;
             let user = User { id: crate::tidal::UserId("account-a".to_string()), name: "Ada".to_string() };
-            app.profile.request((), move |_| (session, Ok((fake_token(), user))));
+            app.profile.request((), move |_| (session, fake_token(), Ok(user)));
             drain_until(&mut app, |a| !a.profile.is_pending() && a.core.lib.name == "Ada");
             if live {
                 drain_until(&mut app, |a| settled(a) && a.core.lib.is_liked(&track(0)));
@@ -3063,7 +3107,7 @@ mod tests {
         let session = app.session;
         app.profile.request((), move |_| {
             let _ = wait.recv();
-            (session, Err(ServiceError::Http("offline".to_string())))
+            (session, fake_token(), Err(ServiceError::Http("offline".to_string())))
         });
         release
     }

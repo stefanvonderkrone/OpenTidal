@@ -147,6 +147,47 @@ struct AccountCovers {
     /// How many shown images had decoded at the last drain, so a drain can
     /// tell that a decode landed and the screen must redraw.
     ready: Cell<usize>,
+    /// Counts the frames that drew a cover. A shown cover is stamped with it
+    /// when drawn, so eviction can tell what is on screen.
+    frame: Cell<u64>,
+    /// Whether a cover was drawn since the last drain.
+    drew: Cell<bool>,
+}
+
+/// The most decoded covers an account holds. One Albums frame draws 80 and
+/// Home draws a few shelves, so this keeps several screens.
+const SHOWN_CAP: usize = 256;
+
+/// A cover drawn in this many recent frames is never evicted. Evicting one on
+/// screen would make it wanted again and decode it again on every frame.
+const RECENT_FRAMES: u64 = 3;
+
+impl AccountCovers {
+    /// Advance the frame count when a cover was drawn, then drop the least
+    /// recently drawn shown covers above [`SHOWN_CAP`]. An evicted cover leaves
+    /// the map, so its next draw wants it again and the disk serves it. Only
+    /// `Shown` is evicted, because a batch holds the other states.
+    fn evict_stale(&self, states: &mut BTreeMap<ArtworkId, CoverState>) {
+        if self.drew.replace(false) {
+            self.frame.set(self.frame.get() + 1);
+        }
+        let mut shown: Vec<(u64, ArtworkId)> = states
+            .iter()
+            .filter_map(|(id, state)| match state {
+                CoverState::Shown { drawn, .. } => Some((*drawn, id.clone())),
+                _ => None,
+            })
+            .collect();
+        let excess = shown.len().saturating_sub(SHOWN_CAP);
+        if excess == 0 {
+            return;
+        }
+        let recent = self.frame.get().saturating_sub(RECENT_FRAMES);
+        shown.sort_unstable();
+        for (_, id) in shown.into_iter().take(excess).take_while(|(drawn, _)| *drawn < recent) {
+            states.remove(&id);
+        }
+    }
 }
 
 /// One cover's place in its life. One enum in one map, so a cover cannot be
@@ -167,7 +208,8 @@ enum CoverState {
     Checked(CoverOwner),
     /// `ImageCache::file` returned this handle. The handle keeps the decoded
     /// pixels alive, because the image cache holds only weak references.
-    Shown(Image),
+    /// `drawn` is the frame that last drew it.
+    Shown { image: Image, drawn: u64 },
     /// No cover for now. A landed page clears it, so the next frame asks again.
     Unavailable,
 }
@@ -355,7 +397,13 @@ impl App {
             covers::cover_root(std::env::var_os("XDG_CACHE_HOME").as_deref(), home.as_deref().map(std::path::Path::new))
         })?;
         let cache = CoverCache::for_account(&root, user_id)?;
-        Some(AccountCovers { cache, states: RefCell::new(BTreeMap::new()), ready: Cell::new(0) })
+        Some(AccountCovers {
+            cache,
+            states: RefCell::new(BTreeMap::new()),
+            ready: Cell::new(0),
+            frame: Cell::new(0),
+            drew: Cell::new(false),
+        })
     }
 
     /// The view-facing covers. With no open library every cover is a gradient.
@@ -391,7 +439,7 @@ impl App {
                             if self.wait_for_decode {
                                 let _ = image.wait();
                             }
-                            CoverState::Shown(image)
+                            CoverState::Shown { image, drawn: open.frame.get() }
                         }
                         _ => CoverState::Unavailable,
                     };
@@ -410,9 +458,10 @@ impl App {
                 *state = next;
             }
         }
+        open.evict_stale(&mut states);
         let mut ready = 0;
         for (id, state) in states.iter_mut() {
-            let CoverState::Shown(image) = state else { continue };
+            let CoverState::Shown { image, .. } = state else { continue };
             if image.error().is_some() {
                 // A file that will not decode is removed, so a later batch
                 // fetches it again rather than serving it as a hit.
@@ -1142,8 +1191,12 @@ impl Covers<'_> {
         let image = match (self.open, request) {
             (Some(open), Some(request)) => {
                 let mut states = open.states.borrow_mut();
-                match states.get(&request.artwork) {
-                    Some(CoverState::Shown(image)) => Some(image.clone()),
+                match states.get_mut(&request.artwork) {
+                    Some(CoverState::Shown { image, drawn }) => {
+                        *drawn = open.frame.get();
+                        open.drew.set(true);
+                        Some(image.clone())
+                    }
                     Some(_) => None,
                     None => {
                         states.insert(request.artwork, CoverState::Wanted(request.owner));
@@ -2923,7 +2976,7 @@ mod tests {
         app.library
             .as_ref()
             .and_then(|open| open.covers.as_ref())
-            .map_or(0, |c| c.states.borrow().values().filter(|s| matches!(s, CoverState::Shown(_))).count())
+            .map_or(0, |c| c.states.borrow().values().filter(|s| matches!(s, CoverState::Shown { .. })).count())
     }
 
     fn cover_calls(service: &tidal::FakeService) -> usize {
@@ -3100,6 +3153,86 @@ mod tests {
         assert_eq!(cover_calls(&service), 0, "a restart fetched a cover it had on disk");
     }
 
+    fn albums(app: &App, range: std::ops::Range<usize>) -> Vec<Album> {
+        range.map(|i| app.catalogue.album(&app.catalogue.album_id(&format!("album-{i}")).unwrap()).unwrap().clone()).collect()
+    }
+
+    /// One frame: draw `drawn`, then drain, as the event loop does.
+    fn frame(app: &mut App, drawn: &[Album]) {
+        for album in drawn {
+            app.covers().album(album);
+        }
+        app.drain();
+    }
+
+    fn all_shown(app: &App, drawn: &[Album]) -> bool {
+        drawn.iter().all(|a| cover_state(app, a.cover.as_ref().unwrap().as_str()) == Some("shown"))
+    }
+
+    /// Draw `drawn` frame after frame until every cover in it is shown, and
+    /// check `each` after every frame. Each cover is a file write, so this
+    /// waits longer than `drain_until` does.
+    fn frames_until_shown(app: &mut App, drawn: &[Album], each: impl Fn(&App)) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            frame(app, drawn);
+            each(app);
+            if all_shown(app, drawn) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("the drawn covers never all showed");
+    }
+
+    /// Scrolling through more covers than the cap keeps at most the cap
+    /// decoded. An evicted cover drawn again shows from disk with no fetch.
+    #[test]
+    fn shown_covers_stay_under_the_cap() {
+        let dir = TempDir::new("covers-cap");
+        let n = SHOWN_CAP + 80;
+        let (mut app, service) = covered_app("173210380", &dir.path(), &dir.0.join("covers"), n);
+        for start in (0..n).step_by(80) {
+            let screen = albums(&app, start..(start + 80).min(n));
+            frames_until_shown(&mut app, &screen, |_| ());
+            for _ in 0..RECENT_FRAMES + 1 {
+                frame(&mut app, &screen);
+                assert!(shown(&app) <= SHOWN_CAP, "{} covers stayed decoded", shown(&app));
+            }
+        }
+        assert_eq!(cover_calls(&service), n, "the fixture did not fetch every cover once");
+        let first = albums(&app, 0..1);
+        assert_eq!(cover_state(&app, "art-0"), None, "the first cover was never evicted");
+
+        frames_until_shown(&mut app, &first, |_| ());
+        assert_eq!(cover_calls(&service), n, "an evicted cover was fetched again instead of read from disk");
+    }
+
+    /// A screen that stays in view keeps its covers while the rest of the
+    /// screen scrolls past the cap. No cover on screen is evicted, so no frame
+    /// wants it again and no batch runs for it.
+    #[test]
+    fn covers_on_screen_are_never_evicted() {
+        let dir = TempDir::new("covers-thrash");
+        let n = SHOWN_CAP + 80;
+        let (mut app, _) = covered_app("173210380", &dir.path(), &dir.0.join("covers"), n);
+        let shelf = albums(&app, 0..80);
+        frames_until_shown(&mut app, &shelf, |_| ());
+        for start in (80..n).step_by(80) {
+            let mut screen = shelf.clone();
+            screen.extend(albums(&app, start..(start + 80).min(n)));
+            frames_until_shown(&mut app, &screen, |app| {
+                assert!(all_shown(app, &shelf), "a cover on screen was evicted while the next screen loaded");
+            });
+            for _ in 0..20 {
+                frame(&mut app, &screen);
+                assert!(all_shown(&app, &shelf), "a cover on screen was evicted");
+                assert!(!app.cover_fetch.is_pending(), "a settled screen started a batch");
+            }
+        }
+        assert!(shown(&app) <= SHOWN_CAP, "{} covers stayed decoded", shown(&app));
+    }
+
     /// Hold the profile fetch until the returned sender sends, as a slow
     /// network does after a restart.
     fn hold_profile(app: &mut App) -> std::sync::mpsc::Sender<()> {
@@ -3120,7 +3253,7 @@ mod tests {
             CoverState::Fetching(_) => "fetching",
             CoverState::Checking(_) => "checking",
             CoverState::Checked(_) => "checked",
-            CoverState::Shown(_) => "shown",
+            CoverState::Shown { .. } => "shown",
             CoverState::Unavailable => "unavailable",
         })
     }

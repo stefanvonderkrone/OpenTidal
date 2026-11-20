@@ -802,6 +802,9 @@ fn fetch_page(
     };
     let at = after.cloned().unwrap_or(Cursor { leg, path: first });
     let doc = get(&at.path)?;
+    if !matches!(doc.data, Some(Data::Many(_))) {
+        return Err(ServiceError::Decode("a list page has no data array".to_string()));
+    }
     let mut rows = CatalogueRows::default();
     doc.add_to(&mut rows);
     let members = doc.members(kind).collect();
@@ -1165,7 +1168,7 @@ mod tests {
 
     /// A page whose `next` is the given link, and nothing else.
     fn linking_to(next: &str) -> Document {
-        serde_json::from_str(&format!(r#"{{"links":{{"next":"{next}"}}}}"#)).unwrap()
+        serde_json::from_str(&format!(r#"{{"data":[],"links":{{"next":"{next}"}}}}"#)).unwrap()
     }
 
     /// A `next` link that leaves the service is refused before it becomes a
@@ -1197,12 +1200,44 @@ mod tests {
         let mut asked = Vec::new();
         let mut get = |path: &str| {
             asked.push(path.to_owned());
-            Ok(if path == SAVED { linking_to(next) } else { serde_json::from_str("{}").unwrap() })
+            Ok(if path == SAVED { linking_to(next) } else { serde_json::from_str(r#"{"data":[]}"#).unwrap() })
         };
         let first = fetch_page(&mut get, "/v2", "173210380", &RemoteList::Albums, None).unwrap();
         let last = fetch_page(&mut get, "/v2", "173210380", &RemoteList::Albums, first.next.as_ref()).unwrap();
         assert_eq!(last.next, None);
         assert_eq!(asked, [SAVED, next]);
+    }
+
+    /// JSON:API primary data of a list must be an array. A `200` page without
+    /// one stalls the pass, so the merge cannot read it as an empty last page
+    /// and clear the stored rows. An empty array is still an empty page.
+    #[test]
+    fn a_list_page_without_a_data_array_stalls_the_pass_and_keeps_the_rows() {
+        use crate::pager::{Landed, PageResult, PassStatus, Passes};
+        let mut cat = Catalogue::seed();
+        let mut lib = Library::default();
+        read_into(&mut lib, &mut cat, RemoteList::Liked).unwrap();
+        let stored = lib.clone();
+        assert_eq!(stored.liked.len(), 3);
+
+        for body in ["{}", r#"{"data":null}"#, r#"{"data":{"type":"tracks","id":"75413016"}}"#] {
+            let mut passes = Passes::default();
+            let mut ids = 0;
+            passes.enter(Some(RemoteList::Liked), &mut ids);
+            let request = passes.next_request("t").unwrap();
+            let mut get = |_: &str| Ok(serde_json::from_str(body).unwrap());
+            let result = fetch_page(&mut get, "/v2", "173210380", &request.of, request.after.as_ref());
+            assert!(matches!(result, Err(ServiceError::Decode(_))), "{body} was read as a page: {result:?}");
+            if let Landed::Merge(merge) = passes.land(PageResult { pass: request.pass, result, token: "t".into() }) {
+                lib.merge(&mut cat, merge);
+            }
+            assert!(matches!(passes.status(&RemoteList::Liked), PassStatus::Stalled(_)), "{body} did not stall the pass");
+            assert_eq!(lib, stored, "{body} changed the stored rows");
+        }
+
+        let mut get = |_: &str| Ok(serde_json::from_str(r#"{"data":[]}"#).unwrap());
+        let empty = fetch_page(&mut get, "/v2", "173210380", &RemoteList::Liked, None).unwrap();
+        assert_eq!(empty, Page { rows: CatalogueRows::default(), members: Vec::new(), next: None });
     }
 
     /// A catalogue playlist id for a Tidal playlist. Only a catalogue mints one.
